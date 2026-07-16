@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-vocab"
+version = "0.1.0"
+description = "Local-first vocabulary companion for Hermes Agent"
+requires-python = ">=3.11,<3.14"
+dependencies = []
+
+[project.entry-points."hermes_agent.plugins"]
+vocabulary = "hermes_vocab.hermes_plugin"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<10",
+  "pytest-cov>=6,<8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hermes_vocab"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
