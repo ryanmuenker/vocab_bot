@@ -1,5 +1,3 @@
-BEGIN IMMEDIATE;
-
 ALTER TABLE vocabulary_entries RENAME TO vocabulary_entries_v1;
 ALTER TABLE review_events RENAME TO review_events_v1;
 

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from hermes_vocab.capture import CaptureService
 from hermes_vocab.database import Database
+from hermes_vocab.formatting import format_review_completion
 from hermes_vocab.models import (
     CaptureCommand,
     CaptureOperation,
@@ -92,6 +93,49 @@ def test_daily_review_creates_one_pending_word_event_with_all_senses(
     assert result.event is not None
     assert result.event.word_id == result.word.id
     assert result.event.review_date.isoformat() == "2026-07-16"
+
+
+def test_review_reveal_keeps_senses_in_insertion_order_with_reversed_clocks(
+    tmp_path: Path,
+) -> None:
+    service, _, database = setup_service(tmp_path, NOW)
+    timestamps = iter((NOW, NOW - timedelta(days=1)))
+    capture = CaptureService(database, clock=lambda: next(timestamps))
+    capture.capture(
+        CaptureCommand(
+            word="bank",
+            operation=CaptureOperation.NEW_WORD,
+            card=SenseCard(
+                part_of_speech="noun",
+                definition="A financial institution.",
+                example_sentence="She deposited the cheque at the bank.",
+            ),
+        )
+    )
+    capture.capture(
+        CaptureCommand(
+            word="bank",
+            operation=CaptureOperation.NEW_SENSE,
+            card=SenseCard(
+                part_of_speech="noun",
+                definition="Land alongside a river.",
+                example_sentence="They rested on the grassy bank.",
+            ),
+        )
+    )
+    service.daily_review()
+
+    result = service.complete_review("my answer")
+
+    assert result.status is ReviewCompletionStatus.COMPLETED
+    assert [sense.definition for sense in result.word.senses] == [
+        "A financial institution.",
+        "Land alongside a river.",
+    ]
+    reveal = format_review_completion(result)
+    assert reveal.index("1. noun — A financial institution.") < reveal.index(
+        "2. noun — Land alongside a river."
+    )
 
 
 def test_same_day_pending_is_idempotent_and_answered_is_silent(tmp_path: Path) -> None:

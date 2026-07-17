@@ -19,7 +19,7 @@ def register(ctx) -> None:
     capture_service = CaptureService(database)
     review_service = ReviewService(database, settings.timezone)
     handlers = ToolHandlers(capture_service, review_service)
-    hook = VocabularyHook(review_service)
+    hook = VocabularyHook(capture_service, review_service)
 
     ctx.register_tool(
         name="vocabulary_save_card",

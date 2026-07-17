@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from hermes_vocab.capture import CaptureService, normalize_word
+from hermes_vocab.capture import (
+    MAX_SOURCE_CONTEXT_LENGTH,
+    CaptureService,
+    normalize_word,
+)
 from hermes_vocab.database import Database
 from hermes_vocab.models import (
     CaptureCommand,
@@ -70,7 +74,10 @@ def test_new_word_creates_word_and_first_sense(tmp_path: Path) -> None:
 
 
 def test_new_sense_preserves_word_review_fields_and_capture_order(tmp_path: Path) -> None:
-    service = service_for(tmp_path)
+    database = Database(tmp_path / "data" / "vocabulary.sqlite3")
+    database.initialize()
+    timestamps = iter((NOW, NOW - timedelta(days=1)))
+    service = CaptureService(database, clock=lambda: next(timestamps))
     original = service.capture(command(CaptureOperation.NEW_WORD)).word
 
     result = service.capture(
@@ -87,6 +94,11 @@ def test_new_sense_preserves_word_review_fields_and_capture_order(tmp_path: Path
         "A financial institution.",
         "Land alongside a river.",
     ]
+    assert [sense.date_added for sense in result.word.senses] == [
+        NOW,
+        NOW - timedelta(days=1),
+    ]
+    assert service.get_word("bank").senses == result.word.senses
     assert result.sense == result.word.senses[1]
     assert result.sense.source_context == "She sat on the bank and watched the river."
     assert result.word.last_reviewed == original.last_reviewed
@@ -162,7 +174,10 @@ def test_existing_sense_rejects_id_from_another_word(tmp_path: Path) -> None:
     "bad_command",
     [
         command(CaptureOperation.NEW_WORD, word="two words"),
-        command(CaptureOperation.NEW_WORD, context="x" * 2001),
+        command(
+            CaptureOperation.NEW_WORD,
+            context="x" * (MAX_SOURCE_CONTEXT_LENGTH + 1),
+        ),
         command(CaptureOperation.NEW_WORD, part_of_speech="x" * 51),
         command(CaptureOperation.NEW_WORD, definition="x" * 501),
         command(CaptureOperation.NEW_WORD, example_sentence="x" * 501),
@@ -196,6 +211,24 @@ def test_malformed_commands_are_invalid_without_writes(
     assert service.get_word("bank") is None
 
 
+@pytest.mark.parametrize("operation", ["new_word", "not_an_operation"])
+def test_raw_string_operations_are_invalid_without_writes(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    service = service_for(tmp_path)
+    raw_command = CaptureCommand(
+        "bank",
+        operation,
+        SenseCard("noun", "A financial institution.", "She visited the bank."),
+    )
+
+    result = service.capture(raw_command)
+
+    assert result.status is CaptureStatus.INVALID
+    assert service.get_word("bank") is None
+
+
 def test_field_boundaries_and_context_are_trimmed_and_persisted(tmp_path: Path) -> None:
     service = service_for(tmp_path)
 
@@ -206,7 +239,7 @@ def test_field_boundaries_and_context_are_trimmed_and_persisted(tmp_path: Path) 
             part_of_speech=f" {'p' * 50} ",
             definition=f" {'d' * 500} ",
             example_sentence=f" {'e' * 500} ",
-            context=f" {'c' * 2000} ",
+            context=f" {'c' * MAX_SOURCE_CONTEXT_LENGTH} ",
         )
     )
 
@@ -215,7 +248,7 @@ def test_field_boundaries_and_context_are_trimmed_and_persisted(tmp_path: Path) 
     assert result.sense.part_of_speech == "p" * 50
     assert result.sense.definition == "d" * 500
     assert result.sense.example_sentence == "e" * 500
-    assert result.sense.source_context == "c" * 2000
+    assert result.sense.source_context == "c" * MAX_SOURCE_CONTEXT_LENGTH
 
 
 def test_unicode_lookup_normalizes_equivalent_words(tmp_path: Path) -> None:

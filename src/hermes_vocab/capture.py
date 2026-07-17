@@ -21,7 +21,7 @@ _JOINERS = {"-", "'", "’"}
 _MAX_WORD = 100
 _MAX_PART_OF_SPEECH = 50
 _MAX_TEXT = 500
-_MAX_CONTEXT = 2000
+MAX_SOURCE_CONTEXT_LENGTH = 2000
 
 
 def normalize_word(word: str) -> str:
@@ -105,7 +105,7 @@ def _load_word(
     if word_row is None:
         return None
     sense_rows = connection.execute(
-        "SELECT * FROM vocabulary_senses WHERE word_id = ? ORDER BY date_added, id",
+        "SELECT * FROM vocabulary_senses WHERE word_id = ? ORDER BY id",
         (word_row["id"],),
     ).fetchall()
     return _word_from_rows(word_row, sense_rows)
@@ -234,6 +234,8 @@ class CaptureService:
     def _prepare_command(
         command: CaptureCommand,
     ) -> tuple[str, str, SenseCard, str | None] | None:
+        if not isinstance(command.operation, CaptureOperation):
+            return None
         if not is_lexical_word(command.word):
             return None
         word = unicodedata.normalize("NFKC", command.word.strip())
@@ -242,7 +244,10 @@ class CaptureService:
             command.source_context.strip() if command.source_context is not None else None
         )
         source_context = source_context or None
-        if source_context is not None and len(source_context) > _MAX_CONTEXT:
+        if (
+            source_context is not None
+            and len(source_context) > MAX_SOURCE_CONTEXT_LENGTH
+        ):
             return None
 
         if command.operation is CaptureOperation.EXISTING_SENSE:

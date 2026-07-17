@@ -47,7 +47,7 @@ def _word_by_id(
     ).fetchone()
     assert word_row is not None
     sense_rows = connection.execute(
-        "SELECT * FROM vocabulary_senses WHERE word_id = ? ORDER BY date_added, id",
+        "SELECT * FROM vocabulary_senses WHERE word_id = ? ORDER BY id",
         (word_id,),
     ).fetchall()
     return _word_from_rows(word_row, sense_rows)

@@ -45,18 +45,50 @@ class Database:
             .read_text(encoding="utf-8")
         )
 
+    @staticmethod
+    def _migration_statements(script: str) -> Iterator[str]:
+        buffer: list[str] = []
+        for character in script:
+            buffer.append(character)
+            if character == ";":
+                statement = "".join(buffer)
+                if sqlite3.complete_statement(statement):
+                    yield statement
+                    buffer.clear()
+        trailing = "".join(buffer).strip()
+        if trailing:
+            yield trailing
+
     def _apply_migration(
         self,
         connection: sqlite3.Connection,
         target: int,
     ) -> None:
-        connection.executescript(self._migration_sql(target))
-        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
-        if violations:
-            raise sqlite3.IntegrityError(
-                f"Foreign-key violations: {violations}"
-            )
-        connection.commit()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if version < target:
+                if version != target - 1:
+                    raise RuntimeError(
+                        f"Cannot apply database migration {target} "
+                        f"from schema version {version}"
+                    )
+                for statement in self._migration_statements(
+                    self._migration_sql(target)
+                ):
+                    connection.execute(statement)
+                violations = connection.execute(
+                    "PRAGMA foreign_key_check"
+                ).fetchall()
+                if violations:
+                    raise sqlite3.IntegrityError(
+                        f"Foreign-key violations: {violations}"
+                    )
+        except BaseException:
+            connection.rollback()
+            raise
+        else:
+            connection.commit()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:

@@ -47,6 +47,31 @@ SQLite is the only source of truth for saved words and review state. Hermes tran
 - A pending review owns the next non-command Telegram message. Answer it or ask for the answer before capturing another word.
 - A no-agent cron job asks the morning question. This avoids model cost and guarantees `What does '<word>' mean?` exactly.
 
+## Capture and review behavior
+
+Word-only capture is unchanged. Send a standalone word in the private Telegram DM:
+
+```text
+bank
+```
+
+To select a meaning with source context, put the word on the first line and the context on the remaining lines of the same message:
+
+```text
+bank
+She sat on the bank and watched the river.
+```
+
+The first non-empty line must be one lexical word; the remaining text is supplied as context while preserving its internal line breaks. There is no command prefix. Consequently, any Telegram message whose first non-empty line is a standalone lexical word is intentionally routed as a vocabulary capture. A pending review takes priority, and multiline messages without a lexical first line remain ordinary conversation.
+
+Hermes compares the intended meaning with every sense already stored for the word:
+
+- A new word creates its first sense and ends with `✓ Saved.`.
+- The same meaning, including a paraphrase, is idempotent: it creates no additional sense and ends with `Already saved with this meaning.`.
+- A genuinely distinct meaning adds another sense under the same word and ends with `✓ New meaning saved.`.
+
+Context is optional evidence for sense selection; capture does not ask a follow-up question. Daily review remains word-level: it asks one `What does '<word>' mean?` question, then reveals all stored senses in capture order after an answer or `show answer`. Multiple senses are numbered. After completion, another review run on the same local day is silent.
+
 ## Current workstation status
 
 Already completed on this machine:
@@ -58,7 +83,7 @@ Already completed on this machine:
 - `HERMES_TIMEZONE=Asia/Kuala_Lumpur` and the default database path configured in `~/.hermes/.env`.
 - `~/.hermes/scripts/daily_review.py` installed.
 - `cron.wrap_response` disabled.
-- `daily-vocabulary-review` scheduled for `08:00` local time.
+- `daily-vocabulary-review` currently scheduled for `12:00` local time.
 
 Provider login, Telegram credentials, the private home DM, and gateway service startup remain credential-gated. Complete Steps 3–5 below.
 
@@ -147,7 +172,7 @@ In the bot's private DM:
 1. Send `/sethome`. The DM chat ID is the same as your user ID.
 2. Send `obdurate`.
 3. Confirm one concise card ends in `✓ Saved.`.
-4. Send `obdurate` again and confirm it says `Already saved.` without changing the first card.
+4. Send `obdurate` again and confirm it says `Already saved with this meaning.` without changing the first card.
 
 Stop the foreground process after this check, then install the persistent user service:
 
@@ -168,7 +193,7 @@ cp scripts/daily_review.py ~/.hermes/scripts/daily_review.py
 hermes config set cron.wrap_response false
 ```
 
-Create the 08:00 local schedule:
+On a clean setup, choose a local review time. For example, create an `08:00` schedule:
 
 ```bash
 hermes cron create "0 8 * * *" \
@@ -178,7 +203,7 @@ hermes cron create "0 8 * * *" \
   --deliver telegram
 ```
 
-This workstation already has that job. Do not create a duplicate; inspect it with:
+This workstation already has that job scheduled for `12:00` local time. Do not create a duplicate; inspect it with:
 
 ```bash
 hermes cron list
@@ -197,7 +222,7 @@ Expected Telegram text:
 What does 'obdurate' mean?
 ```
 
-Reply with a definition or `show answer`. Hermes reveals the stored concise definition and example without grading. A second same-day run is silent after completion. An unanswered prior-day review becomes missed when the next day's review is created; there is no backlog.
+If a review is left unanswered, it becomes missed when the next day's review is created; there is no backlog.
 
 ## Verification and development
 
@@ -232,7 +257,9 @@ Authoritative file:
 ~/.local/share/hermes-vocab/vocabulary.sqlite3
 ```
 
-The database directory and files are restricted to the current user. SQLite uses WAL, so do not copy only the main file while writes may be active. For a simple reliable backup or restore, stop the gateway first, then copy or replace the database and any present `-wal`/`-shm` sidecars as one set. Start the gateway again and run a capture/review smoke check.
+Schema migrations run automatically when the package first initializes the database after an upgrade. Migration 002 converts a version-1 database to the word-and-senses schema while preserving existing cards and review events. Take a backup before upgrading.
+
+The database directory and files are restricted to the current user. SQLite uses WAL, so do not copy only the main file while writes may be active. For a reliable backup or restore, stop the gateway first, then copy or replace the database and any present `-wal`/`-shm` sidecars as one set. Start the gateway again and run a capture/review smoke check.
 
 Other local state is non-authoritative but privacy-bearing:
 
