@@ -82,6 +82,12 @@ class CaptureResult:
     status: CaptureStatus
     entry: VocabularyEntry | None = None
     sense: VocabularySense | None = None
+@dataclass(frozen=True, slots=True)
+class EntryCaptureResult:
+    status: CaptureStatus
+    entry: VocabularyEntry | None = None
+
+
 
 
 class ReviewPromptStatus(StrEnum):

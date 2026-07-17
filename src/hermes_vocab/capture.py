@@ -13,6 +13,7 @@ from .models import (
     CaptureResult,
     CaptureStatus,
     EntryTextStatus,
+    EntryCaptureResult,
     NormalizedEntryText,
     SenseCard,
     VocabularyEntry,
@@ -129,6 +130,61 @@ class CaptureService:
         with self.database.connect() as connection:
             return _load_entry(connection, normalized.normalized_text)
 
+    def capture_entry(
+        self,
+        display_text: str,
+        cards: Sequence[SenseCard],
+    ) -> EntryCaptureResult:
+        try:
+            batch = tuple(cards)
+        except TypeError:
+            return EntryCaptureResult(CaptureStatus.INVALID)
+        normalized = normalize_entry_text(display_text)
+        prepared_cards = self._prepare_cards(batch)
+        if (
+            normalized.status is not EntryTextStatus.VALID
+            or prepared_cards is None
+        ):
+            return EntryCaptureResult(CaptureStatus.INVALID)
+
+        try:
+            with self.database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                existing = _load_entry(connection, normalized.normalized_text)
+                if existing is not None:
+                    connection.rollback()
+                    return EntryCaptureResult(CaptureStatus.ALREADY_EXISTS, existing)
+
+                timestamp = _timestamp(self.clock())
+                cursor = connection.execute(
+                    """
+                    INSERT INTO vocabulary_entries (
+                        display_text, normalized_text, date_added, review_status
+                    ) VALUES (?, ?, ?, 'new')
+                    """,
+                    (
+                        normalized.display_text,
+                        normalized.normalized_text,
+                        timestamp,
+                    ),
+                )
+                entry_id = int(cursor.lastrowid)
+                for card in prepared_cards:
+                    self._insert_batch_sense(
+                        connection,
+                        entry_id,
+                        card,
+                        timestamp,
+                    )
+
+                entry = _load_entry(connection, normalized.normalized_text)
+                if entry is None or len(entry.senses) != len(prepared_cards):
+                    raise sqlite3.DatabaseError("incomplete capture aggregate")
+                connection.commit()
+                return EntryCaptureResult(CaptureStatus.SAVED, entry)
+        except sqlite3.Error:
+            return EntryCaptureResult(CaptureStatus.STORAGE_ERROR)
+
     def capture(self, command: CaptureCommand) -> CaptureResult:
         prepared = self._prepare_command(command)
         if prepared is None:
@@ -233,6 +289,56 @@ class CaptureService:
             ),
         )
         return cursor.lastrowid
+
+    @staticmethod
+    def _insert_batch_sense(
+        connection: sqlite3.Connection,
+        entry_id: int,
+        card: SenseCard,
+        timestamp: str,
+    ) -> int:
+        return CaptureService._insert_sense(
+            connection,
+            entry_id,
+            card,
+            None,
+            timestamp,
+        )
+
+    @staticmethod
+    def _prepare_cards(cards: tuple[SenseCard, ...]) -> tuple[SenseCard, ...] | None:
+        if not 1 <= len(cards) <= 20:
+            return None
+        prepared: list[SenseCard] = []
+        seen: set[tuple[str, str]] = set()
+        for card in cards:
+            if not isinstance(card, SenseCard) or not all(
+                isinstance(field, str)
+                for field in (
+                    card.part_of_speech,
+                    card.definition,
+                    card.example_sentence,
+                )
+            ):
+                return None
+            part_of_speech = card.part_of_speech.strip()
+            definition = card.definition.strip()
+            example_sentence = card.example_sentence.strip()
+            if not (
+                0 < len(part_of_speech) <= _MAX_PART_OF_SPEECH
+                and 0 < len(definition) <= _MAX_TEXT
+                and 0 < len(example_sentence) <= _MAX_TEXT
+            ):
+                return None
+            key = (
+                " ".join(unicodedata.normalize("NFKC", part_of_speech).split()).casefold(),
+                " ".join(unicodedata.normalize("NFKC", definition).split()).casefold(),
+            )
+            if key in seen:
+                return None
+            seen.add(key)
+            prepared.append(SenseCard(part_of_speech, definition, example_sentence))
+        return tuple(prepared)
 
     @staticmethod
     def _prepare_command(

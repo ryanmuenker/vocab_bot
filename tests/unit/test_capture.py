@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -294,3 +295,136 @@ def test_concurrent_new_word_creates_one_word_and_one_sense(tmp_path: Path) -> N
     with service.database.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM vocabulary_entries").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM vocabulary_senses").fetchone()[0] == 1
+
+
+def _batch_cards() -> tuple[SenseCard, ...]:
+    return (
+        SenseCard(
+            part_of_speech="adjective",
+            definition="Provided as a matter of form.",
+            example_sentence="The board issued a pro forma approval.",
+        ),
+        SenseCard(
+            part_of_speech="noun",
+            definition="A projected financial statement.",
+            example_sentence="The analyst prepared a pro forma.",
+        ),
+    )
+
+
+def test_capture_entry_saves_all_senses_in_one_ordered_aggregate(tmp_path: Path) -> None:
+    service = service_for(tmp_path)
+
+    result = service.capture_entry("Pro Forma", _batch_cards())
+
+    assert result.status is CaptureStatus.SAVED
+    assert result.entry is not None
+    assert result.entry.display_text == "Pro Forma"
+    assert [sense.part_of_speech for sense in result.entry.senses] == [
+        "adjective",
+        "noun",
+    ]
+
+
+def test_capture_entry_returns_complete_existing_aggregate_without_insert(
+    tmp_path: Path,
+) -> None:
+    service = service_for(tmp_path)
+    saved = service.capture_entry("Pro Forma", _batch_cards())
+
+    result = service.capture_entry(
+        "PRO   FORMA",
+        (
+            SenseCard("noun", "Different generated meaning.", "Different example."),
+        ),
+    )
+
+    assert result.status is CaptureStatus.ALREADY_EXISTS
+    assert result.entry == saved.entry
+    with service.database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM vocabulary_entries").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM vocabulary_senses").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize(
+    "cards",
+    [
+        (),
+        tuple(SenseCard("noun", f"definition {index}", "example") for index in range(21)),
+        (
+            SenseCard(" noun ", " Same definition ", "First example."),
+            SenseCard("NOUN", "same   definition", "Second example."),
+        ),
+        (SenseCard("", "definition", "example"),),
+        (SenseCard("noun", "", "example"),),
+        (SenseCard("noun", "definition", ""),),
+        (SenseCard("x" * 51, "definition", "example"),),
+        (SenseCard("noun", "x" * 501, "example"),),
+        (SenseCard("noun", "definition", "x" * 501),),
+    ],
+)
+def test_capture_entry_rejects_invalid_batches_without_writes(
+    tmp_path: Path,
+    cards: tuple[SenseCard, ...],
+) -> None:
+    service = service_for(tmp_path)
+
+    result = service.capture_entry("Pro Forma", cards)
+
+    assert result.status is CaptureStatus.INVALID
+    with service.database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM vocabulary_entries").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM vocabulary_senses").fetchone()[0] == 0
+
+
+def test_capture_entry_storage_error_rolls_back_complete_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = service_for(tmp_path)
+    calls = 0
+    original = service._insert_batch_sense
+
+    def fail_second_insert(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise sqlite3.OperationalError("injected")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_insert_batch_sense", fail_second_insert, raising=False)
+
+    result = service.capture_entry("Pro Forma", _batch_cards())
+
+    assert result.status is CaptureStatus.STORAGE_ERROR
+    with service.database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM vocabulary_entries").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM vocabulary_senses").fetchone()[0] == 0
+
+
+def test_concurrent_capture_entry_converges_on_one_complete_aggregate(
+    tmp_path: Path,
+) -> None:
+    service = service_for(tmp_path)
+    first_cards = _batch_cards()
+    second_cards = (
+        SenseCard("noun", "A deliberately different meaning.", "A different example."),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda cards: service.capture_entry("Pro Forma", cards),
+                (first_cards, second_cards),
+            )
+        )
+
+    assert {result.status for result in results} == {
+        CaptureStatus.SAVED,
+        CaptureStatus.ALREADY_EXISTS,
+    }
+    assert results[0].entry == results[1].entry
+    assert len(results[0].entry.senses) in {1, 2}
+    with service.database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM vocabulary_entries").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM vocabulary_senses").fetchone()[0] in {1, 2}
