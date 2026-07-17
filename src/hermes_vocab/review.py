@@ -5,7 +5,7 @@ from collections.abc import Callable
 from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
-from .capture import _timestamp, _word_from_rows
+from .capture import _entry_from_rows, _timestamp
 from .database import Database
 from .models import (
     ReviewCompletionResult,
@@ -13,7 +13,7 @@ from .models import (
     ReviewEvent,
     ReviewPromptResult,
     ReviewPromptStatus,
-    VocabularyWord,
+    VocabularyEntry,
 )
 
 
@@ -28,7 +28,7 @@ def _event_from_row(row: sqlite3.Row) -> ReviewEvent:
     assert prompted_at is not None
     return ReviewEvent(
         id=row["id"],
-        word_id=row["word_id"],
+        entry_id=row["entry_id"],
         review_date=date.fromisoformat(row["review_date"]),
         status=row["status"],
         prompted_at=prompted_at,
@@ -37,20 +37,24 @@ def _event_from_row(row: sqlite3.Row) -> ReviewEvent:
     )
 
 
-def _word_by_id(
+def _entry_by_id(
     connection: sqlite3.Connection,
-    word_id: int,
-) -> VocabularyWord:
-    word_row = connection.execute(
-        "SELECT * FROM vocabulary_words WHERE id = ?",
-        (word_id,),
+    entry_id: int,
+) -> VocabularyEntry:
+    entry_row = connection.execute(
+        "SELECT * FROM vocabulary_entries WHERE id = ?",
+        (entry_id,),
     ).fetchone()
-    assert word_row is not None
+    assert entry_row is not None
     sense_rows = connection.execute(
-        "SELECT * FROM vocabulary_senses WHERE word_id = ? ORDER BY id",
-        (word_id,),
+        """
+        SELECT * FROM vocabulary_senses
+        WHERE entry_id = ?
+        ORDER BY id
+        """,
+        (entry_id,),
     ).fetchall()
-    return _word_from_rows(word_row, sense_rows)
+    return _entry_from_rows(entry_row, sense_rows)
 
 
 class ReviewService:
@@ -75,7 +79,7 @@ class ReviewService:
                     (review_date,),
                 ).fetchone()
                 if current_event is not None:
-                    word = _word_by_id(connection, current_event["word_id"])
+                    entry = _entry_by_id(connection, current_event["entry_id"])
                     connection.commit()
                     status = (
                         ReviewPromptStatus.PENDING
@@ -85,7 +89,7 @@ class ReviewService:
                     return ReviewPromptResult(
                         status,
                         _event_from_row(current_event),
-                        word,
+                        entry,
                     )
 
                 connection.execute(
@@ -96,9 +100,9 @@ class ReviewService:
                     """,
                     (review_date,),
                 )
-                word_row = connection.execute(
+                entry_row = connection.execute(
                     """
-                    SELECT * FROM vocabulary_words
+                    SELECT * FROM vocabulary_entries
                     ORDER BY
                         CASE WHEN last_reviewed IS NULL THEN 0 ELSE 1 END,
                         COALESCE(last_reviewed, date_added),
@@ -107,18 +111,18 @@ class ReviewService:
                     LIMIT 1
                     """
                 ).fetchone()
-                if word_row is None:
+                if entry_row is None:
                     connection.commit()
                     return ReviewPromptResult(ReviewPromptStatus.EMPTY)
 
-                word = _word_by_id(connection, word_row["id"])
+                entry = _entry_by_id(connection, entry_row["id"])
                 cursor = connection.execute(
                     """
                     INSERT INTO review_events (
-                        word_id, review_date, status, prompted_at
+                        entry_id, review_date, status, prompted_at
                     ) VALUES (?, ?, 'pending', ?)
                     """,
-                    (word.id, review_date, _timestamp(now)),
+                    (entry.id, review_date, _timestamp(now)),
                 )
                 event_row = connection.execute(
                     "SELECT * FROM review_events WHERE id = ?", (cursor.lastrowid,)
@@ -127,7 +131,7 @@ class ReviewService:
                 return ReviewPromptResult(
                     ReviewPromptStatus.PENDING,
                     _event_from_row(event_row),
-                    word,
+                    entry,
                 )
         except sqlite3.Error:
             return ReviewPromptResult(ReviewPromptStatus.STORAGE_ERROR)
@@ -165,17 +169,17 @@ class ReviewService:
                 )
                 connection.execute(
                     """
-                    UPDATE vocabulary_words
+                    UPDATE vocabulary_entries
                     SET last_reviewed = ?, review_status = 'reviewed'
                     WHERE id = ?
                     """,
-                    (_timestamp(now), event_row["word_id"]),
+                    (_timestamp(now), event_row["entry_id"]),
                 )
-                word = _word_by_id(connection, event_row["word_id"])
+                entry = _entry_by_id(connection, event_row["entry_id"])
                 connection.commit()
                 return ReviewCompletionResult(
                     ReviewCompletionStatus.COMPLETED,
-                    word,
+                    entry,
                     answer,
                 )
         except sqlite3.Error:

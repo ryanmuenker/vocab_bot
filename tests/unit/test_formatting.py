@@ -7,23 +7,23 @@ from hermes_vocab.models import (
     CaptureResult,
     CaptureStatus,
     VocabularySense,
-    VocabularyWord,
+    VocabularyEntry,
 )
 
 
 SENSE = VocabularySense(
     id=2,
-    word_id=1,
+    entry_id=1,
     definition="Stubbornly refusing to change one's opinion.",
     part_of_speech="adjective",
     example_sentence="The committee remained obdurate despite new evidence.",
     source_context="The committee stayed obdurate.",
     date_added=datetime(2026, 7, 16, tzinfo=UTC),
 )
-WORD = VocabularyWord(
+WORD = VocabularyEntry(
     id=1,
-    word="obdurate",
-    normalized_word="obdurate",
+    display_text="obdurate",
+    normalized_text="obdurate",
     date_added=datetime(2026, 7, 16, tzinfo=UTC),
     last_reviewed=None,
     review_status="new",
@@ -52,14 +52,14 @@ def test_capture_statuses_have_distinct_deterministic_messages() -> None:
         CaptureResult(CaptureStatus.ALREADY_EXISTS, WORD, SENSE)
     ).endswith("Already saved with this meaning.")
     conflict = format_capture(CaptureResult(CaptureStatus.CONFLICT, WORD))
-    assert conflict == "That word changed while I was saving it. Please try again."
+    assert conflict == "That entry changed while I was saving it. Please try again."
     assert "Saved" not in conflict
 
 
 def test_invalid_and_storage_failures_are_concise() -> None:
     assert format_capture(CaptureResult(CaptureStatus.INVALID)) == (
-        "Send one word, optionally followed by context on the next line."
+        "Send a word or expression, optionally followed by context on the next line."
     )
     assert format_capture(CaptureResult(CaptureStatus.STORAGE_ERROR)) == (
-        "I couldn't save that word. Please try again."
+        "I couldn't save that entry. Please try again."
     )

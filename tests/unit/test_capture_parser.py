@@ -15,8 +15,11 @@ def test_first_line_word_and_remaining_text_produce_context() -> None:
     )
 
 
-def test_non_lexical_first_line_is_not_capture() -> None:
-    assert parse_capture_message("How are you?\nI am reading.") is None
+def test_phrase_first_line_is_a_capture_entry() -> None:
+    assert parse_capture_message("How are you?\nI am reading.") == CaptureRequest(
+        "How are you?",
+        "I am reading.",
+    )
 
 
 def test_command_is_not_capture() -> None:

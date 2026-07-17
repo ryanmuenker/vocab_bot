@@ -7,18 +7,18 @@ from .models import (
     ReviewCompletionStatus,
     ReviewPromptResult,
     ReviewPromptStatus,
+    VocabularyEntry,
     VocabularySense,
-    VocabularyWord,
 )
 
 
-def _display_word(word: str) -> str:
-    return word[:1].upper() + word[1:]
+def _display_entry(text: str) -> str:
+    return text[:1].upper() + text[1:]
 
 
-def _card(word: VocabularyWord, sense: VocabularySense, footer: str) -> str:
+def _card(entry: VocabularyEntry, sense: VocabularySense, footer: str) -> str:
     return (
-        f"{_display_word(word.word)} ({sense.part_of_speech})\n\n"
+        f"{_display_entry(entry.display_text)} ({sense.part_of_speech})\n\n"
         f"Definition:\n{sense.definition}\n\n"
         f"Example:\n{sense.example_sentence}\n\n"
         f"{footer}"
@@ -27,18 +27,18 @@ def _card(word: VocabularyWord, sense: VocabularySense, footer: str) -> str:
 
 def format_capture(result: CaptureResult) -> str:
     if result.status is CaptureStatus.INVALID:
-        return "Send one word, optionally followed by context on the next line."
+        return "Send a word or expression, optionally followed by context on the next line."
     if result.status is CaptureStatus.CONFLICT:
-        return "That word changed while I was saving it. Please try again."
+        return "That entry changed while I was saving it. Please try again."
     if result.status is CaptureStatus.STORAGE_ERROR:
-        return "I couldn't save that word. Please try again."
-    if result.word is None or result.sense is None:
-        return "I couldn't save that word. Please try again."
+        return "I couldn't save that entry. Please try again."
+    if result.entry is None or result.sense is None:
+        return "I couldn't save that entry. Please try again."
     if result.status is CaptureStatus.ALREADY_EXISTS:
-        return _card(result.word, result.sense, "Already saved with this meaning.")
+        return _card(result.entry, result.sense, "Already saved with this meaning.")
     if result.status is CaptureStatus.NEW_SENSE_SAVED:
-        return _card(result.word, result.sense, "✓ New meaning saved.")
-    return _card(result.word, result.sense, "✓ Saved.")
+        return _card(result.entry, result.sense, "✓ New meaning saved.")
+    return _card(result.entry, result.sense, "✓ Saved.")
 
 
 def format_daily_review(result: ReviewPromptResult) -> str:
@@ -46,9 +46,9 @@ def format_daily_review(result: ReviewPromptResult) -> str:
         return ""
     if result.status is ReviewPromptStatus.EMPTY:
         return "Save a word first, then I'll have something to review."
-    if result.status is ReviewPromptStatus.STORAGE_ERROR or result.word is None:
+    if result.status is ReviewPromptStatus.STORAGE_ERROR or result.entry is None:
         raise RuntimeError("Could not prepare the daily vocabulary review")
-    return f"What does '{result.word.word}' mean?"
+    return f"What does '{result.entry.display_text}' mean?"
 
 
 def format_review_completion(result: ReviewCompletionResult) -> str:
@@ -56,10 +56,10 @@ def format_review_completion(result: ReviewCompletionResult) -> str:
         return "Send an answer, or type 'show answer'."
     if result.status is ReviewCompletionStatus.NO_PENDING:
         return "There isn't a review waiting."
-    if result.status is ReviewCompletionStatus.STORAGE_ERROR or result.word is None:
+    if result.status is ReviewCompletionStatus.STORAGE_ERROR or result.entry is None:
         return "I couldn't record that review. Please try again."
-    if len(result.word.senses) == 1:
-        sense = result.word.senses[0]
+    if len(result.entry.senses) == 1:
+        sense = result.entry.senses[0]
         return (
             f"Definition:\n{sense.definition}\n\n"
             f"Example:\n{sense.example_sentence}"
@@ -67,5 +67,5 @@ def format_review_completion(result: ReviewCompletionResult) -> str:
     return "\n\n".join(
         f"{index}. {sense.part_of_speech} — {sense.definition}\n"
         f"   Example: {sense.example_sentence}"
-        for index, sense in enumerate(result.word.senses, start=1)
+        for index, sense in enumerate(result.entry.senses, start=1)
     )

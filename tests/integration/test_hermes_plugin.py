@@ -56,12 +56,12 @@ def hook_call(callback, message: str, platform: str = "telegram"):
 def save_args(
     operation: str,
     *,
-    word: str = "bank",
+    display_text: str = "bank",
     definition: str = "A financial institution.",
     context: str | None = None,
     matching_sense_id: int | None = None,
 ) -> dict:
-    args = {"word": word, "operation": operation}
+    args = {"display_text": display_text, "operation": operation}
     if operation != "existing_sense":
         args.update(
             {
@@ -89,10 +89,10 @@ def test_registration_exposes_two_tools_hook_and_skill(monkeypatch, tmp_path: Pa
         "vocabulary_complete_review": "vocabulary",
     }
     save_schema = context.tool_schemas["vocabulary_save_card"]["parameters"]
-    assert save_schema["required"] == ["word", "operation"]
+    assert save_schema["required"] == ["display_text", "operation"]
     assert save_schema["properties"]["operation"] == {
         "type": "string",
-        "enum": ["new_word", "new_sense", "existing_sense"],
+        "enum": ["new_entry", "new_sense", "existing_sense"],
     }
     assert save_schema["properties"]["source_context"] == {"type": "string"}
     assert save_schema["properties"]["matching_sense_id"] == {"type": "integer"}
@@ -106,7 +106,7 @@ def test_telegram_single_word_injects_capture_guidance(monkeypatch, tmp_path: Pa
 
     assert "vocabulary:vocabulary" in result
     assert "vocabulary_save_card" in result
-    assert hook_call(callback, "what does this mean?") is None
+    assert "vocabulary_save_card" in hook_call(callback, "what does this mean?")
     assert hook_call(callback, "obdurate", platform="cli") is None
 
 
@@ -122,7 +122,7 @@ def test_contextual_capture_injects_verbatim_json_and_empty_senses(
     )
 
     request_state = {
-        "word": "bank",
+        "display_text": "bank",
         "context": source_context,
         "senses": [],
     }
@@ -144,16 +144,16 @@ def test_capture_lookup_storage_error_injects_only_retry_guidance(
     context, _ = register_plugin(monkeypatch, tmp_path)
     callback = context.hooks["pre_llm_call"]
 
-    def fail_lookup(word: str):
-        raise sqlite3.OperationalError(f"private state for {word}")
+    def fail_lookup(display_text: str):
+        raise sqlite3.OperationalError(f"private state for {display_text}")
 
-    monkeypatch.setattr(callback.__self__.capture_service, "get_word", fail_lookup)
+    monkeypatch.setattr(callback.__self__.capture_service, "get_entry", fail_lookup)
 
     guidance = hook_call(callback, "bank")
 
     assert guidance == (
         "Do not call vocabulary_save_card. Reply exactly: "
-        "I couldn't save that word. Please try again."
+        "I couldn't save that entry. Please try again."
     )
     assert "private state" not in guidance
 
@@ -180,7 +180,7 @@ def test_existing_word_guidance_contains_numbered_sense_id(
 ) -> None:
     context, _ = register_plugin(monkeypatch, tmp_path)
     saved = json.loads(
-        context.tools["vocabulary_save_card"](save_args("new_word"))
+        context.tools["vocabulary_save_card"](save_args("new_entry"))
     )
 
     guidance = hook_call(context.hooks["pre_llm_call"], "bank")
@@ -198,8 +198,8 @@ def test_save_tool_returns_exact_formatted_text_and_persists(monkeypatch, tmp_pa
     payload = json.loads(
         context.tools["vocabulary_save_card"](
             save_args(
-                "new_word",
-                word="obdurate",
+                "new_entry",
+                display_text="obdurate",
                 definition="Stubbornly refusing to change one's opinion.",
             )
         )
@@ -216,7 +216,7 @@ def test_save_tool_returns_exact_formatted_text_and_persists(monkeypatch, tmp_pa
 def test_new_sense_tool_appends_verbatim_context(monkeypatch, tmp_path: Path) -> None:
     context, path = register_plugin(monkeypatch, tmp_path)
     tool = context.tools["vocabulary_save_card"]
-    tool(save_args("new_word"))
+    tool(save_args("new_entry"))
     source_context = "She sat on the bank and watched the river."
 
     result = json.loads(
@@ -241,7 +241,7 @@ def test_new_sense_tool_appends_verbatim_context(monkeypatch, tmp_path: Path) ->
 def test_existing_sense_tool_performs_no_write(monkeypatch, tmp_path: Path) -> None:
     context, path = register_plugin(monkeypatch, tmp_path)
     tool = context.tools["vocabulary_save_card"]
-    tool(save_args("new_word"))
+    tool(save_args("new_entry"))
 
     result = json.loads(
         tool(save_args("existing_sense", matching_sense_id=1))
@@ -261,11 +261,11 @@ def test_cross_word_sense_id_returns_refreshed_conflict(
 ) -> None:
     context, _ = register_plugin(monkeypatch, tmp_path)
     tool = context.tools["vocabulary_save_card"]
-    tool(save_args("new_word"))
+    tool(save_args("new_entry"))
     tool(
         save_args(
-            "new_word",
-            word="shore",
+            "new_entry",
+            display_text="shore",
             definition="Land at the edge of water.",
         )
     )
@@ -276,9 +276,9 @@ def test_cross_word_sense_id_returns_refreshed_conflict(
 
     assert result == {
         "status": "conflict",
-        "text": "That word changed while I was saving it. Please try again.",
+        "text": "That entry changed while I was saving it. Please try again.",
         "state": {
-            "word_exists": True,
+            "entry_exists": True,
             "senses": [
                 {
                     "id": 1,
@@ -295,10 +295,10 @@ def test_invalid_save_arguments_do_not_write(monkeypatch, tmp_path: Path) -> Non
     tool = context.tools["vocabulary_save_card"]
     invalid_payloads = [
         save_args("not_an_operation"),
-        {**save_args("new_word"), "word": 123},
-        {**save_args("new_word"), "source_context": 123},
-        {**save_args("new_word"), "matching_sense_id": "1"},
-        {**save_args("new_word"), "definition": 123},
+        {**save_args("new_entry"), "display_text": 123},
+        {**save_args("new_entry"), "source_context": 123},
+        {**save_args("new_entry"), "matching_sense_id": "1"},
+        {**save_args("new_entry"), "definition": 123},
     ]
 
     results = [json.loads(tool(payload)) for payload in invalid_payloads]
@@ -306,7 +306,7 @@ def test_invalid_save_arguments_do_not_write(monkeypatch, tmp_path: Path) -> Non
     assert results == [
         {
             "status": "invalid",
-            "text": "Send one word, optionally followed by context on the next line.",
+            "text": "Send a word or expression, optionally followed by context on the next line.",
         }
     ] * len(invalid_payloads)
     with Database(path).connect() as connection:
@@ -320,8 +320,8 @@ def test_pending_review_routes_next_message_and_completion_tool(monkeypatch, tmp
     save = context.tools["vocabulary_save_card"]
     save(
         save_args(
-            "new_word",
-            word="laconic",
+            "new_entry",
+            display_text="laconic",
             definition="Using very few words.",
         )
     )
@@ -354,7 +354,7 @@ def test_pending_review_precedes_contextual_capture(
     monkeypatch, tmp_path: Path
 ) -> None:
     context, path = register_plugin(monkeypatch, tmp_path)
-    context.tools["vocabulary_save_card"](save_args("new_word"))
+    context.tools["vocabulary_save_card"](save_args("new_entry"))
     settings = Settings.from_environment()
     ReviewService(
         Database(path),
@@ -389,7 +389,7 @@ def test_non_telegram_multiline_message_is_not_auto_capture(
 def test_existing_senses_survive_plugin_restart(monkeypatch, tmp_path: Path) -> None:
     first_context, path = register_plugin(monkeypatch, tmp_path)
     save = first_context.tools["vocabulary_save_card"]
-    save(save_args("new_word"))
+    save(save_args("new_entry"))
     save(
         save_args(
             "new_sense",
@@ -418,8 +418,8 @@ def test_multi_sense_capture_review_survives_restart(
     new_word = json.loads(
         save(
             {
-                "word": "bank",
-                "operation": "new_word",
+                "display_text": "bank",
+                "operation": "new_entry",
                 "part_of_speech": "noun",
                 "definition": "A financial institution.",
                 "example_sentence": "She deposited the cheque at the bank.",
@@ -429,7 +429,7 @@ def test_multi_sense_capture_review_survives_restart(
     distinct_sense = json.loads(
         save(
             {
-                "word": "bank",
+                "display_text": "bank",
                 "operation": "new_sense",
                 "source_context": "She sat on the bank and watched the river.",
                 "part_of_speech": "noun",
@@ -448,7 +448,7 @@ def test_multi_sense_capture_review_survives_restart(
     existing_sense = json.loads(
         save(
             {
-                "word": "bank",
+                "display_text": "bank",
                 "operation": "existing_sense",
                 "source_context": "She went to the bank to deposit a cheque.",
                 "matching_sense_id": financial_sense_id,
@@ -515,7 +515,7 @@ def test_multi_sense_capture_review_survives_restart(
         reopened_counts = connection.execute(
             """
             SELECT
-                (SELECT COUNT(*) FROM vocabulary_words),
+                (SELECT COUNT(*) FROM vocabulary_entries),
                 (SELECT COUNT(*) FROM vocabulary_senses),
                 (SELECT COUNT(*) FROM review_events WHERE status = 'answered')
             """

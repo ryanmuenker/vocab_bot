@@ -21,9 +21,9 @@ _CARD_FIELDS = ("part_of_speech", "definition", "example_sentence")
 def _capture_command(args: object) -> CaptureCommand | None:
     if not isinstance(args, dict):
         return None
-    word = args.get("word")
+    display_text = args.get("display_text")
     operation_value = args.get("operation")
-    if not isinstance(word, str) or not isinstance(operation_value, str):
+    if not isinstance(display_text, str) or not isinstance(operation_value, str):
         return None
     try:
         operation = CaptureOperation(operation_value)
@@ -45,7 +45,7 @@ def _capture_command(args: object) -> CaptureCommand | None:
     else:
         card = None
     return CaptureCommand(
-        word=word,
+        display_text=display_text,
         operation=operation,
         card=card,
         source_context=source_context,
@@ -60,16 +60,16 @@ def _capture_payload(result: CaptureResult) -> dict:
     }
     if result.status is CaptureStatus.CONFLICT:
         payload["state"] = {
-            "word_exists": result.word is not None,
+            "entry_exists": result.entry is not None,
             "senses": [
                 {
                     "id": sense.id,
                     "part_of_speech": sense.part_of_speech,
                     "definition": sense.definition,
                 }
-                for sense in result.word.senses
+                for sense in result.entry.senses
             ]
-            if result.word is not None
+            if result.entry is not None
             else [],
         }
     return payload

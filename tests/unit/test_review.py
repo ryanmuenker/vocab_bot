@@ -39,42 +39,33 @@ def setup_service(tmp_path: Path, now: datetime) -> tuple[ReviewService, Clock, 
 
 def add_word(database: Database, word: str, now: datetime) -> None:
     CaptureService(database, clock=lambda: now).capture(
-        CaptureCommand(
-            word=word,
-            operation=CaptureOperation.NEW_WORD,
-            card=SenseCard(
-                "adjective",
-                f"Definition of {word}.",
-                f"Example with {word}.",
-            ),
-        )
+        CaptureCommand(display_text=word, operation=CaptureOperation.NEW_ENTRY,
+        card=SenseCard(
+            "adjective",
+            f"Definition of {word}.",
+            f"Example with {word}.",
+        ),)
     )
 
 
 def add_bank_with_two_senses(database: Database) -> None:
     capture = CaptureService(database, clock=lambda: NOW)
     capture.capture(
-        CaptureCommand(
-            word="bank",
-            operation=CaptureOperation.NEW_WORD,
-            card=SenseCard(
-                part_of_speech="noun",
-                definition="A financial institution.",
-                example_sentence="She deposited the cheque at the bank.",
-            ),
-        )
+        CaptureCommand(display_text="bank", operation=CaptureOperation.NEW_ENTRY,
+        card=SenseCard(
+            part_of_speech="noun",
+            definition="A financial institution.",
+            example_sentence="She deposited the cheque at the bank.",
+        ),)
     )
     capture.capture(
-        CaptureCommand(
-            word="bank",
-            operation=CaptureOperation.NEW_SENSE,
-            card=SenseCard(
-                part_of_speech="noun",
-                definition="Land alongside a river.",
-                example_sentence="They rested on the grassy bank.",
-            ),
-            source_context="They rested on the bank beside the river.",
-        )
+        CaptureCommand(display_text="bank", operation=CaptureOperation.NEW_SENSE,
+        card=SenseCard(
+            part_of_speech="noun",
+            definition="Land alongside a river.",
+            example_sentence="They rested on the grassy bank.",
+        ),
+        source_context="They rested on the bank beside the river.",)
     )
 
 
@@ -87,11 +78,11 @@ def test_daily_review_creates_one_pending_word_event_with_all_senses(
     result = service.daily_review()
 
     assert result.status is ReviewPromptStatus.PENDING
-    assert result.word is not None
-    assert result.word.word == "bank"
-    assert len(result.word.senses) == 2
+    assert result.entry is not None
+    assert result.entry.display_text == "bank"
+    assert len(result.entry.senses) == 2
     assert result.event is not None
-    assert result.event.word_id == result.word.id
+    assert result.event.entry_id == result.entry.id
     assert result.event.review_date.isoformat() == "2026-07-16"
 
 
@@ -102,33 +93,27 @@ def test_review_reveal_keeps_senses_in_insertion_order_with_reversed_clocks(
     timestamps = iter((NOW, NOW - timedelta(days=1)))
     capture = CaptureService(database, clock=lambda: next(timestamps))
     capture.capture(
-        CaptureCommand(
-            word="bank",
-            operation=CaptureOperation.NEW_WORD,
-            card=SenseCard(
-                part_of_speech="noun",
-                definition="A financial institution.",
-                example_sentence="She deposited the cheque at the bank.",
-            ),
-        )
+        CaptureCommand(display_text="bank", operation=CaptureOperation.NEW_ENTRY,
+        card=SenseCard(
+            part_of_speech="noun",
+            definition="A financial institution.",
+            example_sentence="She deposited the cheque at the bank.",
+        ),)
     )
     capture.capture(
-        CaptureCommand(
-            word="bank",
-            operation=CaptureOperation.NEW_SENSE,
-            card=SenseCard(
-                part_of_speech="noun",
-                definition="Land alongside a river.",
-                example_sentence="They rested on the grassy bank.",
-            ),
-        )
+        CaptureCommand(display_text="bank", operation=CaptureOperation.NEW_SENSE,
+        card=SenseCard(
+            part_of_speech="noun",
+            definition="Land alongside a river.",
+            example_sentence="They rested on the grassy bank.",
+        ),)
     )
     service.daily_review()
 
     result = service.complete_review("my answer")
 
     assert result.status is ReviewCompletionStatus.COMPLETED
-    assert [sense.definition for sense in result.word.senses] == [
+    assert [sense.definition for sense in result.entry.senses] == [
         "A financial institution.",
         "Land alongside a river.",
     ]
@@ -148,12 +133,12 @@ def test_same_day_pending_is_idempotent_and_answered_is_silent(tmp_path: Path) -
     after_answer = service.daily_review()
 
     assert second.event == first.event
-    assert second.word == first.word
+    assert second.entry == first.entry
     assert completed.status is ReviewCompletionStatus.COMPLETED
     assert completed.answer_text == "brief and direct"
-    assert completed.word is not None
-    assert completed.word.last_reviewed == NOW
-    assert completed.word.review_status == "reviewed"
+    assert completed.entry is not None
+    assert completed.entry.last_reviewed == NOW
+    assert completed.entry.review_status == "reviewed"
     assert after_answer.status is ReviewPromptStatus.ALREADY_COMPLETED
 
 
@@ -181,7 +166,7 @@ def test_review_prioritizes_oldest_never_reviewed_word(tmp_path: Path) -> None:
     add_word(database, "first", datetime(2026, 7, 1, tzinfo=UTC))
     add_word(database, "second", datetime(2026, 7, 2, tzinfo=UTC))
 
-    assert service.daily_review().word.word == "first"
+    assert service.daily_review().entry.display_text == "first"
 
 
 def test_empty_library_creates_no_event(tmp_path: Path) -> None:
@@ -211,9 +196,9 @@ def test_pending_review_survives_service_restart(tmp_path: Path) -> None:
     completed = restarted.complete_review("Using few words.")
 
     assert resumed.event == first.event
-    assert resumed.word == first.word
+    assert resumed.entry == first.entry
     assert completed.status is ReviewCompletionStatus.COMPLETED
-    assert completed.word.word == "laconic"
+    assert completed.entry.display_text == "laconic"
 
 
 def test_concurrent_same_day_creation_produces_one_event(tmp_path: Path) -> None:
@@ -225,6 +210,6 @@ def test_concurrent_same_day_creation_produces_one_event(tmp_path: Path) -> None
 
     assert all(result.status is ReviewPromptStatus.PENDING for result in results)
     assert results[0].event == results[1].event
-    assert results[0].word == results[1].word
+    assert results[0].entry == results[1].entry
     with database.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM review_events").fetchone()[0] == 1

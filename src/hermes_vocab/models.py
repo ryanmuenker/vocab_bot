@@ -6,7 +6,7 @@ from enum import StrEnum
 
 
 class CaptureOperation(StrEnum):
-    NEW_WORD = "new_word"
+    NEW_ENTRY = "new_entry"
     NEW_SENSE = "new_sense"
     EXISTING_SENSE = "existing_sense"
 
@@ -20,9 +20,22 @@ class CaptureStatus(StrEnum):
     STORAGE_ERROR = "storage_error"
 
 
+class EntryTextStatus(StrEnum):
+    VALID = "valid"
+    EMPTY = "empty"
+    TOO_LONG = "too_long"
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedEntryText:
+    status: EntryTextStatus
+    display_text: str | None = None
+    normalized_text: str | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class CaptureRequest:
-    word: str
+    display_text: str
     context: str | None
 
 
@@ -35,7 +48,7 @@ class SenseCard:
 
 @dataclass(frozen=True, slots=True)
 class CaptureCommand:
-    word: str
+    display_text: str
     operation: CaptureOperation
     card: SenseCard | None = None
     source_context: str | None = None
@@ -45,7 +58,7 @@ class CaptureCommand:
 @dataclass(frozen=True, slots=True)
 class VocabularySense:
     id: int
-    word_id: int
+    entry_id: int
     definition: str
     part_of_speech: str
     example_sentence: str
@@ -54,22 +67,20 @@ class VocabularySense:
 
 
 @dataclass(frozen=True, slots=True)
-class VocabularyWord:
+class VocabularyEntry:
     id: int
-    word: str
-    normalized_word: str
+    display_text: str
+    normalized_text: str
     date_added: datetime
     last_reviewed: datetime | None
     review_status: str
     senses: tuple[VocabularySense, ...]
 
 
-
-
 @dataclass(frozen=True, slots=True)
 class CaptureResult:
     status: CaptureStatus
-    word: VocabularyWord | None = None
+    entry: VocabularyEntry | None = None
     sense: VocabularySense | None = None
 
 
@@ -90,7 +101,7 @@ class ReviewCompletionStatus(StrEnum):
 @dataclass(frozen=True, slots=True)
 class ReviewEvent:
     id: int
-    word_id: int
+    entry_id: int
     review_date: date
     status: str
     prompted_at: datetime
@@ -102,11 +113,11 @@ class ReviewEvent:
 class ReviewPromptResult:
     status: ReviewPromptStatus
     event: ReviewEvent | None = None
-    word: VocabularyWord | None = None
+    entry: VocabularyEntry | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ReviewCompletionResult:
     status: ReviewCompletionStatus
-    word: VocabularyWord | None = None
+    entry: VocabularyEntry | None = None
     answer_text: str | None = None

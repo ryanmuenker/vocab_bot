@@ -19,23 +19,23 @@ from hermes_vocab.models import (
     ReviewPromptStatus,
     SenseCard,
     VocabularySense,
-    VocabularyWord,
+    VocabularyEntry,
 )
 
 
 FIRST_SENSE = VocabularySense(
     id=1,
-    word_id=1,
+    entry_id=1,
     definition="Using very few words.",
     part_of_speech="adjective",
     example_sentence="His laconic reply ended the discussion.",
     source_context=None,
     date_added=datetime(2026, 7, 1, tzinfo=UTC),
 )
-WORD = VocabularyWord(
+WORD = VocabularyEntry(
     id=1,
-    word="laconic",
-    normalized_word="laconic",
+    display_text="laconic",
+    normalized_text="laconic",
     date_added=datetime(2026, 7, 1, tzinfo=UTC),
     last_reviewed=None,
     review_status="new",
@@ -43,7 +43,7 @@ WORD = VocabularyWord(
 )
 EVENT = ReviewEvent(
     id=1,
-    word_id=1,
+    entry_id=1,
     review_date=date(2026, 7, 16),
     status="pending",
     prompted_at=datetime(2026, 7, 16, 12, tzinfo=UTC),
@@ -74,7 +74,7 @@ def test_one_sense_completion_retains_definition_example_shape() -> None:
     text = format_review_completion(
         ReviewCompletionResult(
             ReviewCompletionStatus.COMPLETED,
-            word=WORD,
+            entry=WORD,
             answer_text="show answer",
         )
     )
@@ -88,24 +88,24 @@ def test_one_sense_completion_retains_definition_example_shape() -> None:
 def test_multi_sense_completion_numbers_every_sense_in_capture_order() -> None:
     second_sense = VocabularySense(
         id=2,
-        word_id=1,
+        entry_id=1,
         definition="Land alongside a river.",
         part_of_speech="noun",
         example_sentence="They rested on the grassy bank.",
         source_context="They rested beside the river.",
         date_added=datetime(2026, 7, 2, tzinfo=UTC),
     )
-    bank = VocabularyWord(
+    bank = VocabularyEntry(
         id=1,
-        word="bank",
-        normalized_word="bank",
+        display_text="bank",
+        normalized_text="bank",
         date_added=datetime(2026, 7, 1, tzinfo=UTC),
         last_reviewed=None,
         review_status="new",
         senses=(
             VocabularySense(
                 id=1,
-                word_id=1,
+                entry_id=1,
                 definition="A financial institution.",
                 part_of_speech="noun",
                 example_sentence="She deposited the cheque at the bank.",
@@ -117,7 +117,7 @@ def test_multi_sense_completion_numbers_every_sense_in_capture_order() -> None:
     )
 
     text = format_review_completion(
-        ReviewCompletionResult(ReviewCompletionStatus.COMPLETED, word=bank)
+        ReviewCompletionResult(ReviewCompletionStatus.COMPLETED, entry=bank)
     )
 
     assert text == (
@@ -134,8 +134,8 @@ def test_daily_script_prints_question_from_configured_database(tmp_path: Path) -
     database.initialize()
     CaptureService(database).capture(
         CaptureCommand(
-            word="laconic",
-            operation=CaptureOperation.NEW_WORD,
+            display_text="laconic",
+            operation=CaptureOperation.NEW_ENTRY,
             card=SenseCard(
                 part_of_speech="adjective",
                 definition="Using very few words.",

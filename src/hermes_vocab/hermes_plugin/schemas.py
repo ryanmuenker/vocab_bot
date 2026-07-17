@@ -4,17 +4,17 @@ from __future__ import annotations
 SAVE_CARD = {
     "name": "vocabulary_save_card",
     "description": (
-        "Persist a new word or distinct sense, or identify an existing sense. "
-        "Copy source context verbatim when supplied. For an existing sense, use "
-        "the supplied matching sense ID."
+        "Persist a new vocabulary entry or distinct sense, or identify an existing "
+        "sense. Copy source context verbatim when supplied. For an existing sense, "
+        "use the supplied matching sense ID."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "word": {"type": "string"},
+            "display_text": {"type": "string"},
             "operation": {
                 "type": "string",
-                "enum": ["new_word", "new_sense", "existing_sense"],
+                "enum": ["new_entry", "new_sense", "existing_sense"],
             },
             "source_context": {"type": "string"},
             "matching_sense_id": {"type": "integer"},
@@ -22,7 +22,7 @@ SAVE_CARD = {
             "definition": {"type": "string"},
             "example_sentence": {"type": "string"},
         },
-        "required": ["word", "operation"],
+        "required": ["display_text", "operation"],
     },
 }
 
