@@ -7,85 +7,85 @@ Tested with Hermes Agent `0.18.2` on macOS.
 ## Architecture
 
 ```text
-Telegram DM
-    │
-    ▼
-Hermes Telegram gateway ── pre_llm_call hook ── Hermes model
-                                                │
-                                                ▼
-                                   vocabulary_save_card tool
-                                                │
-                                                ▼
-                                     CaptureService ── SQLite
+configured Telegram root DM
+        │
+        ▼
+Hermes auth + command precedence
+        │
+        ▼
+gateway_inbound_intercept
+        │
+        ├── pending review ──> ReviewService ──> exact answer
+        ├── stored entry ────> SQLite ─────────> exact aggregate
+        └── unseen entry ────> one auxiliary request
+                                      │
+                                      ▼
+                              atomic CaptureService
+                                      │
+                                      ▼
+                                   SQLite
 
 Hermes no-agent cron ── scripts/daily_review.py ── ReviewService ── SQLite
           │
           └── exact stdout delivered to the Telegram home DM
 ```
 
-SQLite is the only source of truth for saved words and review state. Hermes transcripts, memory, cron metadata, and cron output may contain copies, but none decides whether a word exists or which review is pending.
+SQLite is the only source of truth for saved entries and review state. Hermes transcripts, memory, cron metadata, and cron output may contain copies, but none decides whether an entry exists or which review is pending.
 
 ### Why each component exists
 
-- `src/hermes_vocab/capture.py`: Unicode-aware single-word validation, normalization, duplicate handling, and atomic saves. It has no Hermes or Telegram dependency.
+- `src/hermes_vocab/capture.py`: Unicode-aware entry normalization, duplicate handling, and atomic multi-sense saves. It has no Hermes or Telegram dependency.
 - `src/hermes_vocab/review.py`: daily selection and pending/missed/answered transitions. It has no scheduler or transport dependency.
 - `src/hermes_vocab/database.py`: private data-directory checks, migrations, SQLite connections, WAL, and transaction policy.
-- `src/hermes_vocab/models.py`: small domain dataclasses and enums; no ORM.
-- `src/hermes_vocab/formatting.py`: exact user-facing capture and review text. Success text is emitted only after a committed save.
-- `src/hermes_vocab/config.py`: database path and explicit IANA timezone resolution.
+- `src/hermes_vocab/models.py`: small immutable domain dataclasses and enums; no ORM.
+- `src/hermes_vocab/formatting.py`: exact user-facing aggregate and review text. Success text is emitted only after a committed save.
+- `src/hermes_vocab/config.py`: database path, explicit IANA timezone, and optional dedicated Telegram chat resolution.
 - `src/hermes_vocab/migrations/`: append-only schema migrations owned by this package.
-- `src/hermes_vocab/hermes_plugin/`: the only Hermes-coupled layer: two tools, one Telegram routing hook, and one bundled skill.
+- `src/hermes_vocab/hermes_plugin/`: the only Hermes-coupled layer: tools, contextual guidance, a focused definition provider, and deterministic gateway routing.
 - `scripts/daily_review.py`: a thin deterministic cron entry point. Empty stdout means no Telegram message.
-- `tests/`: domain and real-SQLite contracts plus plugin registration seams.
+- `tests/`: domain and real-SQLite contracts plus standalone plugin registration seams.
 
 ### Deliberate constraints
 
-- A plugin, not only a prompt skill: prompts cannot safely own transactions, uniqueness, or review lifecycle state.
+- A gateway interceptor, not only a prompt skill: prompts cannot safely own transactions, uniqueness, review lifecycle state, or prevent general-agent consumers from claiming a dedicated message.
 - A separate SQLite database, not Hermes' session database: ownership, migrations, backup, and restoration remain clear.
-- No dictionary API in V1: it would add credentials, rate limits, provider selection, and sense-disambiguation failure modes. Definitions are model-generated, so verify unusual or high-stakes words.
-- No spaced repetition, tags, grading, or mandatory follow-up. The oldest never-reviewed word is chosen first, then the least recently reviewed.
-- A pending review owns the next non-command Telegram message. Answer it or ask for the answer before capturing another word.
-- A no-agent cron job asks the morning question. This avoids model cost and guarantees `What does '<word>' mean?` exactly.
+- One focused auxiliary definition request for an unseen entry: the configured DM never starts a general Hermes turn for vocabulary capture. Definitions are model-generated and may be inaccurate; verify unusual or high-stakes uses.
+- No spaced repetition, tags, grading, or mandatory follow-up. The oldest never-reviewed entry is chosen first, then the least recently reviewed.
+- A pending review owns the next non-command message in the configured root DM. Answer it or ask for the answer before capturing another entry.
+- A no-agent cron job asks the morning question. This avoids model cost and guarantees `What does '<entry>' mean?` exactly.
 
 ## Capture and review behavior
 
-Word-only capture is unchanged. Send a standalone word in the private Telegram DM:
+In the root Telegram DM selected by `HERMES_VOCAB_TELEGRAM_CHAT_ID`, the complete trimmed non-command message is one entry or expression:
 
 ```text
-bank
+pro forma
 ```
 
-To select a meaning with source context, put the word on the first line and the context on the remaining lines of the same message:
+Phrases are first-class entries; there is no word parser, tagging step, or context syntax in this dedicated inbox. Processing order is fixed:
 
-```text
-bank
-She sat on the bank and watched the river.
-```
+1. A pending review consumes the complete message as its answer.
+2. A stored entry returns every SQLite sense in insertion order with `Already saved.` and makes no model request or write.
+3. An unseen entry makes one focused auxiliary request for all credible senses. The complete validated set is committed in one SQLite transaction and returned with `✓ Saved.`.
 
-The first non-empty line must be one lexical word; the remaining text is supplied as context while preserving its internal line breaks. There is no command prefix. Consequently, any Telegram message whose first non-empty line is a standalone lexical word is intentionally routed as a vocabulary capture. A pending review takes priority, and multiline messages without a lexical first line remain ordinary conversation.
+Equivalent whitespace and case share one lookup key, while the first successfully captured display form is preserved. Concurrent requests converge on one complete aggregate. Exact duplicate generated `(part_of_speech, definition)` pairs collapse before persistence; malformed or partial provider output saves nothing.
 
-Hermes compares the intended meaning with every sense already stored for the word:
+Slash commands, non-configured chats, and Telegram topic lanes retain normal Hermes behavior. On non-dedicated conversational Telegram surfaces, the legacy first-line entry plus optional second-line context workflow remains available through `pre_llm_call`; context syntax does not apply in the dedicated DM.
 
-- A new word creates its first sense and ends with `✓ Saved.`.
-- The same meaning, including a paraphrase, is idempotent: it creates no additional sense and ends with `Already saved with this meaning.`.
-- A genuinely distinct meaning adds another sense under the same word and ends with `✓ New meaning saved.`.
-
-Context is optional evidence for sense selection; capture does not ask a follow-up question. Daily review remains word-level: it asks one `What does '<word>' mean?` question, then reveals all stored senses in capture order after an answer or `show answer`. Multiple senses are numbered. After completion, another review run on the same local day is silent.
+Daily review remains entry-level: it asks one `What does '<entry>' mean?` question, then reveals all stored senses in capture order after an answer or `show answer`. Multiple senses are numbered. After completion, another review run on the same local day is silent.
 
 ## Current workstation status
 
 Already completed on this machine:
 
 - Hermes Agent `0.18.2` installed at `~/.hermes/hermes-agent`.
-- This package installed editable into Hermes' Python environment.
-- `vocabulary` entry-point plugin enabled.
-- Vocabulary toolset enabled for Telegram.
-- `HERMES_TIMEZONE=Asia/Kuala_Lumpur` and the default database path configured in `~/.hermes/.env`.
+- The distributable vocabulary package installed into Hermes' Python environment.
+- `vocabulary` entry-point plugin and Telegram toolset enabled.
+- `HERMES_TIMEZONE=Asia/Kuala_Lumpur`, the default database path, and the dedicated Telegram root DM configured in `~/.hermes/.env`.
 - `~/.hermes/scripts/daily_review.py` installed.
+- Telegram tool progress and interim assistant messages disabled.
 - `cron.wrap_response` disabled.
-- `daily-vocabulary-review` currently scheduled for `12:00` local time.
-
-Provider login, Telegram credentials, the private home DM, and gateway service startup remain credential-gated. Complete Steps 3–5 below.
+- `daily-vocabulary-review` scheduled once for `12:00` local time.
 
 ## Setup from a clean machine
 
@@ -124,18 +124,30 @@ Configure the package in `~/.hermes/.env`:
 
 ```bash
 HERMES_TIMEZONE=Asia/Kuala_Lumpur
-HERMES_VOCAB_DB=/Users/ryanmuenker/.local/share/hermes-vocab/vocabulary.sqlite3
+HERMES_VOCAB_DB=~/.local/share/hermes-vocab/vocabulary.sqlite3
+HERMES_VOCAB_TELEGRAM_CHAT_ID=<your numeric private DM chat ID>
 ```
 
-Use your actual [IANA timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones). Keep `~/.hermes/.env` permissioned to the current user; it will also contain the Telegram token.
+Use your actual IANA timezone and allowlisted private Telegram DM ID; replace the angle-bracket placeholder rather than copying it literally. If Telegram is not configured yet, omit `HERMES_VOCAB_TELEGRAM_CHAT_ID` until Step 3. Leaving it unset disables only deterministic DM routing; tools, review cron, skill registration, and contextual guidance still load. Keep `~/.hermes/.env` permissioned to the current user; it also contains the Telegram token.
+
+Suppress tool progress and interim assistant output in Telegram:
+
+```bash
+hermes config set display.platforms.telegram.tool_progress off
+hermes config set display.platforms.telegram.interim_assistant_messages off
+```
+
+Confirm both values are `false` under `display.platforms.telegram` in `~/.hermes/config.yaml`.
 
 A plugin-load smoke check that does not call a model:
 
 ```bash
 HERMES_PLUGINS_DEBUG=1 hermes prompt-size
+hermes plugins list --plain --no-bundled
+hermes tools list --platform telegram
 ```
 
-Look for two registered vocabulary tools, one hook, and `vocabulary:vocabulary`.
+Before setting the chat ID, look for two vocabulary tools, the bundled skill, `pre_llm_call`, and the `vocabulary_definition` auxiliary task; `gateway_inbound_intercept` is intentionally absent.
 
 ### 3. Create and connect the Telegram bot
 
@@ -149,6 +161,7 @@ Look for two registered vocabulary tools, one hook, and `vocabulary:vocabulary`.
    ```
 
 5. Select Telegram, enter the bot token, and allowlist only your numeric user ID.
+6. Add the numeric ID as `HERMES_VOCAB_TELEGRAM_CHAT_ID`, rerun the smoke commands above, and confirm `gateway_inbound_intercept` now registers.
 
 Equivalent manual values in `~/.hermes/.env` are:
 
@@ -167,12 +180,13 @@ Run the gateway in the foreground first:
 hermes gateway
 ```
 
-In the bot's private DM:
+In the bot's configured private root DM:
 
-1. Send `/sethome`. The DM chat ID is the same as your user ID.
-2. Send `obdurate`.
-3. Confirm one concise card ends in `✓ Saved.`.
-4. Send `obdurate` again and confirm it says `Already saved with this meaning.` without changing the first card.
+1. Send `/sethome`. The DM chat ID is normally the same as your user ID.
+2. Send a stored entry and confirm it returns directly from SQLite with `Already saved.`.
+3. Send an unseen phrase such as `pro forma`; confirm one numbered aggregate ends in `✓ Saved.`.
+4. Repeat it with different case/whitespace; confirm the committed aggregate returns with `Already saved.` and no model request.
+5. Send `/status`; confirm ordinary Hermes command behavior.
 
 Stop the foreground process after this check, then install the persistent user service:
 
@@ -257,9 +271,9 @@ Authoritative file:
 ~/.local/share/hermes-vocab/vocabulary.sqlite3
 ```
 
-Schema migrations run automatically when the package first initializes the database after an upgrade. Migration 002 converts a version-1 database to the word-and-senses schema while preserving existing cards and review events. Take a backup before upgrading.
+Schema migrations run automatically when the package first initializes the database after an upgrade. Migration 002 introduced multiple senses. Migration 003 renames the word-oriented schema to entry-oriented names while preserving entry IDs, sense IDs and order, timestamps, review status, events, and answers.
 
-The database directory and files are restricted to the current user. SQLite uses WAL, so do not copy only the main file while writes may be active. For a reliable backup or restore, stop the gateway first, then copy or replace the database and any present `-wal`/`-shm` sidecars as one set. Start the gateway again and run a capture/review smoke check.
+The database directory and files are restricted to the current user. SQLite uses WAL, so never copy only the main file while writes may be active. Stop the gateway, then use SQLite's backup API (or copy the database and any `-wal`/`-shm` sidecars as one set). Start the gateway and run capture/review smoke checks after backup or restore.
 
 Other local state is non-authoritative but privacy-bearing:
 
