@@ -21,8 +21,8 @@ from .models import (
 )
 
 _MAX_ENTRY_TEXT = 500
-_MAX_PART_OF_SPEECH = 50
-_MAX_TEXT = 500
+MAX_PART_OF_SPEECH_LENGTH = 50
+MAX_SENSE_TEXT_LENGTH = 500
 MAX_SOURCE_CONTEXT_LENGTH = 2000
 
 
@@ -38,6 +38,16 @@ def normalize_entry_text(text: str) -> NormalizedEntryText:
         display_text=display_text,
         normalized_text=normalized_text,
     )
+
+def normalize_sense_identity(
+    part_of_speech: str,
+    definition: str,
+) -> tuple[str, str]:
+    return (
+        " ".join(unicodedata.normalize("NFKC", part_of_speech).split()).casefold(),
+        " ".join(unicodedata.normalize("NFKC", definition).split()).casefold(),
+    )
+
 
 
 def parse_capture_message(message: str) -> CaptureRequest | None:
@@ -325,15 +335,12 @@ class CaptureService:
             definition = card.definition.strip()
             example_sentence = card.example_sentence.strip()
             if not (
-                0 < len(part_of_speech) <= _MAX_PART_OF_SPEECH
-                and 0 < len(definition) <= _MAX_TEXT
-                and 0 < len(example_sentence) <= _MAX_TEXT
+                0 < len(part_of_speech) <= MAX_PART_OF_SPEECH_LENGTH
+                and 0 < len(definition) <= MAX_SENSE_TEXT_LENGTH
+                and 0 < len(example_sentence) <= MAX_SENSE_TEXT_LENGTH
             ):
                 return None
-            key = (
-                " ".join(unicodedata.normalize("NFKC", part_of_speech).split()).casefold(),
-                " ".join(unicodedata.normalize("NFKC", definition).split()).casefold(),
-            )
+            key = normalize_sense_identity(part_of_speech, definition)
             if key in seen:
                 return None
             seen.add(key)
@@ -380,9 +387,9 @@ class CaptureService:
         definition = command.card.definition.strip()
         example_sentence = command.card.example_sentence.strip()
         if not (
-            0 < len(part_of_speech) <= _MAX_PART_OF_SPEECH
-            and 0 < len(definition) <= _MAX_TEXT
-            and 0 < len(example_sentence) <= _MAX_TEXT
+            0 < len(part_of_speech) <= MAX_PART_OF_SPEECH_LENGTH
+            and 0 < len(definition) <= MAX_SENSE_TEXT_LENGTH
+            and 0 < len(example_sentence) <= MAX_SENSE_TEXT_LENGTH
         ):
             return None
         return (
