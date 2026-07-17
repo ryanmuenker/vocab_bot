@@ -8,7 +8,7 @@ from hermes_vocab.capture import (
     CaptureService,
     parse_capture_message,
 )
-from hermes_vocab.review import ReviewService
+from hermes_vocab.review import PendingReviewStatus, ReviewService
 
 
 class VocabularyHook:
@@ -32,7 +32,10 @@ class VocabularyHook:
     ):
         if platform != "telegram" or user_message.lstrip().startswith("/"):
             return None
-        if self.review_service.has_pending_review():
+        pending_status = self.review_service.pending_review_status()
+        if pending_status is PendingReviewStatus.STORAGE_ERROR:
+            return None
+        if pending_status is PendingReviewStatus.PENDING:
             return (
                 "A vocabulary review is pending in SQLite. Load the "
                 "vocabulary:vocabulary plugin skill, treat the user's original "

@@ -23,3 +23,29 @@ def test_invalid_timezone_is_rejected(monkeypatch) -> None:
 
     with pytest.raises(ConfigurationError):
         Settings.from_environment()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, None), ("", None), ("7747352551", 7747352551), ("-100123", -100123)],
+)
+def test_optional_telegram_chat_id_parsing(
+    monkeypatch,
+    value: str | None,
+    expected: int | None,
+) -> None:
+    monkeypatch.setenv("HERMES_TIMEZONE", "UTC")
+    if value is None:
+        monkeypatch.delenv("HERMES_VOCAB_TELEGRAM_CHAT_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_VOCAB_TELEGRAM_CHAT_ID", value)
+
+    assert Settings.from_environment().telegram_chat_id == expected
+
+
+def test_invalid_telegram_chat_id_names_variable(monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_TIMEZONE", "UTC")
+    monkeypatch.setenv("HERMES_VOCAB_TELEGRAM_CHAT_ID", "not-an-integer")
+
+    with pytest.raises(ConfigurationError, match="HERMES_VOCAB_TELEGRAM_CHAT_ID"):
+        Settings.from_environment()

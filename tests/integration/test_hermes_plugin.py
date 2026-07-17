@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
+import sys
+import types
+from dataclasses import dataclass
+from unittest.mock import AsyncMock, Mock
 from datetime import UTC, datetime
 from pathlib import Path
 
 from hermes_vocab.capture import MAX_SOURCE_CONTEXT_LENGTH
 from hermes_vocab.database import Database
 from hermes_vocab.config import Settings
-from hermes_vocab.formatting import format_daily_review
+from hermes_vocab.formatting import format_daily_review, format_entry
 from hermes_vocab.hermes_plugin import register
-from hermes_vocab.review import ReviewService
+from hermes_vocab.review import PendingReviewStatus, ReviewService
 
 
 class FakeContext:
@@ -20,6 +25,7 @@ class FakeContext:
         self.toolsets: dict[str, str] = {}
         self.hooks: dict[str, object] = {}
         self.skills: dict[str, Path] = {}
+        self.auxiliary_tasks: dict[str, dict] = {}
 
     def register_tool(self, *, name, toolset, schema, handler) -> None:
         self.tools[name] = handler
@@ -31,12 +37,36 @@ class FakeContext:
 
     def register_skill(self, name, path) -> None:
         self.skills[name] = Path(path)
+    def register_auxiliary_task(
+        self,
+        *,
+        key,
+        display_name,
+        description,
+        defaults,
+    ) -> None:
+        self.auxiliary_tasks[key] = {
+            "display_name": display_name,
+            "description": description,
+            "defaults": defaults,
+        }
 
 
-def register_plugin(monkeypatch, tmp_path: Path) -> tuple[FakeContext, Path]:
+
+
+def register_plugin(
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    chat_id: int | None = None,
+) -> tuple[FakeContext, Path]:
     path = tmp_path / "data" / "vocabulary.sqlite3"
     monkeypatch.setenv("HERMES_VOCAB_DB", str(path))
     monkeypatch.setenv("HERMES_TIMEZONE", "UTC")
+    if chat_id is None:
+        monkeypatch.delenv("HERMES_VOCAB_TELEGRAM_CHAT_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_VOCAB_TELEGRAM_CHAT_ID", str(chat_id))
     context = FakeContext()
     register(context)
     return context, path
@@ -77,12 +107,22 @@ def save_args(
     return args
 
 
-def test_registration_exposes_two_tools_hook_and_skill(monkeypatch, tmp_path: Path) -> None:
+def test_registration_exposes_tools_hook_skill_and_auxiliary_task(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
     context, _ = register_plugin(monkeypatch, tmp_path)
 
     assert set(context.tools) == {"vocabulary_save_card", "vocabulary_complete_review"}
     assert set(context.hooks) == {"pre_llm_call"}
     assert set(context.skills) == {"vocabulary"}
+    assert context.auxiliary_tasks == {
+        "vocabulary_definition": {
+            "display_name": "Vocabulary definition",
+            "description": "Generate structured senses for an unseen vocabulary entry",
+            "defaults": {"provider": "auto", "timeout": 60},
+        }
+    }
     assert context.skills["vocabulary"].name == "SKILL.md"
     assert context.toolsets == {
         "vocabulary_save_card": "vocabulary",
@@ -98,6 +138,72 @@ def test_registration_exposes_two_tools_hook_and_skill(monkeypatch, tmp_path: Pa
     assert save_schema["properties"]["matching_sense_id"] == {"type": "integer"}
 
 
+def test_dedicated_chat_registers_and_handles_stored_entry_without_model_or_agent(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    @dataclass(frozen=True, slots=True)
+    class GatewayInterceptResponse:
+        text: str
+
+    call_llm = AsyncMock()
+    auxiliary = types.ModuleType("agent.auxiliary_client")
+    auxiliary.async_call_llm = call_llm
+    auxiliary.extract_content_or_reasoning = lambda response: response
+    agent = types.ModuleType("agent")
+    agent.auxiliary_client = auxiliary
+    plugins = types.ModuleType("hermes_cli.plugins")
+    plugins.GatewayInterceptResponse = GatewayInterceptResponse
+    hermes_cli = types.ModuleType("hermes_cli")
+    hermes_cli.plugins = plugins
+    monkeypatch.setitem(sys.modules, "agent", agent)
+    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", auxiliary)
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins)
+
+    context, path = register_plugin(monkeypatch, tmp_path, chat_id=7747352551)
+    saved = json.loads(
+        context.tools["vocabulary_save_card"](
+            save_args(
+                "new_entry",
+                display_text="pro forma",
+                definition="Provided as a matter of form.",
+            )
+        )
+    )
+    with Database(path).connect() as connection:
+        counts_before = (
+            connection.execute("SELECT COUNT(*) FROM vocabulary_entries").fetchone()[0],
+            connection.execute("SELECT COUNT(*) FROM vocabulary_senses").fetchone()[0],
+        )
+    original_pre_llm = context.hooks["pre_llm_call"]
+    pre_llm = Mock(wraps=original_pre_llm)
+    context.hooks["pre_llm_call"] = pre_llm
+
+    response = asyncio.run(
+        context.hooks["gateway_inbound_intercept"](
+            platform="telegram",
+            sender_id="42",
+            chat_id="7747352551",
+            chat_type="dm",
+            thread_id=None,
+            user_message="PRO   FORMA",
+        )
+    )
+
+    entry = original_pre_llm.__self__.capture_service.get_entry("pro forma")
+    assert saved["status"] == "saved"
+    assert response == GatewayInterceptResponse(format_entry(entry, "Already saved."))
+    call_llm.assert_not_awaited()
+    pre_llm.assert_not_called()
+    with Database(path).connect() as connection:
+        counts_after = (
+            connection.execute("SELECT COUNT(*) FROM vocabulary_entries").fetchone()[0],
+            connection.execute("SELECT COUNT(*) FROM vocabulary_senses").fetchone()[0],
+        )
+    assert counts_after == counts_before
+
+
 def test_telegram_single_word_injects_capture_guidance(monkeypatch, tmp_path: Path) -> None:
     context, _ = register_plugin(monkeypatch, tmp_path)
     callback = context.hooks["pre_llm_call"]
@@ -108,6 +214,21 @@ def test_telegram_single_word_injects_capture_guidance(monkeypatch, tmp_path: Pa
     assert "vocabulary_save_card" in result
     assert "vocabulary_save_card" in hook_call(callback, "what does this mean?")
     assert hook_call(callback, "obdurate", platform="cli") is None
+
+
+def test_contextual_hook_fails_open_when_review_state_is_unavailable(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    context, _ = register_plugin(monkeypatch, tmp_path)
+    callback = context.hooks["pre_llm_call"]
+    monkeypatch.setattr(
+        callback.__self__.review_service,
+        "pending_review_status",
+        lambda: PendingReviewStatus.STORAGE_ERROR,
+    )
+
+    assert hook_call(callback, "perfidy") is None
 
 
 def test_contextual_capture_injects_verbatim_json_and_empty_senses(

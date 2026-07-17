@@ -14,6 +14,7 @@ class ConfigurationError(ValueError):
 class Settings:
     database_path: Path
     timezone: ZoneInfo
+    telegram_chat_id: int | None = None
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -32,4 +33,19 @@ class Settings:
             raise ConfigurationError(
                 f"Invalid IANA timezone: {timezone_name}"
             ) from error
-        return cls(database_path=database_path, timezone=timezone)
+        telegram_chat_id_text = os.environ.get(
+            "HERMES_VOCAB_TELEGRAM_CHAT_ID", ""
+        ).strip()
+        try:
+            telegram_chat_id = (
+                int(telegram_chat_id_text) if telegram_chat_id_text else None
+            )
+        except ValueError as error:
+            raise ConfigurationError(
+                "HERMES_VOCAB_TELEGRAM_CHAT_ID must be a base-10 integer"
+            ) from error
+        return cls(
+            database_path=database_path,
+            timezone=timezone,
+            telegram_chat_id=telegram_chat_id,
+        )

@@ -90,6 +90,12 @@ class EntryCaptureResult:
 
 
 
+class PendingReviewStatus(StrEnum):
+    PENDING = "pending"
+    NONE = "none"
+    STORAGE_ERROR = "storage_error"
+
+
 class ReviewPromptStatus(StrEnum):
     PENDING = "pending"
     ALREADY_COMPLETED = "already_completed"

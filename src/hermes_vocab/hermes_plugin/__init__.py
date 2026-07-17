@@ -8,6 +8,8 @@ from hermes_vocab.database import Database
 from hermes_vocab.review import ReviewService
 
 from . import schemas
+from .definition import DefinitionProvider
+from .gateway import VocabularyGatewayRouter
 from .hooks import VocabularyHook
 from .tools import ToolHandlers
 
@@ -20,6 +22,40 @@ def register(ctx) -> None:
     review_service = ReviewService(database, settings.timezone)
     handlers = ToolHandlers(capture_service, review_service)
     hook = VocabularyHook(capture_service, review_service)
+    ctx.register_auxiliary_task(
+        key="vocabulary_definition",
+        display_name="Vocabulary definition",
+        description="Generate structured senses for an unseen vocabulary entry",
+        defaults={"provider": "auto", "timeout": 60},
+    )
+
+    if settings.telegram_chat_id is not None:
+        async def call_definition_model(**kwargs) -> str:
+            from agent.auxiliary_client import (
+                async_call_llm,
+                extract_content_or_reasoning,
+            )
+
+            response = await async_call_llm(**kwargs)
+            return extract_content_or_reasoning(response) or ""
+
+        provider = DefinitionProvider(call_definition_model)
+        router = VocabularyGatewayRouter(
+            capture_service,
+            review_service,
+            provider,
+            settings.telegram_chat_id,
+        )
+
+        async def intercept(**kwargs):
+            text = await router.route(**kwargs)
+            if text is None:
+                return None
+            from hermes_cli.plugins import GatewayInterceptResponse
+
+            return GatewayInterceptResponse(text)
+
+        ctx.register_hook("gateway_inbound_intercept", intercept)
 
     ctx.register_tool(
         name="vocabulary_save_card",

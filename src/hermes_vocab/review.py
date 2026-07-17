@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from .capture import _entry_from_rows, _timestamp
 from .database import Database
 from .models import (
+    PendingReviewStatus,
     ReviewCompletionResult,
     ReviewCompletionStatus,
     ReviewEvent,
@@ -185,14 +186,14 @@ class ReviewService:
         except sqlite3.Error:
             return ReviewCompletionResult(ReviewCompletionStatus.STORAGE_ERROR)
 
-    def has_pending_review(self) -> bool:
+    def pending_review_status(self) -> PendingReviewStatus:
         try:
             with self.database.connect() as connection:
-                return (
-                    connection.execute(
-                        "SELECT 1 FROM review_events WHERE status = 'pending' LIMIT 1"
-                    ).fetchone()
-                    is not None
-                )
+                pending = connection.execute(
+                    "SELECT 1 FROM review_events WHERE status = 'pending' LIMIT 1"
+                ).fetchone()
+            if pending is None:
+                return PendingReviewStatus.NONE
+            return PendingReviewStatus.PENDING
         except sqlite3.Error:
-            return False
+            return PendingReviewStatus.STORAGE_ERROR

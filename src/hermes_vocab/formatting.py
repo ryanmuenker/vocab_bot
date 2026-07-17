@@ -25,6 +25,24 @@ def _card(entry: VocabularyEntry, sense: VocabularySense, footer: str) -> str:
     )
 
 
+def format_entry(entry: VocabularyEntry, footer: str) -> str:
+    if len(entry.senses) == 1:
+        sense = entry.senses[0]
+        return (
+            f"{entry.display_text} ({sense.part_of_speech})\n\n"
+            f"Definition:\n{sense.definition}\n\n"
+            f"Example:\n{sense.example_sentence}\n\n"
+            f"{footer}"
+        )
+    senses = "\n\n".join(
+        f"{index}. {sense.part_of_speech}\n"
+        f"Definition:\n{sense.definition}\n"
+        f"Example:\n{sense.example_sentence}"
+        for index, sense in enumerate(entry.senses, start=1)
+    )
+    return f"{entry.display_text}\n\n{senses}\n\n{footer}"
+
+
 def format_capture(result: CaptureResult) -> str:
     if result.status is CaptureStatus.INVALID:
         return "Send a word or expression, optionally followed by context on the next line."

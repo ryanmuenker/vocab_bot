@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -15,7 +16,7 @@ from hermes_vocab.models import (
     ReviewPromptStatus,
     SenseCard,
 )
-from hermes_vocab.review import ReviewService
+from hermes_vocab.review import PendingReviewStatus, ReviewService
 
 
 NOW = datetime(2026, 7, 16, 12, tzinfo=UTC)
@@ -213,3 +214,21 @@ def test_concurrent_same_day_creation_produces_one_event(tmp_path: Path) -> None
     assert results[0].entry == results[1].entry
     with database.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM review_events").fetchone()[0] == 1
+
+
+def test_pending_review_status_distinguishes_pending_none_and_storage_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, _, database = setup_service(tmp_path, NOW)
+    assert service.pending_review_status() is PendingReviewStatus.NONE
+
+    add_word(database, "laconic", NOW)
+    service.daily_review()
+    assert service.pending_review_status() is PendingReviewStatus.PENDING
+
+    def fail_connect():
+        raise sqlite3.OperationalError("private state")
+
+    monkeypatch.setattr(database, "connect", fail_connect)
+    assert service.pending_review_status() is PendingReviewStatus.STORAGE_ERROR
