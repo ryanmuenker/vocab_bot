@@ -4,15 +4,27 @@ import asyncio
 import sqlite3
 
 from hermes_vocab.capture import CaptureService, normalize_entry_text
-from hermes_vocab.formatting import format_entry, format_review_completion
+from hermes_vocab.formatting import (
+    format_entry,
+    format_hint,
+    format_review_completion,
+    format_test_completion,
+)
 from hermes_vocab.models import (
     CaptureStatus,
     EntryTextStatus,
     PendingReviewStatus,
+    TestSnapshotStatus,
 )
 from hermes_vocab.review import ReviewService
+from hermes_vocab.test_session import TestSessionService
 
 from .definition import DefinitionProvider, DefinitionStatus
+from .evaluation import (
+    EvaluationProvider,
+    complete_pending_review,
+    complete_test_question,
+)
 
 _EMPTY = "Send a word or phrase."
 _TOO_LONG = "Send a word or phrase under 500 characters."
@@ -20,6 +32,24 @@ _NOT_FOUND = "I couldn't define that. Please try another word or phrase."
 _DEFINITION_ERROR = "I couldn't define that. Please try again."
 _STORAGE_ERROR = "I couldn't save that. Please try again."
 _REVIEW_ERROR = "I couldn't check your review. Please try again."
+_TEST_ERROR = "I couldn't check your test. Please try again."
+_HINT_REQUESTS = frozenset(
+    {
+        "hint",
+        "give me a hint",
+        "can i have a hint",
+        "show me an example",
+        "example sentence",
+    }
+)
+
+
+def _is_hint_request(message: str) -> bool:
+    normalized = " ".join(message.split()).casefold()
+    normalized = normalized.rstrip("?.!").rstrip()
+    return normalized in _HINT_REQUESTS
+
+
 
 
 def _is_slash_command(message: str) -> bool:
@@ -36,12 +66,16 @@ class VocabularyGatewayRouter:
         self,
         capture_service: CaptureService,
         review_service: ReviewService,
+        test_service: TestSessionService,
         definition_provider: DefinitionProvider,
+        evaluation_provider: EvaluationProvider,
         telegram_chat_id: int,
     ) -> None:
         self._capture_service = capture_service
         self._review_service = review_service
+        self._test_service = test_service
         self._definition_provider = definition_provider
+        self._evaluation_provider = evaluation_provider
         self._telegram_chat_id = str(telegram_chat_id)
         self._inflight: dict[str, asyncio.Task[str]] = {}
         self._inflight_guard = asyncio.Lock()
@@ -69,13 +103,38 @@ class VocabularyGatewayRouter:
         if _is_slash_command(user_message):
             return None
 
-        pending = self._review_service.pending_review_status()
-        if pending is PendingReviewStatus.STORAGE_ERROR:
+        pending = self._review_service.pending_review()
+        if pending.status is PendingReviewStatus.STORAGE_ERROR:
             return _REVIEW_ERROR
-        if pending is PendingReviewStatus.PENDING:
-            return format_review_completion(
-                self._review_service.complete_review(user_message)
+        if pending.status is PendingReviewStatus.PENDING:
+            if pending.entry is None:
+                return _REVIEW_ERROR
+            if _is_hint_request(user_message):
+                return format_hint(pending.entry)
+            completion = await complete_pending_review(
+                self._review_service,
+                self._evaluation_provider,
+                user_message,
             )
+            return format_review_completion(completion)
+
+        test_state = self._test_service.current()
+        if test_state.status is TestSnapshotStatus.STORAGE_ERROR:
+            return _TEST_ERROR
+        if test_state.status is TestSnapshotStatus.ACTIVE:
+            if (
+                test_state.snapshot is None
+                or test_state.snapshot.current_question is None
+            ):
+                return _TEST_ERROR
+            if _is_hint_request(user_message):
+                return format_hint(test_state.snapshot.current_question.entry)
+            completion = await complete_test_question(
+                self._test_service,
+                self._evaluation_provider,
+                user_message,
+            )
+            return format_test_completion(completion)
 
         normalized = normalize_entry_text(user_message)
         if normalized.status is EntryTextStatus.EMPTY:

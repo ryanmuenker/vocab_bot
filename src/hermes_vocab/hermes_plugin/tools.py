@@ -9,10 +9,12 @@ from hermes_vocab.models import (
     CaptureOperation,
     CaptureResult,
     CaptureStatus,
+    ReviewCompletionResult,
     ReviewCompletionStatus,
     SenseCard,
 )
 from hermes_vocab.review import ReviewService
+from .evaluation import EvaluationProvider, complete_pending_review
 
 
 _CARD_FIELDS = ("part_of_speech", "definition", "example_sentence")
@@ -80,9 +82,11 @@ class ToolHandlers:
         self,
         capture_service: CaptureService,
         review_service: ReviewService,
+        evaluation_provider: EvaluationProvider,
     ) -> None:
         self.capture_service = capture_service
         self.review_service = review_service
+        self.evaluation_provider = evaluation_provider
 
     def save_card(self, args: dict, **kwargs) -> str:
         command = _capture_command(args)
@@ -93,9 +97,14 @@ class ToolHandlers:
         )
         return json.dumps(_capture_payload(result), ensure_ascii=False)
 
-    def complete_review(self, args: dict, **kwargs) -> str:
+    async def complete_review(self, args: dict, **kwargs) -> str:
         try:
-            result = self.review_service.complete_review(args.get("answer_text", ""))
+            answer_text = args.get("answer_text", "")
+            result = await complete_pending_review(
+                self.review_service,
+                self.evaluation_provider,
+                answer_text,
+            )
             return json.dumps(
                 {
                     "status": result.status.value,
@@ -104,9 +113,12 @@ class ToolHandlers:
                 ensure_ascii=False,
             )
         except Exception:
+            result = ReviewCompletionResult(
+                ReviewCompletionStatus.STORAGE_ERROR
+            )
             return json.dumps(
                 {
-                    "status": ReviewCompletionStatus.STORAGE_ERROR.value,
-                    "text": "I couldn't record that review. Please try again.",
+                    "status": result.status.value,
+                    "text": format_review_completion(result),
                 }
             )

@@ -29,8 +29,9 @@ SAVE_CARD = {
 COMPLETE_REVIEW = {
     "name": "vocabulary_complete_review",
     "description": (
-        "Record the user's raw response to the currently pending vocabulary review "
-        "and return the stored definition and example. Do not grade the response."
+        "Evaluate the user's raw response to the currently pending vocabulary "
+        "review, persist the authoritative grade and feedback, and return them "
+        "before the stored definition and example."
     ),
     "parameters": {
         "type": "object",

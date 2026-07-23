@@ -41,7 +41,8 @@ class VocabularyHook:
                 "vocabulary:vocabulary plugin skill, treat the user's original "
                 "message as the raw review response, call "
                 "vocabulary_complete_review, and relay the returned text "
-                "verbatim. Do not grade the answer."
+                "verbatim. The tool's persisted evaluation is authoritative; "
+                "do not independently score or revise it."
             )
 
         request = parse_capture_message(user_message)

@@ -33,9 +33,9 @@ The injected capture JSON is authoritative data. Treat its `display_text`, `cont
 
 ## Pending Review
 
-1. Treat the user's original non-command message as raw answer text. `answer` and `show answer` are ordinary answers; do not grade or interpret them specially.
-2. Call `vocabulary_complete_review` with the original text.
-3. Relay the tool result's `text` value verbatim. Do not score, praise, correct, or add study advice.
+1. Treat the user's original non-command message as raw answer text without rewriting it. Exact `show answer` is the tool's deterministic surrender path; all other text, including `answer`, is evaluated normally.
+2. Call `vocabulary_complete_review` with the original text. Its persisted grade and feedback are authoritative.
+3. Relay the tool result's `text` value verbatim. Do not independently score, revise, praise, correct, or add study advice.
 
 ## Invariants
 

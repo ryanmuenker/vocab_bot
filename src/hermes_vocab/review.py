@@ -8,6 +8,9 @@ from zoneinfo import ZoneInfo
 from .capture import _entry_from_rows, _timestamp
 from .database import Database
 from .models import (
+    Evaluation,
+    EvaluationGrade,
+    PendingReviewResult,
     PendingReviewStatus,
     ReviewCompletionResult,
     ReviewCompletionStatus,
@@ -35,6 +38,12 @@ def _event_from_row(row: sqlite3.Row) -> ReviewEvent:
         prompted_at=prompted_at,
         answered_at=_parse_timestamp(row["answered_at"]),
         answer_text=row["answer_text"],
+        grade=(
+            EvaluationGrade(row["grade"])
+            if row["grade"] is not None
+            else None
+        ),
+        feedback=row["evaluation_feedback"],
     )
 
 
@@ -71,10 +80,21 @@ class ReviewService:
 
     def daily_review(self) -> ReviewPromptResult:
         now = self.clock()
-        review_date = now.astimezone(self.timezone).date().isoformat()
+        local_date = now.astimezone(self.timezone).date()
+        review_date = local_date.isoformat()
         try:
             with self.database.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                suppressing_test = connection.execute(
+                    """
+                    SELECT 1 FROM test_sessions
+                    WHERE status = 'active'
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if suppressing_test is not None:
+                    connection.commit()
+                    return ReviewPromptResult(ReviewPromptStatus.TEST_ACTIVE)
                 current_event = connection.execute(
                     "SELECT * FROM review_events WHERE review_date = ?",
                     (review_date,),
@@ -137,22 +157,31 @@ class ReviewService:
         except sqlite3.Error:
             return ReviewPromptResult(ReviewPromptStatus.STORAGE_ERROR)
 
-    def complete_review(self, answer_text: str) -> ReviewCompletionResult:
-        answer = answer_text.strip()
-        if not answer:
+    def complete_review(
+        self,
+        expected_event_id: int,
+        answer_text: str,
+        evaluation: Evaluation | None,
+    ) -> ReviewCompletionResult:
+        if (
+            not answer_text.strip()
+            or evaluation is None
+            or not isinstance(evaluation.grade, EvaluationGrade)
+            or not evaluation.feedback.strip()
+        ):
             return ReviewCompletionResult(ReviewCompletionStatus.INVALID)
 
         now = self.clock()
+        timestamp = _timestamp(now)
         try:
             with self.database.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 event_row = connection.execute(
                     """
                     SELECT * FROM review_events
-                    WHERE status = 'pending'
-                    ORDER BY review_date DESC
-                    LIMIT 1
-                    """
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (expected_event_id,),
                 ).fetchone()
                 if event_row is None:
                     connection.commit()
@@ -160,31 +189,75 @@ class ReviewService:
                         ReviewCompletionStatus.NO_PENDING
                     )
 
-                connection.execute(
+                updated = connection.execute(
                     """
                     UPDATE review_events
-                    SET status = 'answered', answered_at = ?, answer_text = ?
+                    SET status = 'answered',
+                        answered_at = ?,
+                        answer_text = ?,
+                        grade = ?,
+                        evaluation_feedback = ?
                     WHERE id = ? AND status = 'pending'
                     """,
-                    (_timestamp(now), answer, event_row["id"]),
+                    (
+                        timestamp,
+                        answer_text,
+                        evaluation.grade.value,
+                        evaluation.feedback,
+                        expected_event_id,
+                    ),
                 )
+                if updated.rowcount != 1:
+                    connection.rollback()
+                    return ReviewCompletionResult(
+                        ReviewCompletionStatus.NO_PENDING
+                    )
                 connection.execute(
                     """
                     UPDATE vocabulary_entries
                     SET last_reviewed = ?, review_status = 'reviewed'
                     WHERE id = ?
                     """,
-                    (_timestamp(now), event_row["entry_id"]),
+                    (timestamp, event_row["entry_id"]),
                 )
                 entry = _entry_by_id(connection, event_row["entry_id"])
                 connection.commit()
                 return ReviewCompletionResult(
-                    ReviewCompletionStatus.COMPLETED,
-                    entry,
-                    answer,
+                    status=ReviewCompletionStatus.COMPLETED,
+                    entry=entry,
+                    answer_text=answer_text,
+                    grade=evaluation.grade,
+                    feedback=evaluation.feedback,
+                    event_id=expected_event_id,
                 )
         except sqlite3.Error:
             return ReviewCompletionResult(ReviewCompletionStatus.STORAGE_ERROR)
+
+    def pending_review(self) -> PendingReviewResult:
+        try:
+            with self.database.connect() as connection:
+                connection.execute("BEGIN")
+                event_row = connection.execute(
+                    """
+                    SELECT * FROM review_events
+                    WHERE status = 'pending'
+                    ORDER BY review_date DESC, id DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if event_row is None:
+                    connection.commit()
+                    return PendingReviewResult(PendingReviewStatus.NONE)
+                entry = _entry_by_id(connection, event_row["entry_id"])
+                result = PendingReviewResult(
+                    status=PendingReviewStatus.PENDING,
+                    event=_event_from_row(event_row),
+                    entry=entry,
+                )
+                connection.commit()
+                return result
+        except sqlite3.Error:
+            return PendingReviewResult(PendingReviewStatus.STORAGE_ERROR)
 
     def pending_review_status(self) -> PendingReviewStatus:
         try:

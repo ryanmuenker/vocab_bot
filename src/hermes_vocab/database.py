@@ -12,6 +12,7 @@ _MIGRATIONS = {
     1: "001_initial.sql",
     2: "002_multi_sense.sql",
     3: "003_entry_terms.sql",
+    4: "004_graded_reviews_and_tests.sql",
 }
 
 
