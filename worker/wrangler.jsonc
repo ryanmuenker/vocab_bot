@@ -1,0 +1,48 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "hermes-vocab-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-23",
+  "compatibility_flags": ["nodejs_compat"],
+  "routes": [
+    {
+      "pattern": "vocab.ryanmuenker.com",
+      "custom_domain": true
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "VOCABULARY",
+        "class_name": "VocabularyCompanion"
+      }
+    ]
+  },
+  "exports": {
+    "VocabularyCompanion": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
+  "triggers": {
+    "crons": ["0 4 * * *"]
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "secrets": {
+    "required": [
+      "TELEGRAM_BOT_TOKEN",
+      "TELEGRAM_WEBHOOK_SECRET",
+      "TELEGRAM_ALLOWED_CHAT_ID",
+      "TELEGRAM_ALLOWED_USER_ID",
+      "OPENCODE_API_KEY"
+    ]
+  },
+  "vars": {
+    "OPENCODE_BASE_URL": "https://opencode.ai/zen/go/v1",
+    "OPENCODE_MODEL": "deepseek-v4-flash",
+    "HERMES_TIMEZONE": "Asia/Kuala_Lumpur"
+  }
+}

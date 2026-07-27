@@ -1,0 +1,20 @@
+{
+  "name": "hermes-vocab-worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "types": "wrangler types --strict-vars false",
+    "typecheck": "npm run types && tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "deploy": "wrangler deploy",
+    "deploy:dry-run": "wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.18.7",
+    "typescript": "5.5.3",
+    "vitest": "4.1.8",
+    "wrangler": "4.113.0"
+  }
+}

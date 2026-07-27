@@ -1,0 +1,244 @@
+import { EvaluationGrade } from "../domain/models";
+import type { Evaluation, SenseCard, VocabularyEntry } from "../domain/models";
+import {
+  MAX_PART_OF_SPEECH_LENGTH,
+  MAX_SENSE_TEXT_LENGTH,
+  normalizeSenseIdentity,
+  trimPythonWhitespace,
+} from "../domain/normalization";
+
+export const DefinitionStatus = {
+  FOUND: "found",
+  NOT_FOUND: "not_found",
+  INVALID_RESPONSE: "invalid_response",
+  PROVIDER_ERROR: "provider_error",
+} as const;
+export type DefinitionStatus = (typeof DefinitionStatus)[keyof typeof DefinitionStatus];
+export interface DefinitionResult {
+  readonly status: DefinitionStatus;
+  readonly cards: readonly SenseCard[];
+}
+
+export const EvaluationStatus = {
+  VALID: "valid",
+  INVALID_RESPONSE: "invalid_response",
+  PROVIDER_ERROR: "provider_error",
+} as const;
+export type EvaluationStatus = (typeof EvaluationStatus)[keyof typeof EvaluationStatus];
+export interface EvaluationResult {
+  readonly status: EvaluationStatus;
+  readonly evaluation: Evaluation | null;
+}
+
+export const SHOW_ANSWER_FEEDBACK = "You chose to reveal the answer.";
+const MAX_EVALUATION_FEEDBACK_LENGTH = 500;
+const MAX_SENSES = 20;
+const VALID_GRADE: Record<string, EvaluationGrade> = {
+  [EvaluationGrade.CORRECT]: EvaluationGrade.CORRECT,
+  [EvaluationGrade.PARTIAL]: EvaluationGrade.PARTIAL,
+  [EvaluationGrade.INCORRECT]: EvaluationGrade.INCORRECT,
+};
+
+const DEFINITION_SYSTEM_PROMPT =
+  "You are a focused English dictionary enrichment service. " +
+  "Return JSON only. For a defined entry, return exactly one " +
+  "top-level key, senses, containing 1 to 20 senses. " +
+  "List every credible distinct English sense for the supplied " +
+  "entry, including common, literary, archaic, regional, and " +
+  "major technical senses. Exclude hyper-specialized jargon and " +
+  "do not split mere wording variants into separate senses. " +
+  "Each sense must contain exactly part_of_speech, definition, " +
+  "and example_sentence. Definitions must be concise and examples " +
+  "must demonstrate that sense. If the entry is not an English " +
+  "term or expression, return exactly {\"status\":\"not_found\"}.";
+
+const EVALUATION_SYSTEM_PROMPT =
+  "You evaluate an English vocabulary learner's answer against stored senses. " +
+  "Return JSON only with exactly two top-level keys: grade and feedback. " +
+  "Grade must be exactly correct, partial, or incorrect. Accept an accurate " +
+  "semantic paraphrase as correct even when it shares no wording with the stored " +
+  "definition. A response matching any one valid stored sense can be correct; do " +
+  "not require the learner to enumerate every sense. Use partial for an incomplete " +
+  "but directionally valid meaning and incorrect for an unrelated or wrong meaning. " +
+  "Feedback must briefly explain the grade, must not be blank, and must be at most " +
+  "500 characters.";
+
+function object(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+export function parseDefinitionResponse(text: unknown): DefinitionResult {
+  if (typeof text !== "string") return { status: DefinitionStatus.INVALID_RESPONSE, cards: [] };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { status: DefinitionStatus.INVALID_RESPONSE, cards: [] };
+  }
+  const payload = object(parsed);
+  if (payload === null) return { status: DefinitionStatus.INVALID_RESPONSE, cards: [] };
+  if (exactKeys(payload, ["status"]) && payload.status === "not_found") {
+    return { status: DefinitionStatus.NOT_FOUND, cards: [] };
+  }
+  if (!exactKeys(payload, ["senses"]) || !Array.isArray(payload.senses) ||
+      payload.senses.length < 1 || payload.senses.length > MAX_SENSES) {
+    return { status: DefinitionStatus.INVALID_RESPONSE, cards: [] };
+  }
+  const validated: SenseCard[] = [];
+  for (const candidate of payload.senses) {
+    const sense = object(candidate);
+    if (sense === null || !exactKeys(sense, ["part_of_speech", "definition", "example_sentence"]) ||
+        typeof sense.part_of_speech !== "string" || typeof sense.definition !== "string" ||
+        typeof sense.example_sentence !== "string") {
+      return { status: DefinitionStatus.INVALID_RESPONSE, cards: [] };
+    }
+    const card = {
+      partOfSpeech: trimPythonWhitespace(sense.part_of_speech),
+      definition: trimPythonWhitespace(sense.definition),
+      exampleSentence: trimPythonWhitespace(sense.example_sentence),
+    };
+    if (
+      Array.from(card.partOfSpeech).length < 1 ||
+      Array.from(card.partOfSpeech).length > MAX_PART_OF_SPEECH_LENGTH ||
+      Array.from(card.definition).length < 1 ||
+      Array.from(card.definition).length > MAX_SENSE_TEXT_LENGTH ||
+      Array.from(card.exampleSentence).length < 1 ||
+      Array.from(card.exampleSentence).length > MAX_SENSE_TEXT_LENGTH
+    ) return { status: DefinitionStatus.INVALID_RESPONSE, cards: [] };
+    validated.push(card);
+  }
+  const cards: SenseCard[] = [];
+  const seen = new Set<string>();
+  for (const card of validated) {
+    const [partOfSpeech, definition] = normalizeSenseIdentity(card.partOfSpeech, card.definition);
+    const identity = `${partOfSpeech.length}:${partOfSpeech}${definition}`;
+    if (!seen.has(identity)) {
+      seen.add(identity);
+      cards.push(card);
+    }
+  }
+  return { status: DefinitionStatus.FOUND, cards };
+}
+
+export function parseEvaluationResponse(text: unknown): EvaluationResult {
+  if (typeof text !== "string") return { status: EvaluationStatus.INVALID_RESPONSE, evaluation: null };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { status: EvaluationStatus.INVALID_RESPONSE, evaluation: null };
+  }
+  const payload = object(parsed);
+  if (payload === null || !exactKeys(payload, ["grade", "feedback"]) ||
+      typeof payload.grade !== "string" || typeof payload.feedback !== "string" ||
+      !Object.hasOwn(VALID_GRADE, payload.grade)) {
+    return { status: EvaluationStatus.INVALID_RESPONSE, evaluation: null };
+  }
+  const feedback = trimPythonWhitespace(payload.feedback);
+  if (Array.from(feedback).length < 1 || Array.from(feedback).length > MAX_EVALUATION_FEEDBACK_LENGTH) {
+    return { status: EvaluationStatus.INVALID_RESPONSE, evaluation: null };
+  }
+  return {
+    status: EvaluationStatus.VALID,
+    evaluation: { grade: VALID_GRADE[payload.grade]!, feedback },
+  };
+}
+
+interface OpenCodeConfig {
+  readonly apiKey: string;
+  readonly baseUrl: string;
+  readonly model: string;
+}
+
+export class OpenCodeAdapter {
+  constructor(private readonly config: OpenCodeConfig) {}
+
+  async defineEntry(displayText: string): Promise<DefinitionResult> {
+    const content = await this.chat(
+      [
+        { role: "system", content: DEFINITION_SYSTEM_PROMPT },
+        { role: "user", content: JSON.stringify({ display_text: displayText }) },
+      ],
+      4_000,
+    );
+    return content === null
+      ? { status: DefinitionStatus.PROVIDER_ERROR, cards: [] }
+      : parseDefinitionResponse(content);
+  }
+
+  async evaluateAnswer(entry: VocabularyEntry, answerText: string): Promise<EvaluationResult> {
+    if (answerText === "show answer") {
+      return {
+        status: EvaluationStatus.VALID,
+        evaluation: { grade: EvaluationGrade.INCORRECT, feedback: SHOW_ANSWER_FEEDBACK },
+      };
+    }
+    if (trimPythonWhitespace(answerText).length === 0) {
+      return { status: EvaluationStatus.INVALID_RESPONSE, evaluation: null };
+    }
+    const content = await this.chat(
+      [
+        { role: "system", content: EVALUATION_SYSTEM_PROMPT },
+        {
+          role: "user",
+          content: JSON.stringify({
+            display_text: entry.displayText,
+            answer_text: answerText,
+            senses: entry.senses.map((sense) => ({
+              part_of_speech: sense.partOfSpeech,
+              definition: sense.definition,
+              example_sentence: sense.exampleSentence,
+            })),
+          }),
+        },
+      ],
+      500,
+    );
+    return content === null
+      ? { status: EvaluationStatus.PROVIDER_ERROR, evaluation: null }
+      : parseEvaluationResponse(content);
+  }
+
+  private async chat(
+    messages: readonly { readonly role: "system" | "user"; readonly content: string }[],
+    maxTokens: number,
+  ): Promise<string | null> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60_000);
+    try {
+      const response = await fetch(`${this.config.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.config.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: this.config.model,
+          messages,
+          max_tokens: maxTokens,
+          temperature: 0,
+          tools: [],
+        }),
+        signal: controller.signal,
+      });
+      if (!response.ok) return null;
+      const payload = object(await response.json());
+      if (payload === null || !Array.isArray(payload.choices)) return null;
+      const choice = object(payload.choices[0]);
+      const message = choice === null ? null : object(choice.message);
+      return message !== null && typeof message.content === "string" ? message.content : null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+}
