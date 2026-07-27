@@ -200,7 +200,13 @@ export class OpenCodeAdapter {
           }),
         },
       ],
-      500,
+      // `max_tokens` bounds reasoning tokens plus content, and the configured
+      // model reasons before answering: grading one answer spends ~650 tokens
+      // thinking. A 500 budget truncated the JSON mid-key, which surfaced as
+      // "I couldn't evaluate that answer" for exactly the substantive answers
+      // that deserve grading, while nonsense answers stayed cheap enough to
+      // pass. Budget for the reasoning, not just the two short fields.
+      4_000,
     );
     return content === null
       ? { status: EvaluationStatus.PROVIDER_ERROR, evaluation: null }

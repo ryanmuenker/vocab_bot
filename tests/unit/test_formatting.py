@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
 
 from hermes_vocab.formatting import (
     format_capture,
@@ -358,15 +359,35 @@ def test_study_schedule_formats_progress_retry_and_next_prompt() -> None:
         datetime(2026, 7, 21, 4, tzinfo=UTC),
         StudyProgress(completed=1, total=3),
         retry_queued=True,
+        timezone=ZoneInfo("Asia/Kuala_Lumpur"),
         next_prompt=next_prompt,
     ) == (
         "Rated: Again\n"
-        "Next due: 2026-07-21 04:00 UTC\n"
+        "Next due: 2026-07-21 12:00 (UTC+08:00)\n"
         "Progress: 1 of 3 complete.\n"
         "Retry added at the end.\n\n"
         "Review 2 of 3 · 1 due\n"
         "What does 'laconic' mean?"
     )
+
+
+def test_study_schedule_renders_the_due_instant_in_the_learners_zone() -> None:
+    """A bare UTC stamp reads as the wrong time of day to anyone off UTC."""
+    due = datetime(2026, 7, 28, 8, 3, tzinfo=UTC)
+    progress = StudyProgress(completed=1, total=2)
+    for zone, expected in (
+        ("UTC", "2026-07-28 08:03 (UTC+00:00)"),
+        ("Asia/Kuala_Lumpur", "2026-07-28 16:03 (UTC+08:00)"),
+        ("Asia/Kathmandu", "2026-07-28 13:48 (UTC+05:45)"),
+        ("America/New_York", "2026-07-28 04:03 (UTC-04:00)"),
+    ):
+        assert f"Next due: {expected}" in format_study_schedule(
+            ReviewRating.GOOD,
+            due,
+            progress,
+            retry_queued=False,
+            timezone=ZoneInfo(zone),
+        )
 
 
 def test_final_directional_totals_are_exact() -> None:

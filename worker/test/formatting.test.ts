@@ -447,11 +447,11 @@ describe("study schedule formatting", () => {
         ReviewRating.AGAIN,
         new Date("2026-07-21T04:00:00Z"),
         { completed: 1, total: 3 },
-        { retryQueued: true, nextPrompt },
+        { retryQueued: true, timeZone: "Asia/Kuala_Lumpur", nextPrompt },
       ),
     ).toBe(
       "Rated: Again\n" +
-        "Next due: 2026-07-21 04:00 UTC\n" +
+        "Next due: 2026-07-21 12:00 (UTC+08:00)\n" +
         "Progress: 1 of 3 complete.\n" +
         "Retry added at the end.\n\n" +
         "Review 2 of 3 · 1 due\n" +
@@ -465,22 +465,29 @@ describe("study schedule formatting", () => {
         ReviewRating.EASY,
         new Date("2026-08-03T09:07:00Z"),
         { completed: 3, total: 3 },
-        { retryQueued: false },
+        { retryQueued: false, timeZone: "Asia/Kuala_Lumpur" },
       ),
     ).toBe(
-      "Rated: Easy\nNext due: 2026-08-03 09:07 UTC\nProgress: 3 of 3 complete.",
+      "Rated: Easy\nNext due: 2026-08-03 17:07 (UTC+08:00)\nProgress: 3 of 3 complete.",
     );
   });
 
-  it("renders the effective due instant in UTC regardless of its offset", () => {
-    expect(
-      formatStudySchedule(
-        ReviewRating.GOOD,
-        new Date("2026-07-21T00:30:00+05:30"),
-        { completed: 2, total: 4 },
-        { retryQueued: false },
-      ),
-    ).toBe("Rated: Good\nNext due: 2026-07-20 19:00 UTC\nProgress: 2 of 4 complete.");
+  it("renders the due instant in the learner's zone, matching Python", () => {
+    // A bare UTC stamp reads as the wrong time of day to anyone off UTC.
+    const due = new Date("2026-07-28T08:03:00Z");
+    for (const [timeZone, expected] of [
+      ["UTC", "2026-07-28 08:03 (UTC+00:00)"],
+      ["Asia/Kuala_Lumpur", "2026-07-28 16:03 (UTC+08:00)"],
+      ["Asia/Kathmandu", "2026-07-28 13:48 (UTC+05:45)"],
+      ["America/New_York", "2026-07-28 04:03 (UTC-04:00)"],
+    ] as const) {
+      expect(
+        formatStudySchedule(ReviewRating.GOOD, due, { completed: 1, total: 2 }, {
+          retryQueued: false,
+          timeZone,
+        }),
+      ).toContain(`Next due: ${expected}`);
+    }
   });
 });
 

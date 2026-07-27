@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from .models import (
     CardDirection,
@@ -138,15 +139,34 @@ def format_study_evaluation(
     return f"{result}\n\nChoose effort: {choice_text}."
 
 
+def _format_due(effective_due: datetime, timezone: ZoneInfo) -> str:
+    """Render a due instant in the learner's own clock.
+
+    A bare UTC stamp is unreadable to anyone who is not on UTC: '08:03 UTC'
+    reads as morning to a learner whose watch says 16:03. The offset stays
+    attached so the value is still unambiguous.
+    """
+    local = effective_due.astimezone(timezone)
+    offset = local.utcoffset() or timedelta(0)
+    seconds = int(offset.total_seconds())
+    sign = "+" if seconds >= 0 else "-"
+    seconds = abs(seconds)
+    return (
+        f"{local.strftime('%Y-%m-%d %H:%M')} "
+        f"(UTC{sign}{seconds // 3600:02d}:{seconds % 3600 // 60:02d})"
+    )
+
+
 def format_study_schedule(
     rating: ReviewRating,
     effective_due: datetime,
     progress: StudyProgress,
     *,
     retry_queued: bool,
+    timezone: ZoneInfo,
     next_prompt: str | None = None,
 ) -> str:
-    due = effective_due.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    due = _format_due(effective_due, timezone)
     lines = [
         f"Rated: {rating.value.title()}",
         f"Next due: {due}",

@@ -186,14 +186,44 @@ export function formatStudyEvaluation(
   return `${result}\n\nChoose effort: ${choices.map(titleCase).join(" or ")}.`;
 }
 
+/**
+ * Render a due instant in the learner's own clock.
+ *
+ * A bare UTC stamp is unreadable to anyone who is not on UTC: "08:03 UTC"
+ * reads as morning to a learner whose watch says 16:03. The offset stays
+ * attached so the value is still unambiguous. Mirrors `_format_due` in
+ * `src/hermes_vocab/formatting.py`.
+ */
+function formatDue(effectiveDue: Date, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZoneName: "longOffset",
+  }).formatToParts(effectiveDue);
+  const field: Record<string, string> = {};
+  for (const part of parts) field[part.type] = part.value;
+  // `longOffset` renders UTC itself as a bare "GMT", every other zone as
+  // "GMT+08:00"; Python writes the zero offset explicitly, so normalize.
+  const offset = (field.timeZoneName ?? "GMT").replace("GMT", "") || "+00:00";
+  return `${field.year}-${field.month}-${field.day} ${field.hour}:${field.minute} (UTC${offset})`;
+}
+
 export function formatStudySchedule(
   rating: ReviewRating,
   effectiveDue: Date,
   progress: StudyProgress,
-  options: { readonly retryQueued: boolean; readonly nextPrompt?: string | null },
+  options: {
+    readonly retryQueued: boolean;
+    readonly timeZone: string;
+    readonly nextPrompt?: string | null;
+  },
 ): string {
-  const iso = effectiveDue.toISOString();
-  const due = `${iso.slice(0, 10)} ${iso.slice(11, 16)} UTC`;
+  const due = formatDue(effectiveDue, options.timeZone);
   let text =
     `Rated: ${titleCase(rating)}\n` +
     `Next due: ${due}\n` +

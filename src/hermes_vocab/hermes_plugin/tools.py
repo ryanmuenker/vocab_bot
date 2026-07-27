@@ -188,6 +188,7 @@ class ToolHandlers:
                 transition.effective_due,
                 snapshot.progress,
                 retry_queued=transition.retry_same_session,
+                timezone=self.review_service.timezone,
                 next_prompt=(
                     snapshot.current_prompt.prompt_text
                     if (
@@ -205,7 +206,11 @@ class ToolHandlers:
         messages = {
             StudyAnswerStatus.INVALID_INPUT: "Send a non-empty answer.",
             StudyAnswerStatus.INVALID_RATING: "Send one of the listed effort ratings.",
-            StudyAnswerStatus.EVALUATION_ERROR: "I couldn't evaluate that answer. Please try again.",
+            StudyAnswerStatus.EVALUATION_ERROR: (
+                "I couldn't evaluate that answer, and nothing was recorded. "
+                "Send your answer again — the next message you send is graded "
+                "as your answer."
+            ),
             StudyAnswerStatus.NO_ACTIVE: "There isn't a delivered study prompt waiting.",
             StudyAnswerStatus.STALE: "That study prompt is no longer current.",
             StudyAnswerStatus.STORAGE_ERROR: "I couldn't save that study step. Please try again.",
