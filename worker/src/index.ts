@@ -1,5 +1,5 @@
-import { parseTestCommand, slashCommandName } from "./domain/routing";
-import { parseExportEnvelope, sha256Snapshot } from "./domain/snapshot";
+import { parseStudyCommand, slashCommandName } from "./domain/routing";
+import { parseVerifiedEnvelope, sha256Snapshot } from "./domain/snapshot";
 import { TelegramAdapter } from "./integrations/telegram";
 
 export { VocabularyCompanion } from "./vocabulary-companion";
@@ -106,10 +106,11 @@ async function webhook(request: Request, env: Env): Promise<Response> {
   }
   const admitted = telegramMessage(payload, env);
   if (admitted === null) return new Response(null, { status: 200 });
+  // Unknown slash commands are ignored; anything else is capturable text.
   const commandName = slashCommandName(admitted.text);
-  if (commandName !== null && commandName !== "test") return new Response(null, { status: 200 });
-  const command = parseTestCommand(admitted.text);
-  if (command === "other" && commandName !== null) return new Response(null, { status: 200 });
+  if (commandName !== null && parseStudyCommand(admitted.text) === null) {
+    return new Response(null, { status: 200 });
+  }
   await owner(env).enqueueTelegramUpdate(admitted);
   return new Response(null, { status: 200 });
 }
@@ -123,9 +124,9 @@ async function admin(request: Request, env: AdminEnv, pathname: string): Promise
 
   try {
     if (request.method === "POST" && pathname === "/admin/import") {
-      const envelope = parseExportEnvelope(await readJson(request, MAX_IMPORT_BYTES));
+      const envelope = await parseVerifiedEnvelope(await readJson(request, MAX_IMPORT_BYTES));
       if (envelope === null) return json({ error: "invalid request" }, 400);
-      return json(await owner(env).importSnapshot(envelope.snapshot, envelope.sha256));
+      return json(await owner(env).importSnapshot(envelope.snapshot));
     }
     if (request.method === "GET" && pathname === "/admin/export") {
       const snapshot = await owner(env).exportSnapshot();

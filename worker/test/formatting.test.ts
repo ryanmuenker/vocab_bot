@@ -2,25 +2,31 @@ import { describe, expect, it } from "vitest";
 
 import {
   CaptureStatus,
+  CardDirection,
+  CardScheduleState,
   EvaluationGrade,
-  ReviewCompletionStatus,
-  ReviewPromptStatus,
-  TestCompletionStatus,
-  TestSessionStatus,
-  TestStartStatus,
-  type TestQuestion,
-  type TestSessionSnapshot,
+  ReviewRating,
+  StudyMode,
+  StudyPromptStatus,
+  StudyQueueStatus,
+  StudySessionStatus,
+  type StudyAnswerContext,
+  type StudyCardSnapshot,
+  type StudyPromptSnapshot,
+  type StudyQueueItemSnapshot,
+  type StudySnapshot,
   type VocabularyEntry,
   type VocabularySense,
 } from "../src/domain/models";
 import {
   formatCapture,
-  formatDailyReview,
+  formatDirectionalTotals,
   formatEntry,
   formatHint,
-  formatReviewCompletion,
-  formatTestCompletion,
-  formatTestStart,
+  formatStudyEvaluation,
+  formatStudyEvaluationResult,
+  formatStudyPrompt,
+  formatStudySchedule,
 } from "../src/domain/formatting";
 
 const SENSE: VocabularySense = {
@@ -51,46 +57,95 @@ const SECOND_SENSE: VocabularySense = {
   sourceContext: null,
 };
 
-const MULTI_WORD: VocabularyEntry = {
+const MULTI_SENSE_WORD: VocabularyEntry = {
   ...WORD,
-  displayText: "pro forma",
-  normalizedText: "pro forma",
   senses: [SENSE, SECOND_SENSE],
 };
 
-function question(
-  position: number,
-  overrides: Partial<TestQuestion> = {},
-): TestQuestion {
+const MULTI_WORD: VocabularyEntry = {
+  ...MULTI_SENSE_WORD,
+  displayText: "pro forma",
+  normalizedText: "pro forma",
+};
+
+interface StudyContextOptions {
+  readonly direction?: CardDirection;
+  readonly entry?: VocabularyEntry;
+  readonly sense?: VocabularySense | null;
+  readonly grade?: EvaluationGrade | null;
+  readonly retry?: boolean;
+}
+
+function studyContext(options: StudyContextOptions = {}): StudyAnswerContext {
+  const direction = options.direction ?? CardDirection.FORWARD;
+  const entry = options.entry ?? WORD;
+  const sense = options.sense ?? null;
+  const grade = options.grade ?? null;
+  const retry = options.retry ?? false;
+
+  const card: StudyCardSnapshot = {
+    id: 101,
+    entryId: entry.id,
+    senseId: sense === null ? null : sense.id,
+    direction,
+    state: CardScheduleState.NEW,
+    stability: null,
+    difficulty: null,
+    due: new Date("2026-07-20T12:00:00Z"),
+    effectiveDue: new Date("2026-07-20T12:00:00Z"),
+    lastReview: null,
+    repetitions: 0,
+    lapses: 0,
+    createdAt: new Date("2026-07-01T00:00:00Z"),
+  };
+  const queueItem: StudyQueueItemSnapshot = {
+    id: 201,
+    card,
+    position: retry ? 3 : 1,
+    status: StudyQueueStatus.CURRENT,
+    retryOfQueueItemId: retry ? 99 : null,
+  };
+  const prompt: StudyPromptSnapshot = {
+    id: 301,
+    sessionId: 401,
+    queueItemId: queueItem.id,
+    promptKey: "prompt-1",
+    promptText: "Persisted.",
+    status: grade === null ? StudyPromptStatus.DELIVERED : StudyPromptStatus.ANSWERED,
+    preparedAt: new Date("2026-07-20T12:00:00Z"),
+    deliveredAt: new Date("2026-07-20T12:00:00Z"),
+    answeredAt: grade === null ? null : new Date("2026-07-20T12:01:00Z"),
+  };
   return {
-    id: 10 + position,
-    sessionId: 7,
-    position,
-    entry: WORD,
-    answerText: null,
-    grade: null,
-    feedback: null,
-    answeredAt: null,
-    ...overrides,
+    prompt,
+    queueItem,
+    entry,
+    sense,
+    draft:
+      grade === null
+        ? null
+        : {
+            id: 501,
+            submittedAnswer: "learner answer",
+            evaluation: { grade, feedback: "Right direction." },
+            answeredAt: new Date("2026-07-20T12:01:00Z"),
+          },
   };
 }
 
-function snapshot(
-  currentQuestion: TestQuestion | null,
-  questions: readonly TestQuestion[],
-  overrides: Partial<TestSessionSnapshot> = {},
-): TestSessionSnapshot {
+function studySnapshot(
+  context: StudyAnswerContext,
+  progress: { completed: number; total: number },
+  mode: StudyMode = StudyMode.REVIEW,
+): StudySnapshot {
   return {
-    session: {
-      id: 7,
-      status: currentQuestion === null ? TestSessionStatus.COMPLETED : TestSessionStatus.ACTIVE,
-      startedAt: "2026-07-19T00:00:00Z",
-      completedAt: currentQuestion === null ? "2026-07-19T00:05:00Z" : null,
-    },
-    questions,
-    currentQuestion,
-    summary: { correct: 0, partial: 0, incorrect: 0 },
-    ...overrides,
+    sessionId: context.prompt.sessionId,
+    mode,
+    status: StudySessionStatus.ACTIVE,
+    localDate: "2026-07-20",
+    queue: [context.queueItem],
+    currentPrompt: context.prompt,
+    progress,
   };
 }
 
@@ -113,13 +168,14 @@ describe("entry, capture, and hint formatting", () => {
     );
     expect(formatCapture({ status: CaptureStatus.ALREADY_EXISTS, entry: WORD, sense: SENSE })).toBe(
       "Obdurate (adjective)\n\nDefinition:\nStubbornly refusing to change one's opinion.\n\n" +
-        "Example:\nThe committee remained obdurate despite new evidence.\n\nAlready saved with this meaning.",
+        "Example:\nThe committee remained obdurate despite new evidence.\n\n" +
+        "Already saved with this meaning.",
     );
+    const conflict = formatCapture({ status: CaptureStatus.CONFLICT });
+    expect(conflict).toBe("That entry changed while I was saving it. Please try again.");
+    expect(conflict).not.toContain("Saved");
     expect(formatCapture({ status: CaptureStatus.INVALID })).toBe(
       "Send a word or expression, optionally followed by context on the next line.",
-    );
-    expect(formatCapture({ status: CaptureStatus.CONFLICT })).toBe(
-      "That entry changed while I was saving it. Please try again.",
     );
     expect(formatCapture({ status: CaptureStatus.STORAGE_ERROR })).toBe(
       "I couldn't save that entry. Please try again.",
@@ -129,67 +185,215 @@ describe("entry, capture, and hint formatting", () => {
     );
   });
 
-  it("preserves exact single- and multi-sense entry whitespace and order", () => {
+  it("preserves the one-sense entry shape with the requested footer", () => {
     expect(formatEntry(WORD, "Already saved.")).toBe(
       "obdurate (adjective)\n\n" +
-        "Definition:\nStubbornly refusing to change one's opinion.\n\n" +
-        "Example:\nThe committee remained obdurate despite new evidence.\n\nAlready saved.",
-    );
-    expect(formatEntry(MULTI_WORD, "✓ Saved.")).toBe(
-      "pro forma\n\n" +
-        "1. adjective\nDefinition:\nStubbornly refusing to change one's opinion.\n" +
-        "Example:\nThe committee remained obdurate despite new evidence.\n\n" +
-        "2. adjective\nDefinition:\nResistant to persuasion.\n" +
-        "Example:\nThe witness remained obdurate.\n\n✓ Saved.",
+        "Definition:\n" +
+        "Stubbornly refusing to change one's opinion.\n\n" +
+        "Example:\n" +
+        "The committee remained obdurate despite new evidence.\n\n" +
+        "Already saved.",
     );
   });
 
-  it("uses the first stored sense for hints", () => {
-    expect(formatHint(MULTI_WORD)).toBe(
+  it("preserves all senses in database order", () => {
+    expect(formatEntry(MULTI_WORD, "✓ Saved.")).toBe(
+      "pro forma\n\n" +
+        "1. adjective\n" +
+        "Definition:\n" +
+        "Stubbornly refusing to change one's opinion.\n" +
+        "Example:\n" +
+        "The committee remained obdurate despite new evidence.\n\n" +
+        "2. adjective\n" +
+        "Definition:\n" +
+        "Resistant to persuasion.\n" +
+        "Example:\n" +
+        "The witness remained obdurate.\n\n" +
+        "✓ Saved.",
+    );
+  });
+
+  it("returns the complete stored example as a hint", () => {
+    expect(formatHint(WORD)).toBe(
+      "Hint: The committee remained obdurate despite new evidence.",
+    );
+  });
+
+  it("uses the first stored sense for a multi-sense hint", () => {
+    expect(formatHint(MULTI_SENSE_WORD)).toBe(
       "Hint: The committee remained obdurate despite new evidence.",
     );
   });
 });
 
-describe("daily review formatting", () => {
-  it("matches all review prompt status strings", () => {
-    expect(formatDailyReview({ status: ReviewPromptStatus.PENDING, entry: WORD })).toBe(
-      "What does 'obdurate' mean?",
+describe("study prompt formatting", () => {
+  it("formats current, total, backlog, and tail retry exactly", () => {
+    const current = studyContext();
+    const retry = studyContext({ retry: true });
+
+    expect(
+      formatStudyPrompt(current, studySnapshot(current, { completed: 0, total: 3 }), {
+        dueBacklog: 2,
+      }),
+    ).toBe("Review 1 of 3 · 2 due\nWhat does 'obdurate' mean?");
+    expect(
+      formatStudyPrompt(retry, studySnapshot(retry, { completed: 2, total: 3 }), {
+        dueBacklog: 1,
+      }),
+    ).toBe("Review 3 of 3 · 1 due · retry\nWhat does 'obdurate' mean?");
+  });
+
+  it("clamps the current position to the session total", () => {
+    const context = studyContext();
+
+    expect(
+      formatStudyPrompt(context, studySnapshot(context, { completed: 3, total: 3 }), {
+        dueBacklog: 0,
+      }),
+    ).toBe("Review 3 of 3 · 0 due\nWhat does 'obdurate' mean?");
+  });
+
+  it("shows only the selected definition for a reverse multi-sense prompt", () => {
+    const context = studyContext({
+      direction: CardDirection.REVERSE,
+      entry: MULTI_SENSE_WORD,
+      sense: SECOND_SENSE,
+    });
+
+    const text = formatStudyPrompt(
+      context,
+      studySnapshot(context, { completed: 0, total: 5 }),
+      { dueBacklog: 4 },
     );
-    expect(formatDailyReview({ status: ReviewPromptStatus.ALREADY_COMPLETED })).toBe("");
-    expect(formatDailyReview({ status: ReviewPromptStatus.TEST_ACTIVE })).toBe("");
-    expect(formatDailyReview({ status: ReviewPromptStatus.EMPTY })).toBe(
-      "Save a word first, then I'll have something to review.",
+
+    expect(text).toBe(
+      "Review 1 of 5 · 4 due\n" +
+        "Which saved word or expression matches this definition?\n\n" +
+        "Resistant to persuasion.",
     );
-    expect(() => formatDailyReview({ status: ReviewPromptStatus.STORAGE_ERROR })).toThrow(
-      "Could not prepare the daily vocabulary review",
+    expect(text.toLowerCase()).not.toContain("obdurate");
+    expect(text).not.toContain(SECOND_SENSE.exampleSentence);
+    expect(text).not.toContain(SENSE.definition);
+  });
+
+  it("rejects a reverse prompt without a selected sense", () => {
+    const context = studyContext({ direction: CardDirection.REVERSE });
+
+    expect(() =>
+      formatStudyPrompt(context, studySnapshot(context, { completed: 0, total: 1 }), {
+        dueBacklog: 0,
+      }),
+    ).toThrow("reverse study prompts require a selected sense");
+  });
+
+  it("uses the directional test header in test modes", () => {
+    const forward = studyContext();
+    expect(
+      formatStudyPrompt(
+        forward,
+        studySnapshot(forward, { completed: 0, total: 5 }, StudyMode.TEST_FORWARD),
+        { dueBacklog: 4 },
+      ),
+    ).toBe("Question 1 of 5\nWhat does 'obdurate' mean?");
+
+    const reverse = studyContext({
+      direction: CardDirection.REVERSE,
+      entry: MULTI_SENSE_WORD,
+      sense: SECOND_SENSE,
+    });
+    expect(
+      formatStudyPrompt(
+        reverse,
+        studySnapshot(reverse, { completed: 0, total: 5 }, StudyMode.TEST_REVERSE),
+        { dueBacklog: 4 },
+      ),
+    ).toBe(
+      "Question 1 of 5\nWhich saved word matches this definition?\nResistant to persuasion.",
     );
   });
 
-  it("formats grade and feedback before canonical one- and multi-sense reveals", () => {
+  it("pins a test retry to the last question slot", () => {
+    const retry = studyContext({ retry: true });
+
     expect(
-      formatReviewCompletion({
-        status: ReviewCompletionStatus.COMPLETED,
-        entry: WORD,
-        answerText: "It means stubborn.",
-        grade: EvaluationGrade.CORRECT,
-        feedback: "Accurate paraphrase.",
-        eventId: 7,
-      }),
-    ).toBe(
-      "Grade: Correct\nFeedback: Accurate paraphrase.\n\n" +
-        "Definition:\nStubbornly refusing to change one's opinion.\n\n" +
-        "Example:\nThe committee remained obdurate despite new evidence.",
+      formatStudyPrompt(
+        retry,
+        studySnapshot(retry, { completed: 4, total: 5 }, StudyMode.TEST_FORWARD),
+        { dueBacklog: 0 },
+      ),
+    ).toBe("Question 5 of 5 · retry\nWhat does 'obdurate' mean?");
+  });
+});
+
+describe("study evaluation formatting", () => {
+  it("reveals grade and feedback before the allowed choices", () => {
+    const context = studyContext({ grade: EvaluationGrade.PARTIAL });
+
+    const text = formatStudyEvaluation(context, [ReviewRating.AGAIN, ReviewRating.HARD]);
+
+    expect(text).toBe(
+      "Grade: Partial\n" +
+        "Feedback: Right direction.\n\n" +
+        "Definition:\n" +
+        "Stubbornly refusing to change one's opinion.\n\n" +
+        "Example:\n" +
+        "The committee remained obdurate despite new evidence.\n\n" +
+        "Choose effort: Again or Hard.",
     );
+    expect(text.indexOf("Grade:")).toBeLessThan(text.indexOf("Definition:"));
+    expect(text.indexOf("Definition:")).toBeLessThan(text.indexOf("Choose effort:"));
+  });
+
+  it("joins three allowed choices in order", () => {
+    const context = studyContext({ grade: EvaluationGrade.CORRECT });
+
     expect(
-      formatReviewCompletion({
-        status: ReviewCompletionStatus.COMPLETED,
-        entry: MULTI_WORD,
-        grade: EvaluationGrade.PARTIAL,
-        feedback: "You identified part of the meaning.",
-      }),
+      formatStudyEvaluation(context, [ReviewRating.HARD, ReviewRating.GOOD, ReviewRating.EASY]),
     ).toBe(
-      "Grade: Partial\nFeedback: You identified part of the meaning.\n\n" +
+      "Grade: Correct\n" +
+        "Feedback: Right direction.\n\n" +
+        "Definition:\n" +
+        "Stubbornly refusing to change one's opinion.\n\n" +
+        "Example:\n" +
+        "The committee remained obdurate despite new evidence.\n\n" +
+        "Choose effort: Hard or Good or Easy.",
+    );
+  });
+
+  it("omits the effort prompt entirely when there are no choices", () => {
+    const context = studyContext({ grade: EvaluationGrade.INCORRECT });
+
+    const text = formatStudyEvaluation(context, []);
+
+    expect(text).toBe(formatStudyEvaluationResult(context));
+    expect(text).not.toContain("Choose effort:");
+  });
+
+  it("reveals a finalized incorrect answer without an empty effort prompt", () => {
+    const context = studyContext({ grade: EvaluationGrade.INCORRECT });
+
+    const text = formatStudyEvaluationResult(context);
+
+    expect(text).toBe(
+      "Grade: Incorrect\n" +
+        "Feedback: Right direction.\n\n" +
+        "Definition:\n" +
+        "Stubbornly refusing to change one's opinion.\n\n" +
+        "Example:\n" +
+        "The committee remained obdurate despite new evidence.",
+    );
+    expect(text).not.toContain("Choose effort:");
+  });
+
+  it("reveals every stored sense for a multi-sense forward card", () => {
+    const context = studyContext({
+      entry: MULTI_SENSE_WORD,
+      grade: EvaluationGrade.PARTIAL,
+    });
+
+    expect(formatStudyEvaluationResult(context)).toBe(
+      "Grade: Partial\n" +
+        "Feedback: Right direction.\n\n" +
         "1. adjective — Stubbornly refusing to change one's opinion.\n" +
         "   Example: The committee remained obdurate despite new evidence.\n\n" +
         "2. adjective — Resistant to persuasion.\n" +
@@ -197,118 +401,104 @@ describe("daily review formatting", () => {
     );
   });
 
-  it("matches every review completion failure literal without revealing", () => {
-    expect(formatReviewCompletion({ status: ReviewCompletionStatus.INVALID })).toBe(
-      "Send an answer, or type 'show answer'.",
+  it("reveals the answer and only the selected sense for a reverse card", () => {
+    const context = studyContext({
+      direction: CardDirection.REVERSE,
+      entry: MULTI_SENSE_WORD,
+      sense: SECOND_SENSE,
+      grade: EvaluationGrade.CORRECT,
+    });
+
+    expect(formatStudyEvaluationResult(context)).toBe(
+      "Grade: Correct\n" +
+        "Feedback: Right direction.\n\n" +
+        "Answer: obdurate\n\n" +
+        "Definition:\n" +
+        "Resistant to persuasion.\n\n" +
+        "Example:\n" +
+        "The witness remained obdurate.",
     );
-    expect(formatReviewCompletion({ status: ReviewCompletionStatus.NO_PENDING })).toBe(
-      "There isn't a review waiting.",
+  });
+
+  it("rejects evaluation formatting without a persisted draft", () => {
+    expect(() => formatStudyEvaluationResult(studyContext())).toThrow(
+      "study evaluation formatting requires a persisted draft",
     );
-    expect(formatReviewCompletion({ status: ReviewCompletionStatus.STORAGE_ERROR })).toBe(
-      "I couldn't evaluate that answer. Please try again.",
+  });
+
+  it("rejects a reverse evaluation without a selected sense", () => {
+    const context = studyContext({
+      direction: CardDirection.REVERSE,
+      grade: EvaluationGrade.CORRECT,
+    });
+
+    expect(() => formatStudyEvaluationResult(context)).toThrow(
+      "reverse evaluation requires a selected sense",
     );
-    expect(
-      formatReviewCompletion({
-        status: ReviewCompletionStatus.COMPLETED,
-        entry: WORD,
-        grade: EvaluationGrade.CORRECT,
-        feedback: "\u001c",
-      }),
-    ).toBe("I couldn't evaluate that answer. Please try again.");
   });
 });
 
-describe("test formatting", () => {
-  it("matches every test start literal", () => {
-    const current = question(3);
+describe("study schedule formatting", () => {
+  it("formats progress, retry, and the next prompt", () => {
+    const nextPrompt = "Review 2 of 3 · 1 due\nWhat does 'laconic' mean?";
+
     expect(
-      formatTestStart({
-        status: TestStartStatus.RESUMED,
-        snapshot: snapshot(current, [current]),
-      }),
-    ).toBe("Question 3 of 5\nWhat does 'obdurate' mean?");
-    expect(
-      formatTestStart({ status: TestStartStatus.INSUFFICIENT_LIBRARY, availableCount: 3 }),
-    ).toBe("You have 3 saved entries. Save 2 more to start a 5-word test.");
-    expect(
-      formatTestStart({ status: TestStartStatus.INSUFFICIENT_LIBRARY, availableCount: 1 }),
-    ).toBe("You have 1 saved entry. Save 4 more to start a 5-word test.");
-    expect(formatTestStart({ status: TestStartStatus.DAILY_REVIEW_PENDING })).toBe(
-      "Finish your daily review before starting a test.",
-    );
-    expect(formatTestStart({ status: TestStartStatus.STORAGE_ERROR })).toBe(
-      "I couldn't start the test. Please try again.",
+      formatStudySchedule(
+        ReviewRating.AGAIN,
+        new Date("2026-07-21T04:00:00Z"),
+        { completed: 1, total: 3 },
+        { retryQueued: true, nextPrompt },
+      ),
+    ).toBe(
+      "Rated: Again\n" +
+        "Next due: 2026-07-21 04:00 UTC\n" +
+        "Progress: 1 of 3 complete.\n" +
+        "Retry added at the end.\n\n" +
+        "Review 2 of 3 · 1 due\n" +
+        "What does 'laconic' mean?",
     );
   });
 
-  it("formats an advanced answer before the next exact prompt", () => {
-    const answered = question(1, {
-      answerText: "It means stubborn.",
-      grade: EvaluationGrade.PARTIAL,
-      feedback: "Right direction.",
-      answeredAt: "2026-07-19T00:01:00Z",
-    });
-    const current = question(2);
+  it("omits the retry line and the next prompt when neither applies", () => {
     expect(
-      formatTestCompletion({
-        status: TestCompletionStatus.ADVANCED,
-        snapshot: snapshot(current, [answered, current], {
-          summary: { correct: 0, partial: 1, incorrect: 0 },
-        }),
-        answeredQuestion: answered,
-      }),
+      formatStudySchedule(
+        ReviewRating.EASY,
+        new Date("2026-08-03T09:07:00Z"),
+        { completed: 3, total: 3 },
+        { retryQueued: false },
+      ),
     ).toBe(
-      "Grade: Partial\nFeedback: Right direction.\n\n" +
-        "Definition:\nStubbornly refusing to change one's opinion.\n\n" +
-        "Example:\nThe committee remained obdurate despite new evidence.\n\n" +
-        "Question 2 of 5\nWhat does 'obdurate' mean?",
+      "Rated: Easy\nNext due: 2026-08-03 09:07 UTC\nProgress: 3 of 3 complete.",
     );
   });
 
-  it("formats a completed answer and exact category totals", () => {
-    const answered = question(5, {
-      answerText: "attempt",
-      grade: EvaluationGrade.INCORRECT,
-      feedback: "That is not the stored meaning.",
-      answeredAt: "2026-07-19T00:05:00Z",
-    });
+  it("renders the effective due instant in UTC regardless of its offset", () => {
     expect(
-      formatTestCompletion({
-        status: TestCompletionStatus.COMPLETED,
-        snapshot: snapshot(null, [answered], {
-          summary: { correct: 2, partial: 2, incorrect: 1 },
-        }),
-        answeredQuestion: answered,
-      }),
-    ).toBe(
-      "Grade: Incorrect\nFeedback: That is not the stored meaning.\n\n" +
-        "Definition:\nStubbornly refusing to change one's opinion.\n\n" +
-        "Example:\nThe committee remained obdurate despite new evidence.\n\n" +
-        "Test complete.\nResults: 2 correct, 2 partial, 1 incorrect.",
-    );
+      formatStudySchedule(
+        ReviewRating.GOOD,
+        new Date("2026-07-21T00:30:00+05:30"),
+        { completed: 2, total: 4 },
+        { retryQueued: false },
+      ),
+    ).toBe("Rated: Good\nNext due: 2026-07-20 19:00 UTC\nProgress: 2 of 4 complete.");
   });
+});
 
-  it("matches invalid, absent, stale, and evaluation failure literals", () => {
-    expect(formatTestCompletion({ status: TestCompletionStatus.INVALID })).toBe(
-      "Send an answer, or type 'show answer'.",
-    );
-    expect(formatTestCompletion({ status: TestCompletionStatus.NO_ACTIVE })).toBe(
-      "There isn't an active test.",
-    );
-    expect(formatTestCompletion({ status: TestCompletionStatus.STALE })).toBe(
-      "That answer was already recorded.",
-    );
-    const current = question(2);
+describe("directional totals formatting", () => {
+  it("matches the exact forward and reverse totals", () => {
     expect(
-      formatTestCompletion({
-        status: TestCompletionStatus.STALE,
-        snapshot: snapshot(current, [current]),
+      formatDirectionalTotals(CardDirection.FORWARD, {
+        correct: 2,
+        partial: 2,
+        incorrect: 1,
       }),
-    ).toBe(
-      "That answer was already recorded.\n\nQuestion 2 of 5\nWhat does 'obdurate' mean?",
-    );
-    expect(formatTestCompletion({ status: TestCompletionStatus.STORAGE_ERROR })).toBe(
-      "I couldn't evaluate that answer. Please try again.",
-    );
+    ).toBe("Forward test complete.\nResults: 2 correct, 2 partial, 1 incorrect.");
+    expect(
+      formatDirectionalTotals(CardDirection.REVERSE, {
+        correct: 4,
+        partial: 0,
+        incorrect: 1,
+      }),
+    ).toBe("Reverse test complete.\nResults: 4 correct, 0 partial, 1 incorrect.");
   });
 });

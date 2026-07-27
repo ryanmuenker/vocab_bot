@@ -96,15 +96,15 @@ describe("TelegramAdapter", () => {
     expect(splitTelegramMessage("😀😀😀", 2)).toEqual(["😀😀", "😀"]);
   });
 
-  it("sends chunks sequentially without parse mode and rejects Telegram errors", async () => {
+  it("sends chunks sequentially, returns their message ids, and rejects Telegram errors", async () => {
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce(response({ ok: true }))
+      .mockResolvedValueOnce(response({ ok: true, result: { message_id: 41 } }))
       .mockResolvedValueOnce(response({ ok: false }));
     vi.stubGlobal("fetch", fetchMock);
     const adapter = new TelegramAdapter({ botToken: "token", chatId: "123" });
-    await expect(adapter.sendText("short")).resolves.toBeUndefined();
+    await expect(adapter.sendText("one\n\ntwo")).resolves.toEqual([41]);
     const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
-    expect(body).toEqual({ chat_id: "123", text: "short" });
+    expect(body).toEqual({ chat_id: "123", text: "one\n\ntwo" });
     await expect(adapter.sendText("again")).rejects.toThrow(/rejected/u);
   });
 });

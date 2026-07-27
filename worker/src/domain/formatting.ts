@@ -1,50 +1,45 @@
-import {
-  CaptureStatus,
-  ReviewCompletionStatus,
-  ReviewPromptStatus,
-  TestCompletionStatus,
-  TestStartStatus,
-} from "./models";
+import { CaptureStatus, CardDirection, StudyMode } from "./models";
 import type {
   CaptureResult,
-  ReviewCompletionResult,
-  ReviewPromptResult,
-  TestCompletionResult,
-  TestSessionSnapshot,
-  TestStartResult,
+  ReviewRating,
+  StudyAnswerContext,
+  StudyCardContext,
+  StudyProgress,
+  StudySnapshot,
   VocabularyEntry,
   VocabularySense,
 } from "./models";
-import { trimPythonWhitespace } from "./normalization";
+
+/** Directional tests always run a fixed five-card queue. */
+const TEST_REQUIRED_CARDS = 5;
 
 type OptionalFields<T, K extends keyof T> = Omit<T, K> & Partial<Pick<T, K>>;
 type CaptureResultInput = OptionalFields<CaptureResult, "entry" | "sense">;
-type ReviewPromptResultInput = OptionalFields<ReviewPromptResult, "event" | "entry">;
-type ReviewCompletionResultInput = OptionalFields<
-  ReviewCompletionResult,
-  "entry" | "answerText" | "grade" | "feedback" | "eventId"
->;
-type TestStartResultInput = OptionalFields<
-  TestStartResult,
-  "snapshot" | "availableCount" | "requiredCount"
->;
-type TestCompletionResultInput = OptionalFields<
-  TestCompletionResult,
-  "snapshot" | "answeredQuestion"
->;
+
+/**
+ * Python `str.title()` over the single lowercase ASCII word that every
+ * rating, grade, and direction value is.
+ */
+function titleCase(value: string): string {
+  return value.slice(0, 1).toUpperCase() + value.slice(1);
+}
+
+function displayEntry(text: string): string {
+  const firstCodePoint = text.codePointAt(0);
+  if (firstCodePoint === undefined) {
+    return text;
+  }
+  const firstCharacter = String.fromCodePoint(firstCodePoint);
+  return firstCharacter.toUpperCase() + text.slice(firstCharacter.length);
+}
 
 function formatCaptureCard(
   entry: VocabularyEntry,
   sense: VocabularySense,
   footer: string,
 ): string {
-  const firstCodePoint = entry.displayText.codePointAt(0);
-  const firstCharacter =
-    firstCodePoint === undefined ? "" : String.fromCodePoint(firstCodePoint);
-  const displayText =
-    firstCharacter.toUpperCase() + entry.displayText.slice(firstCharacter.length);
   return (
-    `${displayText} (${sense.partOfSpeech})\n\n` +
+    `${displayEntry(entry.displayText)} (${sense.partOfSpeech})\n\n` +
     `Definition:\n${sense.definition}\n\n` +
     `Example:\n${sense.exampleSentence}\n\n` +
     footer
@@ -101,22 +96,7 @@ export function formatCapture(result: CaptureResultInput): string {
   return formatCaptureCard(result.entry, result.sense, "✓ Saved.");
 }
 
-export function formatDailyReview(result: ReviewPromptResultInput): string {
-  if (
-    result.status === ReviewPromptStatus.ALREADY_COMPLETED ||
-    result.status === ReviewPromptStatus.TEST_ACTIVE
-  ) {
-    return "";
-  }
-  if (result.status === ReviewPromptStatus.EMPTY) {
-    return "Save a word first, then I'll have something to review.";
-  }
-  if (result.status === ReviewPromptStatus.STORAGE_ERROR || result.entry == null) {
-    throw new Error("Could not prepare the daily vocabulary review");
-  }
-  return `What does '${result.entry.displayText}' mean?`;
-}
-
+/** Every stored sense of an entry, revealed after an answer is graded. */
 function formatCanonicalReveal(entry: VocabularyEntry): string {
   if (entry.senses.length === 1) {
     const sense = entry.senses[0]!;
@@ -135,102 +115,106 @@ function formatCanonicalReveal(entry: VocabularyEntry): string {
   return reveal;
 }
 
-function formatTestPrompt(snapshot: TestSessionSnapshot): string | null {
-  const question = snapshot.currentQuestion;
-  if (question === null) {
-    return null;
-  }
-  return `Question ${question.position} of 5\nWhat does '${question.entry.displayText}' mean?`;
-}
-
-export function formatTestStart(result: TestStartResultInput): string {
-  if (result.status === TestStartStatus.INSUFFICIENT_LIBRARY) {
-    const available = result.availableCount || 0;
-    const required = result.requiredCount ?? 5;
-    const needed = Math.max(required - available, 0);
-    const entryWord = available === 1 ? "entry" : "entries";
-    return (
-      `You have ${available} saved ${entryWord}. ` +
-      `Save ${needed} more to start a ${required}-word test.`
-    );
-  }
-  if (result.status === TestStartStatus.DAILY_REVIEW_PENDING) {
-    return "Finish your daily review before starting a test.";
-  }
-  if (result.status === TestStartStatus.STORAGE_ERROR || result.snapshot == null) {
-    return "I couldn't start the test. Please try again.";
-  }
-  const prompt = formatTestPrompt(result.snapshot);
-  return prompt ?? "I couldn't start the test. Please try again.";
-}
-
-export function formatTestCompletion(result: TestCompletionResultInput): string {
-  if (result.status === TestCompletionStatus.INVALID) {
-    return "Send an answer, or type 'show answer'.";
-  }
-  if (result.status === TestCompletionStatus.NO_ACTIVE) {
-    return "There isn't an active test.";
-  }
-  if (result.status === TestCompletionStatus.STALE) {
-    if (result.snapshot == null) {
-      return "That answer was already recorded.";
+export function formatStudyPrompt(
+  context: StudyCardContext,
+  snapshot: StudySnapshot,
+  options: { readonly dueBacklog: number },
+): string {
+  const retry = context.queueItem.retryOfQueueItemId !== null ? " · retry" : "";
+  if (snapshot.mode === StudyMode.REVIEW) {
+    const current = Math.min(snapshot.progress.completed + 1, snapshot.progress.total);
+    const header =
+      `Review ${current} of ${snapshot.progress.total} · ` +
+      `${options.dueBacklog} due${retry}`;
+    if (context.queueItem.card.direction === CardDirection.REVERSE) {
+      if (context.sense === null) {
+        throw new Error("reverse study prompts require a selected sense");
+      }
+      return (
+        `${header}\nWhich saved word or expression matches this definition?\n\n` +
+        context.sense.definition
+      );
     }
-    const prompt = formatTestPrompt(result.snapshot);
-    return prompt === null
-      ? "There isn't an active test."
-      : `That answer was already recorded.\n\n${prompt}`;
+    return `${header}\nWhat does '${context.entry.displayText}' mean?`;
   }
 
-  const answered = result.answeredQuestion;
-  if (
-    result.status === TestCompletionStatus.STORAGE_ERROR ||
-    result.snapshot == null ||
-    answered == null ||
-    answered.grade == null ||
-    answered.feedback == null ||
-    trimPythonWhitespace(answered.feedback).length === 0
-  ) {
-    return "I couldn't evaluate that answer. Please try again.";
+  // A tail retry always occupies the final question slot of a directional test.
+  const position = retry === "" ? context.queueItem.position : TEST_REQUIRED_CARDS;
+  const header = `Question ${position} of ${TEST_REQUIRED_CARDS}${retry}`;
+  if (snapshot.mode === StudyMode.TEST_FORWARD) {
+    return `${header}\nWhat does '${context.entry.displayText}' mean?`;
   }
-
-  const grade = answered.grade[0]!.toUpperCase() + answered.grade.slice(1);
-  const text =
-    `Grade: ${grade}\nFeedback: ${answered.feedback}\n\n` +
-    formatCanonicalReveal(answered.entry);
-  if (result.status === TestCompletionStatus.ADVANCED) {
-    const prompt = formatTestPrompt(result.snapshot);
-    return prompt === null
-      ? "I couldn't evaluate that answer. Please try again."
-      : `${text}\n\n${prompt}`;
+  if (context.sense === null) {
+    throw new Error("reverse test card has no sense definition");
   }
-  if (result.status === TestCompletionStatus.COMPLETED) {
-    const summary = result.snapshot.summary;
-    return (
-      `${text}\n\nTest complete.\n` +
-      `Results: ${summary.correct} correct, ${summary.partial} partial, ` +
-      `${summary.incorrect} incorrect.`
-    );
-  }
-  return "I couldn't evaluate that answer. Please try again.";
+  return `${header}\nWhich saved word matches this definition?\n${context.sense.definition}`;
 }
 
-export function formatReviewCompletion(result: ReviewCompletionResultInput): string {
-  if (result.status === ReviewCompletionStatus.INVALID) {
-    return "Send an answer, or type 'show answer'.";
+export function formatStudyEvaluationResult(context: StudyAnswerContext): string {
+  const draft = context.draft;
+  if (draft === null) {
+    throw new Error("study evaluation formatting requires a persisted draft");
   }
-  if (result.status === ReviewCompletionStatus.NO_PENDING) {
-    return "There isn't a review waiting.";
+  const evaluation = draft.evaluation;
+  let reveal: string;
+  if (context.queueItem.card.direction === CardDirection.REVERSE) {
+    if (context.sense === null) {
+      throw new Error("reverse evaluation requires a selected sense");
+    }
+    reveal =
+      `Answer: ${context.entry.displayText}\n\n` +
+      `Definition:\n${context.sense.definition}\n\n` +
+      `Example:\n${context.sense.exampleSentence}`;
+  } else {
+    reveal = formatCanonicalReveal(context.entry);
   }
-  if (
-    result.status === ReviewCompletionStatus.STORAGE_ERROR ||
-    result.entry == null ||
-    result.grade == null ||
-    result.feedback == null ||
-    trimPythonWhitespace(result.feedback).length === 0
-  ) {
-    return "I couldn't evaluate that answer. Please try again.";
+  return (
+    `Grade: ${titleCase(evaluation.grade)}\n` +
+    `Feedback: ${evaluation.feedback}\n\n` +
+    reveal
+  );
+}
+
+export function formatStudyEvaluation(
+  context: StudyAnswerContext,
+  choices: readonly ReviewRating[],
+): string {
+  const result = formatStudyEvaluationResult(context);
+  if (choices.length === 0) {
+    return result;
   }
-  const grade = result.grade[0]!.toUpperCase() + result.grade.slice(1);
-  const evaluation = `Grade: ${grade}\nFeedback: ${result.feedback}`;
-  return `${evaluation}\n\n${formatCanonicalReveal(result.entry)}`;
+  return `${result}\n\nChoose effort: ${choices.map(titleCase).join(" or ")}.`;
+}
+
+export function formatStudySchedule(
+  rating: ReviewRating,
+  effectiveDue: Date,
+  progress: StudyProgress,
+  options: { readonly retryQueued: boolean; readonly nextPrompt?: string | null },
+): string {
+  const iso = effectiveDue.toISOString();
+  const due = `${iso.slice(0, 10)} ${iso.slice(11, 16)} UTC`;
+  let text =
+    `Rated: ${titleCase(rating)}\n` +
+    `Next due: ${due}\n` +
+    `Progress: ${progress.completed} of ${progress.total} complete.`;
+  if (options.retryQueued) {
+    text += "\nRetry added at the end.";
+  }
+  return options.nextPrompt ? `${text}\n\n${options.nextPrompt}` : text;
+}
+
+export function formatDirectionalTotals(
+  direction: CardDirection,
+  totals: {
+    readonly correct: number;
+    readonly partial: number;
+    readonly incorrect: number;
+  },
+): string {
+  return (
+    `${titleCase(direction)} test complete.\n` +
+    `Results: ${totals.correct} correct, ${totals.partial} partial, ` +
+    `${totals.incorrect} incorrect.`
+  );
 }

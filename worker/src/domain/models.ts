@@ -1,3 +1,5 @@
+import type { ScheduleTransition } from "./scheduling";
+
 export type CaptureOperationValue = "new_entry" | "new_sense" | "existing_sense";
 
 export class CaptureOperation {
@@ -103,143 +105,177 @@ export interface Evaluation {
   readonly feedback: string;
 }
 
-export const PendingReviewStatus = {
-  PENDING: "pending",
-  NONE: "none",
-  STORAGE_ERROR: "storage_error",
-} as const;
-export type PendingReviewStatus =
-  (typeof PendingReviewStatus)[keyof typeof PendingReviewStatus];
-
-export const ReviewPromptStatus = {
-  PENDING: "pending",
-  ALREADY_COMPLETED: "already_completed",
-  TEST_ACTIVE: "test_active",
-  EMPTY: "empty",
-  STORAGE_ERROR: "storage_error",
-} as const;
-export type ReviewPromptStatus = (typeof ReviewPromptStatus)[keyof typeof ReviewPromptStatus];
-
-export const ReviewCompletionStatus = {
-  COMPLETED: "completed",
-  INVALID: "invalid",
-  NO_PENDING: "no_pending",
-  STORAGE_ERROR: "storage_error",
-} as const;
-export type ReviewCompletionStatus =
-  (typeof ReviewCompletionStatus)[keyof typeof ReviewCompletionStatus];
-
-export interface ReviewEvent {
-  readonly id: number;
-  readonly entryId: number;
-  readonly reviewDate: string;
-  readonly status: string;
-  readonly promptedAt: string;
-  readonly answeredAt: string | null;
-  readonly answerText: string | null;
-  readonly grade: EvaluationGrade | null;
-  readonly feedback: string | null;
-}
-
-export interface PendingReviewResult {
-  readonly status: PendingReviewStatus;
-  readonly event: ReviewEvent | null;
-  readonly entry: VocabularyEntry | null;
-}
-
-export interface ReviewPromptResult {
-  readonly status: ReviewPromptStatus;
-  readonly event: ReviewEvent | null;
-  readonly entry: VocabularyEntry | null;
-}
-
-export interface ReviewCompletionResult {
-  readonly status: ReviewCompletionStatus;
-  readonly entry: VocabularyEntry | null;
-  readonly answerText: string | null;
-  readonly grade: EvaluationGrade | null;
-  readonly feedback: string | null;
-  readonly eventId: number | null;
-}
-
-export const TestSessionStatus = {
-  ACTIVE: "active",
-  COMPLETED: "completed",
-} as const;
-export type TestSessionStatus = (typeof TestSessionStatus)[keyof typeof TestSessionStatus];
-
-export interface TestSession {
-  readonly id: number;
-  readonly status: TestSessionStatus;
-  readonly startedAt: string;
-  readonly completedAt: string | null;
-}
-
-export interface TestQuestion {
-  readonly id: number;
-  readonly sessionId: number;
-  readonly position: number;
-  readonly entry: VocabularyEntry;
-  readonly answerText: string | null;
-  readonly grade: EvaluationGrade | null;
-  readonly feedback: string | null;
-  readonly answeredAt: string | null;
-}
-
 export interface TestSummary {
   readonly correct: number;
   readonly partial: number;
   readonly incorrect: number;
 }
 
-export interface TestSessionSnapshot {
-  readonly session: TestSession;
-  readonly questions: readonly TestQuestion[];
-  readonly currentQuestion: TestQuestion | null;
-  readonly summary: TestSummary;
+export const ReviewRating = {
+  AGAIN: "again",
+  HARD: "hard",
+  GOOD: "good",
+  EASY: "easy",
+} as const;
+export type ReviewRating = (typeof ReviewRating)[keyof typeof ReviewRating];
+
+export const CardScheduleState = {
+  NEW: "new",
+  REVIEW: "review",
+  RELEARNING: "relearning",
+} as const;
+export type CardScheduleState = (typeof CardScheduleState)[keyof typeof CardScheduleState];
+
+export const CardDirection = {
+  FORWARD: "forward",
+  REVERSE: "reverse",
+} as const;
+export type CardDirection = (typeof CardDirection)[keyof typeof CardDirection];
+
+export const StudyMode = {
+  REVIEW: "review",
+  TEST_FORWARD: "test_forward",
+  TEST_REVERSE: "test_reverse",
+} as const;
+export type StudyMode = (typeof StudyMode)[keyof typeof StudyMode];
+
+export const StudySessionStatus = {
+  ACTIVE: "active",
+  INTERRUPTED: "interrupted",
+  COMPLETED: "completed",
+  EXITED: "exited",
+} as const;
+export type StudySessionStatus = (typeof StudySessionStatus)[keyof typeof StudySessionStatus];
+
+export const StudyQueueStatus = {
+  QUEUED: "queued",
+  CURRENT: "current",
+  COMPLETED: "completed",
+  SKIPPED: "skipped",
+} as const;
+export type StudyQueueStatus = (typeof StudyQueueStatus)[keyof typeof StudyQueueStatus];
+
+export const StudyPromptStatus = {
+  PREPARED: "prepared",
+  DELIVERED: "delivered",
+  ANSWERED: "answered",
+  COMPLETED: "completed",
+  FAILED: "failed",
+  CANCELLED: "cancelled",
+} as const;
+export type StudyPromptStatus = (typeof StudyPromptStatus)[keyof typeof StudyPromptStatus];
+
+export interface StudyCardSnapshot {
+  readonly id: number;
+  readonly entryId: number;
+  readonly senseId: number | null;
+  readonly direction: CardDirection;
+  readonly state: CardScheduleState;
+  readonly stability: number | null;
+  readonly difficulty: number | null;
+  readonly due: Date;
+  readonly effectiveDue: Date;
+  readonly lastReview: Date | null;
+  readonly repetitions: number;
+  readonly lapses: number;
+  readonly createdAt: Date;
 }
 
-export const TestStartStatus = {
+export interface StudyQueueItemSnapshot {
+  readonly id: number;
+  readonly card: StudyCardSnapshot;
+  readonly position: number;
+  readonly status: StudyQueueStatus;
+  readonly retryOfQueueItemId: number | null;
+}
+
+export interface StudyPromptSnapshot {
+  readonly id: number;
+  readonly sessionId: number;
+  readonly queueItemId: number;
+  readonly promptKey: string;
+  readonly promptText: string;
+  readonly status: StudyPromptStatus;
+  readonly preparedAt: Date;
+  readonly deliveredAt: Date | null;
+  readonly answeredAt: Date | null;
+}
+
+export interface StudyProgress {
+  readonly completed: number;
+  readonly total: number;
+}
+
+export interface StudySnapshot {
+  readonly sessionId: number;
+  readonly mode: StudyMode;
+  readonly status: StudySessionStatus;
+  /** Local calendar day as `YYYY-MM-DD`. */
+  readonly localDate: string;
+  readonly queue: readonly StudyQueueItemSnapshot[];
+  readonly currentPrompt: StudyPromptSnapshot | null;
+  readonly progress: StudyProgress;
+}
+
+export interface StudyDraftSnapshot {
+  readonly id: number;
+  readonly submittedAnswer: string;
+  readonly evaluation: Evaluation;
+  readonly answeredAt: Date;
+}
+
+/** Everything a prompt renderer needs about the card currently under study. */
+export interface StudyCardContext {
+  readonly queueItem: StudyQueueItemSnapshot;
+  readonly entry: VocabularyEntry;
+  readonly sense: VocabularySense | null;
+}
+
+export interface StudyAnswerContext extends StudyCardContext {
+  readonly prompt: StudyPromptSnapshot;
+  readonly draft: StudyDraftSnapshot | null;
+}
+
+/** The data needed to render and persist the prompt for the current queue item. */
+export interface StudyPromptPlan {
+  readonly snapshot: StudySnapshot;
+  readonly context: StudyCardContext;
+  readonly promptKey: string;
+}
+
+export const StudyStartStatus = {
   STARTED: "started",
   RESUMED: "resumed",
-  INSUFFICIENT_LIBRARY: "insufficient_library",
-  DAILY_REVIEW_PENDING: "daily_review_pending",
+  EMPTY: "empty",
+  CONFLICT: "conflict",
   STORAGE_ERROR: "storage_error",
 } as const;
-export type TestStartStatus = (typeof TestStartStatus)[keyof typeof TestStartStatus];
+export type StudyStartStatus = (typeof StudyStartStatus)[keyof typeof StudyStartStatus];
 
-export interface TestStartResult {
-  readonly status: TestStartStatus;
-  readonly snapshot: TestSessionSnapshot | null;
+export interface StudyStartResult {
+  readonly status: StudyStartStatus;
+  readonly snapshot: StudySnapshot | null;
+  /** Eligible cards found when a directional test is short of its five. */
   readonly availableCount: number | null;
-  readonly requiredCount: number;
 }
 
-export const TestSnapshotStatus = {
-  ACTIVE: "active",
-  NONE: "none",
-  STORAGE_ERROR: "storage_error",
-} as const;
-export type TestSnapshotStatus = (typeof TestSnapshotStatus)[keyof typeof TestSnapshotStatus];
-
-export interface TestSnapshotResult {
-  readonly status: TestSnapshotStatus;
-  readonly snapshot: TestSessionSnapshot | null;
-}
-
-export const TestCompletionStatus = {
-  ADVANCED: "advanced",
+export const FinalizeStatus = {
   COMPLETED: "completed",
-  INVALID: "invalid",
+  NO_ANSWER: "no_answer",
   STALE: "stale",
-  NO_ACTIVE: "no_active",
   STORAGE_ERROR: "storage_error",
 } as const;
-export type TestCompletionStatus =
-  (typeof TestCompletionStatus)[keyof typeof TestCompletionStatus];
+export type FinalizeStatus = (typeof FinalizeStatus)[keyof typeof FinalizeStatus];
 
-export interface TestCompletionResult {
-  readonly status: TestCompletionStatus;
-  readonly snapshot: TestSessionSnapshot | null;
-  readonly answeredQuestion: TestQuestion | null;
+export interface FinalizeResult {
+  readonly status: FinalizeStatus;
+  readonly transition: ScheduleTransition | null;
+  readonly snapshot: StudySnapshot | null;
 }
+
+export const StudyMutationStatus = {
+  COMPLETED: "completed",
+  STALE: "stale",
+  STORAGE_ERROR: "storage_error",
+} as const;
+export type StudyMutationStatus = (typeof StudyMutationStatus)[keyof typeof StudyMutationStatus];

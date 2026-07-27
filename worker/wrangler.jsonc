@@ -43,6 +43,7 @@
   "vars": {
     "OPENCODE_BASE_URL": "https://opencode.ai/zen/go/v1",
     "OPENCODE_MODEL": "deepseek-v4-flash",
-    "HERMES_TIMEZONE": "Asia/Kuala_Lumpur"
+    "HERMES_TIMEZONE": "Asia/Kuala_Lumpur",
+    "HERMES_REVIEW_HOUR": "12"
   }
 }

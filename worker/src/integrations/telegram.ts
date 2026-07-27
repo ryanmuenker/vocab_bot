@@ -31,7 +31,9 @@ interface TelegramConfig {
 export class TelegramAdapter {
   constructor(private readonly config: TelegramConfig) {}
 
-  async sendText(text: string): Promise<void> {
+  /** Sends every chunk in order and returns the Telegram message ids created. */
+  async sendText(text: string): Promise<number[]> {
+    const messageIds: number[] = [];
     for (const chunk of splitTelegramMessage(text)) {
       const response = await fetch(
         `https://api.telegram.org/bot${this.config.botToken}/sendMessage`,
@@ -42,8 +44,14 @@ export class TelegramAdapter {
         },
       );
       if (!response.ok) throw new Error("Telegram send failed");
-      const payload = (await response.json()) as { readonly ok?: unknown };
+      const payload = (await response.json()) as {
+        readonly ok?: unknown;
+        readonly result?: { readonly message_id?: unknown };
+      };
       if (payload.ok !== true) throw new Error("Telegram send rejected");
+      const messageId = payload.result?.message_id;
+      if (Number.isSafeInteger(messageId)) messageIds.push(messageId as number);
     }
+    return messageIds;
   }
 }

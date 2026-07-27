@@ -35,7 +35,7 @@ describe("Worker HTTP and cron surface", () => {
     expect((await webhook(update(), "wrong")).status).toBe(401);
   });
 
-  it("silently ignores unsupported updates, wrong identities, topics, and non-test commands", async () => {
+  it("silently ignores unsupported updates, wrong identities, topics, and unknown commands", async () => {
     expect((await webhook({ edited_message: update().message })).status).toBe(200);
     expect((await webhook(update({ chat: { id: 999, type: "private" } }))).status).toBe(200);
     expect((await webhook(update({ message_thread_id: 3 }))).status).toBe(200);
@@ -43,10 +43,12 @@ describe("Worker HTTP and cron surface", () => {
     expect(await env.VOCABULARY.getByName("123456").summary()).toMatchObject({ pendingInbox: 0 });
   });
 
-  it("admits test commands and keeps slash-containing paths capturable", async () => {
-    expect((await webhook(update({ text: "/test now" }))).status).toBe(200);
-    expect((await webhook({ ...update({ text: "/tmp/vocabulary" }), update_id: 2 })).status).toBe(200);
-    expect(await env.VOCABULARY.getByName("123456").summary()).toMatchObject({ pendingInbox: 2 });
+  it("admits every study command and keeps slash-containing paths capturable", async () => {
+    expect((await webhook(update({ text: "/test forward" }))).status).toBe(200);
+    expect((await webhook({ ...update({ text: "/review" }), update_id: 2 })).status).toBe(200);
+    expect((await webhook({ ...update({ text: "/endstudy" }), update_id: 3 })).status).toBe(200);
+    expect((await webhook({ ...update({ text: "/tmp/vocabulary" }), update_id: 4 })).status).toBe(200);
+    expect(await env.VOCABULARY.getByName("123456").summary()).toMatchObject({ pendingInbox: 4 });
     const blockedExport = await exports.default.fetch(new Request("https://example.test/admin/export", {
       headers: { Authorization: "Bearer test-admin-token" },
     }));
@@ -88,7 +90,35 @@ describe("Worker HTTP and cron surface", () => {
     expect(oversized.status).toBe(413);
   });
 
-  it("protects admin routes and enqueues cron with scheduled-time dedupe", async () => {
+  it("rejects an admin import whose digest does not match its snapshot", async () => {
+    const snapshot = {
+      formatVersion: 2,
+      entries: [],
+      senses: [],
+      reviewEvents: [],
+      testSessions: [],
+      testQuestions: [],
+      cards: [],
+      studySessions: [],
+      studyQueue: [],
+      studyPrompts: [],
+      deliveryAttempts: [],
+      answerDrafts: [],
+      reviewAttempts: [],
+    };
+    const rejected = await exports.default.fetch(new Request("https://example.test/admin/import", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer test-admin-token",
+      },
+      body: JSON.stringify({ sha256: "0".repeat(64), snapshot }),
+    }));
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toEqual({ error: "invalid request" });
+  });
+
+  it("protects admin routes and keeps the cron tick silent with nothing due", async () => {
     expect((await exports.default.fetch(new Request("https://example.test/admin/summary"))).status)
       .toBe(401);
     const summary = await exports.default.fetch(new Request("https://example.test/admin/summary", {
@@ -99,7 +129,8 @@ describe("Worker HTTP and cron surface", () => {
     const controller = createScheduledController({ scheduledTime: Date.parse("2026-07-23T04:00:00Z") });
     await worker.scheduled(controller, env);
     await worker.scheduled(controller, env);
+    // An empty library has nothing to ask about, so the tick enqueues nothing.
     expect((await env.VOCABULARY.getByName("123456").summary()).pendingInbox)
-      .toBe(before.pendingInbox + 1);
+      .toBe(before.pendingInbox);
   });
 });

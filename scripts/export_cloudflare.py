@@ -11,7 +11,7 @@ from hermes_vocab.cloudflare_snapshot import extract_snapshot, snapshot_sha256, 
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export a Hermes vocabulary v4 snapshot")
+    parser = argparse.ArgumentParser(description="Export a Hermes vocabulary v5 snapshot")
     parser.add_argument("--database", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--pretty", action="store_true")
