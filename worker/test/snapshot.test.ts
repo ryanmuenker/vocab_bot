@@ -405,6 +405,27 @@ describe("SnapshotV2 and JCS", () => {
       draft.cards[0].state = "new";
     }))).toBeNull();
   });
+
+  it("accepts pre-grading legacy review events but still binds the answer to the status", () => {
+    // v4 recorded answers before it recorded grades; those rows are real
+    // history and must cross the bridge rather than block the export.
+    const ungraded = parseSnapshot(mutate((draft) => {
+      draft.reviewEvents[0].grade = null;
+      draft.reviewEvents[0].evaluationFeedback = null;
+    }));
+    expect(ungraded).not.toBeNull();
+    expect(ungraded!.reviewEvents[0]!.grade).toBeNull();
+
+    expect(parseSnapshot(mutate((draft) => {
+      draft.reviewEvents[0].answerText = null;
+    }))).toBeNull();
+    expect(parseSnapshot(mutate((draft) => {
+      draft.reviewEvents[0].answeredAt = null;
+    }))).toBeNull();
+    expect(parseSnapshot(mutate((draft) => {
+      draft.reviewEvents[0].status = "missed";
+    }))).toBeNull();
+  });
 });
 
 describe("v5 schema", () => {

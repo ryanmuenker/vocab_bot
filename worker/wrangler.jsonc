@@ -24,8 +24,11 @@
       "storage": "sqlite"
     }
   },
+  // Every 15 minutes, not daily: enqueueDailyReview is a silent ticker that
+  // prepares at most one prompt and stays quiet unless work is genuinely due,
+  // so frequent ticks are what let a failed send be retried the same day.
   "triggers": {
-    "crons": ["0 4 * * *"]
+    "crons": ["*/15 * * * *"]
   },
   "observability": {
     "enabled": true,

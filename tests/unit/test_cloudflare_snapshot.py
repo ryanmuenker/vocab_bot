@@ -449,6 +449,27 @@ def test_snapshot_rejects_v1_format_and_broken_invariants() -> None:
             validate_snapshot(_corrupt(**changes))
 
 
+def test_snapshot_accepts_pre_grading_legacy_review_events() -> None:
+    """v4 recorded answers before it recorded grades; those rows are real
+    history and must survive the bridge rather than block the export."""
+    ungraded = _corrupt(
+        reviewEvents__0__grade=None,
+        reviewEvents__0__evaluationFeedback=None,
+    )
+    validated = validate_snapshot(ungraded)
+    assert validated["reviewEvents"][0]["grade"] is None
+    assert validated["reviewEvents"][0]["evaluationFeedback"] is None
+
+    # The answer itself still has to agree with the status in both directions.
+    for changes, message in (
+        ({"reviewEvents__0__answerText": None}, "disagree with status"),
+        ({"reviewEvents__0__answeredAt": None}, "disagree with status"),
+        ({"reviewEvents__0__status": "missed"}, "disagree with status"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            validate_snapshot(_corrupt(**changes))
+
+
 def test_snapshot_export_rejects_a_v4_database(tmp_path: Path) -> None:
     database_path = tmp_path / "legacy.sqlite3"
     connection = sqlite3.connect(database_path)

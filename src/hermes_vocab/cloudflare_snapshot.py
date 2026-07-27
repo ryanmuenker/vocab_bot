@@ -415,8 +415,16 @@ def _validate_semantics(snapshot: dict[str, Any]) -> None:
         if row["entryId"] not in entry_ids:
             raise ValueError("orphan review event")
         answered = row["status"] == "answered"
-        fields = (row["answeredAt"], row["answerText"], row["grade"], row["evaluationFeedback"])
-        if any((field is not None) != answered for field in fields):
+        # An answered event must carry the answer itself, but grade and
+        # evaluationFeedback may be null: v4 recorded answers before it
+        # recorded grades, and those rows are real history. The v5 backfill
+        # already ignores ungraded events for scheduling.
+        for field in (row["answeredAt"], row["answerText"]):
+            if (field is not None) != answered:
+                raise ValueError("review event answer fields disagree with status")
+        if not answered and (
+            row["grade"] is not None or row["evaluationFeedback"] is not None
+        ):
             raise ValueError("review event answer fields disagree with status")
     _require_unique([row["reviewDate"] for row in snapshot["reviewEvents"]], "duplicate review date")
 

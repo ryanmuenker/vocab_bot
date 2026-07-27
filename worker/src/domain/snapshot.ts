@@ -445,12 +445,16 @@ function validSemantics(snapshot: SnapshotV2): boolean {
   if (!uniqueNonNull(snapshot.entries.map(({ normalizedText }) => normalizedText))) return false;
   if (snapshot.senses.some(({ entryId }) => !entryIds.has(entryId))) return false;
 
-  // Legacy audit carriers keep their pre-card shape.
+  // Legacy audit carriers keep their pre-card shape. An answered event must
+  // carry the answer itself, but `grade`/`evaluationFeedback` may be null:
+  // v4 recorded answers before it recorded grades, and those rows are real
+  // history. The v5 backfill already ignores ungraded events for scheduling.
   for (const event of snapshot.reviewEvents) {
     if (!entryIds.has(event.entryId)) return false;
     const answered = event.status === "answered";
-    const fields = [event.answeredAt, event.answerText, event.grade, event.evaluationFeedback];
-    if (fields.some((field) => (field !== null) !== answered)) return false;
+    if ((event.answeredAt !== null) !== answered) return false;
+    if ((event.answerText !== null) !== answered) return false;
+    if (!answered && (event.grade !== null || event.evaluationFeedback !== null)) return false;
   }
   if (!uniqueNonNull(snapshot.reviewEvents.map(({ reviewDate }) => reviewDate))) return false;
   if (snapshot.testSessions.some(({ status, completedAt }) => (status === "active") === (completedAt !== null))) {
