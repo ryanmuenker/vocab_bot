@@ -88,3 +88,29 @@ Import refuses a non-empty inbox and rejects a digest mismatch. Stop the Hermes
 gateway and every cron or ticker process before exporting; the two deployments
 must never run against the same library at once, because each is an independent
 scheduling authority.
+
+## Cutover: the Hermes gateway will steal the chat back
+
+Telegram delivers each update to a webhook **or** to long-polling, never both,
+so the Worker and the Hermes gateway cannot share one bot. Handing the bot to
+the Worker takes more than `setWebhook`, because the Telegram adapter calls
+`_delete_webhook_best_effort()` while bootstrapping polling
+(`plugins/platforms/telegram/adapter.py`). Every gateway start — including the
+automatic launchd start after a reboot — therefore **deletes the Worker's
+webhook and silently resumes polling**, and the cutover appears to work right
+up until the next restart.
+
+The adapter is enabled purely by a non-empty `TELEGRAM_BOT_TOKEN`, so a durable
+cutover is:
+
+1. `hermes cron pause <daily-review-job-id>` — stop the second ticker.
+2. `hermes plugins disable vocabulary` — stop the second scheduling authority.
+3. Comment out `TELEGRAM_BOT_TOKEN` in `~/.hermes/.env` — stop the webhook theft.
+4. `hermes gateway restart`, then export, import, and `setWebhook` with a
+   `secret_token` that matches the Worker's `TELEGRAM_WEBHOOK_SECRET`.
+
+Reverting is the same list backwards, and step 3 does most of the work on its
+own: restoring the token makes the gateway delete the webhook at startup, which
+is exactly the handover in reverse. Export from `/admin/export` first — after
+cutover the Durable Object is the source of truth and the local SQLite file is
+a stale backup.
