@@ -1,0 +1,513 @@
+import { env } from "cloudflare:workers";
+import { runDurableObjectAlarm } from "cloudflare:test";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import {
+  DESIRED_RETENTION,
+  PARAMETERS_VERSION,
+  PARAMETER_FINGERPRINT,
+  SCHEDULER_KIND,
+  SCHEDULER_VERSION,
+} from "../src/domain/scheduling";
+import { encodeReal } from "../src/domain/snapshot";
+import type { SnapshotCard, SnapshotV2 } from "../src/domain/snapshot";
+
+function message(updateId: number, text: string, receivedAt = "2026-07-23T04:00:00Z") {
+  return {
+    updateId,
+    messageId: updateId,
+    chatId: "123456",
+    senderId: "123456",
+    text,
+    receivedAt,
+  };
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function newCard(
+  id: number,
+  entryId: number,
+  senseId: number | null,
+  direction: "forward" | "reverse",
+  createdAt: string,
+): SnapshotCard {
+  return {
+    id,
+    entryId,
+    senseId,
+    direction,
+    state: "new",
+    stability: null,
+    difficulty: null,
+    dueAt: createdAt,
+    effectiveDueAt: createdAt,
+    lastReviewAt: null,
+    repetitions: 0,
+    lapses: 0,
+    schedulerKind: SCHEDULER_KIND,
+    schedulerVersion: SCHEDULER_VERSION,
+    parametersVersion: PARAMETERS_VERSION,
+    parameterFingerprint: PARAMETER_FINGERPRINT,
+    desiredRetention: encodeReal(DESIRED_RETENTION),
+    introducedLocalDate: null,
+    buriedUntilLocalDate: null,
+    createdAt,
+  };
+}
+
+/** A library of `count` single-sense entries, each with both card directions. */
+function library(count: number): SnapshotV2 {
+  const entries: SnapshotV2["entries"][number][] = [];
+  const senses: SnapshotV2["senses"][number][] = [];
+  const cards: SnapshotCard[] = [];
+  for (let index = 1; index <= count; index += 1) {
+    const dateAdded = `2026-06-${String(index).padStart(2, "0")}T00:00:00Z`;
+    entries.push({
+      id: index,
+      displayText: `word-${index}`,
+      normalizedText: `word-${index}`,
+      dateAdded,
+      lastReviewed: null,
+      reviewStatus: "new",
+    });
+    senses.push({
+      id: index,
+      entryId: index,
+      definition: `definition ${index}`,
+      partOfSpeech: "noun",
+      exampleSentence: `Example ${index}.`,
+      sourceContext: null,
+      dateAdded,
+    });
+    cards.push(newCard(index * 2 - 1, index, null, "forward", dateAdded));
+    cards.push(newCard(index * 2, index, index, "reverse", dateAdded));
+  }
+  return {
+    formatVersion: 2,
+    entries,
+    senses,
+    reviewEvents: [],
+    testSessions: [],
+    testQuestions: [],
+    cards,
+    studySessions: [],
+    studyQueue: [],
+    studyPrompts: [],
+    deliveryAttempts: [],
+    answerDrafts: [],
+    reviewAttempts: [],
+  };
+}
+
+interface Transport {
+  readonly sent: string[];
+  readonly modelCalls: () => number;
+  telegramFails: boolean;
+  evaluation: { grade: string; feedback: string };
+}
+
+/** Stub the model and Telegram endpoints, recording what each one saw. */
+function transport(): Transport {
+  const sent: string[] = [];
+  let modelCalls = 0;
+  let messageId = 1_000;
+  const state: Transport = {
+    sent,
+    modelCalls: () => modelCalls,
+    telegramFails: false,
+    evaluation: { grade: "correct", feedback: "Accurate." },
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/chat/completions")) {
+        modelCalls += 1;
+        const body = JSON.parse(init!.body as string) as { messages: { content: string }[] };
+        const content = body.messages[0]!.content.includes("dictionary")
+          ? JSON.stringify({
+              senses: [
+                {
+                  part_of_speech: "noun",
+                  definition: "a street",
+                  example_sentence: "The street was quiet.",
+                },
+              ],
+            })
+          : JSON.stringify(state.evaluation);
+        return jsonResponse({ choices: [{ message: { content } }] });
+      }
+      if (state.telegramFails) return jsonResponse({ ok: false });
+      sent.push(JSON.parse(init!.body as string).text as string);
+      messageId += 1;
+      return jsonResponse({ ok: true, result: { message_id: messageId } });
+    }),
+  );
+  return state;
+}
+
+async function drain(stub: DurableObjectStub, limit = 12): Promise<void> {
+  for (let attempt = 0; attempt < limit; attempt += 1) {
+    if (!(await runDurableObjectAlarm(stub))) return;
+  }
+}
+
+function companion(name: string) {
+  return env.VOCABULARY.getByName(`${name}-${crypto.randomUUID()}`);
+}
+
+afterEach(() => vi.unstubAllGlobals());
+
+describe("VocabularyCompanion capture", () => {
+  it("deduplicates updates, coalesces equivalent captures, and projects both card directions", async () => {
+    const io = transport();
+    const stub = companion("coalesce");
+
+    expect(await stub.enqueueTelegramUpdate(message(1, "Straße"))).toBe("enqueued");
+    expect(await stub.enqueueTelegramUpdate(message(1, "Straße"))).toBe("duplicate");
+    expect(await stub.enqueueTelegramUpdate(message(2, "  STRASSE  "))).toBe("enqueued");
+    await drain(stub);
+
+    expect(io.modelCalls()).toBe(1);
+    expect(io.sent).toHaveLength(2);
+    const exported = (await stub.exportSnapshot())!;
+    expect(exported.entries).toHaveLength(1);
+    expect(exported.cards.map((card) => [card.direction, card.senseId])).toEqual([
+      ["forward", null],
+      ["reverse", exported.senses[0]!.id],
+    ]);
+    expect(await stub.summary()).toMatchObject({ entries: 1, senses: 1, pendingInbox: 0, failedInbox: 0 });
+  });
+});
+
+describe("VocabularyCompanion delivery gating", () => {
+  it("never makes a prompt answerable when its send fails, and echoes the next message", async () => {
+    const io = transport();
+    io.telegramFails = true;
+    const stub = companion("failed-send");
+    await stub.importSnapshot(library(2));
+
+    expect(await stub.enqueueTelegramUpdate(message(1, "/review"))).toBe("enqueued");
+    await drain(stub, 12);
+    expect(await stub.summary()).toMatchObject({ pendingInbox: 0, failedInbox: 1 });
+    expect(io.sent).toHaveLength(0);
+
+    // The prompt was never delivered, so the next ordinary message is neither an
+    // answer nor a capture: it comes back verbatim with the outstanding question.
+    io.telegramFails = false;
+    expect(await stub.enqueueTelegramUpdate(message(2, "obdurate"))).toBe("enqueued");
+    await drain(stub);
+
+    expect(io.modelCalls()).toBe(0);
+    expect(io.sent).toHaveLength(1);
+    expect(io.sent[0]).toContain("Review due. Answer this delivered question first:");
+    expect(io.sent[0]).toContain("What does 'word-1' mean?");
+    expect(io.sent[0]).toContain("Your original message was:\nobdurate");
+    expect(io.sent[0]).toContain("Complete or exit the study session, then resubmit it.");
+    expect((await stub.summary()).entries).toBe(2);
+  });
+
+  it("still interrupts capture after a day rollover cancels the undelivered prompt", async () => {
+    const io = transport();
+    io.telegramFails = true;
+    const stub = companion("rollover-gap");
+    await stub.importSnapshot(library(2));
+
+    expect(await stub.enqueueTelegramUpdate(message(1, "/review"))).toBe("enqueued");
+    await drain(stub, 12);
+    expect(io.sent).toHaveLength(0);
+
+    // The next ordinary message arrives on the following local day: the
+    // rollover reconcile cancels the prepared prompt, but the message must
+    // still surface the review instead of being captured.
+    io.telegramFails = false;
+    expect(
+      await stub.enqueueTelegramUpdate(message(2, "obdurate", "2026-07-24T04:00:00Z")),
+    ).toBe("enqueued");
+    await drain(stub);
+
+    expect(io.modelCalls()).toBe(0);
+    expect(io.sent).toHaveLength(1);
+    expect(io.sent[0]).toContain("Review due. Answer this delivered question first:");
+    expect(io.sent[0]).toContain("Your original message was:\nobdurate");
+    expect((await stub.summary()).entries).toBe(2);
+  });
+
+  it("delivers, grades an answer, applies the rating, and buries the entry's siblings", async () => {
+    const io = transport();
+    const stub = companion("graded");
+    await stub.importSnapshot(library(3));
+
+    await stub.enqueueTelegramUpdate(message(1, "/review"));
+    await drain(stub);
+    expect(io.sent[0]).toContain("Review 1 of 5 · 5 due");
+    expect(io.sent[0]).toContain("What does 'word-1' mean?");
+
+    await stub.enqueueTelegramUpdate(message(2, "hint"));
+    await drain(stub);
+    expect(io.sent[1]).toBe("Hint: Example 1.");
+    expect(io.modelCalls()).toBe(0);
+
+    await stub.enqueueTelegramUpdate(message(3, "a street of some kind"));
+    await drain(stub);
+    expect(io.modelCalls()).toBe(1);
+    expect(io.sent[2]).toContain("Grade: Correct");
+    expect(io.sent[2]).toContain("Feedback: Accurate.");
+    expect(io.sent[2]).toContain("Choose effort: Hard or Good or Easy.");
+
+    await stub.enqueueTelegramUpdate(message(4, "nonsense"));
+    await drain(stub);
+    expect(io.sent[3]).toBe("Send one of the listed effort ratings.");
+
+    await stub.enqueueTelegramUpdate(message(5, "Good"));
+    await drain(stub);
+    expect(io.sent[4]).toContain("Rated: Good");
+    expect(io.sent[4]).toContain("Next due: ");
+    expect(io.sent[4]).toContain("Progress: 1 of 4 complete.");
+    // The next prompt rides along and is itself only answerable once delivered.
+    expect(io.sent[4]).toContain("What does 'word-2' mean?");
+
+    const exported = (await stub.exportSnapshot())!;
+    const forward = exported.cards.find((card) => card.id === 1)!;
+    expect(forward.state).toBe("review");
+    expect(forward.repetitions).toBe(1);
+    expect(exported.cards.find((card) => card.id === 2)!.buriedUntilLocalDate).toBe("2026-07-23");
+    expect(exported.reviewAttempts).toHaveLength(1);
+    expect(exported.reviewAttempts[0]).toMatchObject({
+      rating: "good",
+      evaluatorGrade: "correct",
+      submittedAnswer: "a street of some kind",
+    });
+    const delivered = exported.deliveryAttempts.filter((attempt) => attempt.status === "delivered");
+    expect(delivered).toHaveLength(2);
+    expect(delivered[0]!.contentFingerprint).toMatch(/^[0-9a-f]{64}$/u);
+  });
+
+  it("surfaces due work as an interruption when no tick ever prepared a prompt", async () => {
+    const io = transport();
+    const stub = companion("cold-backlog");
+    const snapshot = library(2);
+    await stub.importSnapshot({
+      ...snapshot,
+      cards: [
+        {
+          ...snapshot.cards[0]!,
+          state: "review" as const,
+          stability: encodeReal(3.5),
+          difficulty: encodeReal(5),
+          dueAt: "2026-07-18T00:00:00Z",
+          effectiveDueAt: "2026-07-18T00:00:00Z",
+          lastReviewAt: "2026-07-15T00:00:00Z",
+          repetitions: 1,
+          introducedLocalDate: "2026-07-15",
+        },
+        ...snapshot.cards.slice(1),
+      ],
+    });
+
+    await stub.enqueueTelegramUpdate(message(1, "obdurate"));
+    await drain(stub);
+
+    expect(io.modelCalls()).toBe(0);
+    expect(io.sent[0]).toContain("Review due. Answer this delivered question first:");
+    expect(io.sent[0]).toContain("Your original message was:\nobdurate");
+    expect(io.sent[0]).toContain("Complete or exit the review, then resubmit it.");
+    expect((await stub.summary()).entries).toBe(2);
+  });
+
+  it("grades a reverse card by exact match without calling the evaluator", async () => {
+    const io = transport();
+    const stub = companion("reverse-test");
+    await stub.importSnapshot(library(5));
+
+    await stub.enqueueTelegramUpdate(message(1, "/test reverse"));
+    await drain(stub);
+    expect(io.sent[0]).toBe(
+      "Question 1 of 5\nWhich saved word matches this definition?\ndefinition 1",
+    );
+
+    await stub.enqueueTelegramUpdate(message(2, "  Word-1. "));
+    await drain(stub);
+    expect(io.modelCalls()).toBe(0);
+    expect(io.sent[1]).toContain("Grade: Correct\nFeedback: Exact match to the saved entry.");
+    expect(io.sent[1]).toContain("Answer: word-1");
+
+    await stub.enqueueTelegramUpdate(message(3, "easy"));
+    await drain(stub);
+    expect(io.sent[2]).toContain("Rated: Easy");
+    expect(io.sent[2]).toContain("Question 2 of 5");
+
+    // An incorrect answer settles itself: no rating is offered and a retry is queued.
+    await stub.enqueueTelegramUpdate(message(4, "not the saved word"));
+    await drain(stub);
+    expect(io.modelCalls()).toBe(0);
+    expect(io.sent[3]).toContain("Grade: Incorrect");
+    expect(io.sent[3]).toContain("That does not exactly match the saved entry.");
+    expect(io.sent[3]).toContain("Retry added at the end.");
+    expect(io.sent[3]).not.toContain("Choose effort");
+  });
+});
+
+describe("VocabularyCompanion study commands", () => {
+  it("runs a five-question forward test and refuses a conflicting review", async () => {
+    const io = transport();
+    const stub = companion("test-command");
+    await stub.importSnapshot(library(5));
+
+    await stub.enqueueTelegramUpdate(message(1, "/test"));
+    await drain(stub);
+    expect(io.sent[0]).toBe(
+      "Usage: /test forward|reverse\n" +
+        "Forward: recall each saved meaning from its word.\n" +
+        "Reverse: recall the saved word from one exact definition.",
+    );
+
+    await stub.enqueueTelegramUpdate(message(2, "/test sideways"));
+    await drain(stub);
+    expect(io.sent[1]).toContain("Usage: /test forward|reverse");
+
+    await stub.enqueueTelegramUpdate(message(3, "/test forward"));
+    await drain(stub);
+    expect(io.sent[2]).toBe("Question 1 of 5\nWhat does 'word-1' mean?");
+
+    await stub.enqueueTelegramUpdate(message(4, "/review"));
+    await drain(stub);
+    expect(io.sent[3]).toBe("Finish or exit your active test first.");
+  });
+
+  it("reports the shortfall for a test that cannot fill five distinct entries", async () => {
+    const io = transport();
+    const stub = companion("test-shortfall");
+    await stub.importSnapshot(library(3));
+
+    await stub.enqueueTelegramUpdate(message(1, "/test reverse"));
+    await drain(stub);
+    expect(io.sent[0]).toBe(
+      "You have 3 eligible distinct reverse entries. Add or unbury 2 more to start.",
+    );
+    expect((await stub.exportSnapshot())!.studySessions).toHaveLength(0);
+  });
+
+  it("exits a study session and leaves the unanswered cards due", async () => {
+    const io = transport();
+    const stub = companion("endstudy");
+    await stub.importSnapshot(library(2));
+
+    await stub.enqueueTelegramUpdate(message(1, "/endstudy"));
+    await drain(stub);
+    expect(io.sent[0]).toBe("There is no active vocabulary study session.");
+
+    await stub.enqueueTelegramUpdate(message(2, "/review"));
+    await drain(stub);
+    await stub.enqueueTelegramUpdate(message(3, "/endstudy"));
+    await drain(stub);
+    expect(io.sent[2]).toBe("Review exited. Unfinished cards are still due.");
+
+    const exported = (await stub.exportSnapshot())!;
+    expect(exported.cards.every((card) => card.repetitions === 0 && card.state === "new")).toBe(true);
+    expect(exported.studySessions[0]!.status).toBe("exited");
+    expect(exported.studyPrompts[0]!.status).toBe("cancelled");
+
+    // The carried-over cards come back in the next session.
+    await stub.enqueueTelegramUpdate(message(4, "/review"));
+    await drain(stub);
+    expect(io.sent[3]).toContain("What does 'word-1' mean?");
+  });
+});
+
+describe("VocabularyCompanion review ticker", () => {
+  it("stays silent before the review hour unless an older backlog exists", async () => {
+    transport();
+    const stub = companion("ticker-silent");
+    await stub.importSnapshot(library(2));
+
+    expect(await stub.enqueueDailyReview({ dedupeKey: "cron:1", nowUtc: "2026-07-20T01:00:00Z" }))
+      .toBe("silent");
+    expect(await stub.summary()).toMatchObject({ pendingInbox: 0 });
+  });
+
+  it("sends at most one prompt per run and never while one is in flight", async () => {
+    const io = transport();
+    const stub = companion("ticker-once");
+    await stub.importSnapshot(library(3));
+
+    // 04:00Z is 12:00 in Asia/Kuala_Lumpur, the configured review hour.
+    expect(await stub.enqueueDailyReview({ dedupeKey: "cron:1", nowUtc: "2026-07-20T04:00:00Z" }))
+      .toBe("enqueued");
+    // The prompt is prepared but not yet sent, so the next run must stay quiet.
+    expect(await stub.enqueueDailyReview({ dedupeKey: "cron:2", nowUtc: "2026-07-20T05:00:00Z" }))
+      .toBe("silent");
+
+    await drain(stub);
+    expect(io.sent).toHaveLength(1);
+    expect(io.sent[0]).toContain("What does 'word-1' mean?");
+
+    // Now it is answerable, so later runs keep quiet rather than dumping the queue.
+    expect(await stub.enqueueDailyReview({ dedupeKey: "cron:3", nowUtc: "2026-07-20T06:00:00Z" }))
+      .toBe("silent");
+    await drain(stub);
+    expect(io.sent).toHaveLength(1);
+  });
+
+  it("prompts before the review hour when an overdue card is waiting", async () => {
+    const io = transport();
+    const stub = companion("ticker-backlog");
+    const snapshot = library(2);
+    const overdue = {
+      ...snapshot.cards[0]!,
+      state: "review" as const,
+      stability: encodeReal(3.5),
+      difficulty: encodeReal(5),
+      dueAt: "2026-07-18T00:00:00Z",
+      effectiveDueAt: "2026-07-18T00:00:00Z",
+      lastReviewAt: "2026-07-15T00:00:00Z",
+      repetitions: 1,
+      introducedLocalDate: "2026-07-15",
+    };
+    await stub.importSnapshot({ ...snapshot, cards: [overdue, ...snapshot.cards.slice(1)] });
+
+    expect(await stub.enqueueDailyReview({ dedupeKey: "cron:1", nowUtc: "2026-07-20T01:00:00Z" }))
+      .toBe("enqueued");
+    await drain(stub);
+    expect(io.sent).toHaveLength(1);
+    expect(io.sent[0]).toContain("What does 'word-1' mean?");
+  });
+});
+
+describe("VocabularyCompanion concurrency", () => {
+  it("grades the first of two racing answers and treats the second as a rating", async () => {
+    const io = transport();
+    const stub = companion("racing");
+    await stub.importSnapshot(library(2));
+
+    await stub.enqueueTelegramUpdate(message(1, "/review"));
+    await drain(stub);
+
+    await stub.enqueueTelegramUpdate(message(2, "stubborn"));
+    await stub.enqueueTelegramUpdate(message(3, "unyielding"));
+    await drain(stub);
+
+    expect(io.modelCalls()).toBe(1);
+    expect(io.sent[1]).toContain("Choose effort:");
+    expect(io.sent[2]).toBe("Send one of the listed effort ratings.");
+  });
+
+  it("marks a prepared response failed after ten Telegram send failures", async () => {
+    const io = transport();
+    io.telegramFails = true;
+    const stub = companion("failure");
+    await stub.importSnapshot(library(1));
+
+    await stub.enqueueTelegramUpdate(message(1, "/test forward"));
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+    }
+    expect(await stub.summary()).toMatchObject({ pendingInbox: 0, failedInbox: 1 });
+  });
+});

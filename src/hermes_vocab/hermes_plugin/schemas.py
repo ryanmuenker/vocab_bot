@@ -26,12 +26,12 @@ SAVE_CARD = {
     },
 }
 
-COMPLETE_REVIEW = {
-    "name": "vocabulary_complete_review",
+CONTINUE_STUDY = {
+    "name": "vocabulary_continue_study",
     "description": (
-        "Evaluate the user's raw response to the currently pending vocabulary "
-        "review, persist the authoritative grade and feedback, and return them "
-        "before the stored definition and example."
+        "Continue the currently delivered study prompt. Submit the learner's "
+        "answer first, then submit one of the returned effort ratings. The same "
+        "contract handles review, forward-test, and reverse-test sessions."
     ),
     "parameters": {
         "type": "object",

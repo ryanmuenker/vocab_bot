@@ -6,18 +6,18 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from hermes_vocab.models import (
+    CardDirection,
     Evaluation,
     EvaluationGrade,
-    PendingReviewStatus,
-    ReviewCompletionResult,
-    ReviewCompletionStatus,
+    FinalizeResult,
+    FinalizeStatus,
+    ReviewRating,
+    StudyAnswerContext,
+    StudyAnswerResult,
+    StudyAnswerStatus,
     VocabularyEntry,
-    TestCompletionResult,
-    TestCompletionStatus,
-    TestSnapshotStatus,
 )
 from hermes_vocab.review import ReviewService
-from hermes_vocab.test_session import TestSessionService
 
 MAX_EVALUATION_FEEDBACK_LENGTH = 500
 SHOW_ANSWER_FEEDBACK = "You chose to reveal the answer."
@@ -133,83 +133,153 @@ async def evaluate_answer(
                 SHOW_ANSWER_FEEDBACK,
             ),
         )
+    if answer_text.strip().casefold() == "idk":
+        return EvaluationResult(
+            EvaluationStatus.VALID,
+            Evaluation(
+                EvaluationGrade.INCORRECT,
+                "You said you don't know the answer.",
+            ),
+        )
     return await provider.evaluate(entry, answer_text)
 
 
-async def complete_pending_review(
+REVERSE_CORRECT_FEEDBACK = "Exact match to the saved entry."
+REVERSE_INCORRECT_FEEDBACK = "That does not exactly match the saved entry."
+
+
+def normalize_reverse_answer(text: str) -> str:
+    normalized = " ".join(text.split()).casefold()
+    return normalized.rstrip(".!?").rstrip()
+
+
+def allowed_ratings(grade: EvaluationGrade) -> tuple[ReviewRating, ...]:
+    if grade is EvaluationGrade.PARTIAL:
+        return (ReviewRating.AGAIN, ReviewRating.HARD)
+    if grade is EvaluationGrade.CORRECT:
+        return (ReviewRating.HARD, ReviewRating.GOOD, ReviewRating.EASY)
+    return ()
+
+
+def parse_rating(
+    text: str,
+    allowed: tuple[ReviewRating, ...],
+) -> ReviewRating | None:
+    if not isinstance(text, str):
+        return None
+    token = " ".join(text.split()).casefold()
+    try:
+        rating = ReviewRating(token)
+    except ValueError:
+        return None
+    return rating if rating in allowed else None
+
+
+def _reverse_evaluation(entry: VocabularyEntry, answer_text: str) -> Evaluation:
+    if normalize_reverse_answer(answer_text) == normalize_reverse_answer(
+        entry.display_text
+    ):
+        return Evaluation(EvaluationGrade.CORRECT, REVERSE_CORRECT_FEEDBACK)
+    return Evaluation(EvaluationGrade.INCORRECT, REVERSE_INCORRECT_FEEDBACK)
+
+
+def _finalized_result(
+    context: StudyAnswerContext,
+    choices: tuple[ReviewRating, ...],
+    finalization: FinalizeResult,
+) -> StudyAnswerResult:
+    if finalization.status is FinalizeStatus.COMPLETED:
+        status = StudyAnswerStatus.FINALIZED
+    elif finalization.status is FinalizeStatus.STORAGE_ERROR:
+        status = StudyAnswerStatus.STORAGE_ERROR
+    else:
+        status = StudyAnswerStatus.STALE
+    return StudyAnswerResult(
+        status,
+        context=context,
+        allowed_ratings=choices,
+        finalization=finalization,
+    )
+
+
+async def continue_study_answer(
     review_service: ReviewService,
     provider: EvaluationProvider,
     answer_text: str,
-) -> ReviewCompletionResult:
-    if not isinstance(answer_text, str) or not answer_text.strip():
-        return ReviewCompletionResult(ReviewCompletionStatus.INVALID)
-
-    try:
-        prepared = review_service.pending_review()
-    except Exception:
-        return ReviewCompletionResult(ReviewCompletionStatus.STORAGE_ERROR)
-
-    if prepared.status is PendingReviewStatus.STORAGE_ERROR:
-        return ReviewCompletionResult(ReviewCompletionStatus.STORAGE_ERROR)
-    if (
-        prepared.status is not PendingReviewStatus.PENDING
-        or prepared.event is None
-        or prepared.entry is None
-    ):
-        return ReviewCompletionResult(ReviewCompletionStatus.NO_PENDING)
-
-    evaluated = await evaluate_answer(provider, prepared.entry, answer_text)
-    if (
-        evaluated.status is not EvaluationStatus.VALID
-        or evaluated.evaluation is None
-    ):
-        return ReviewCompletionResult(ReviewCompletionStatus.STORAGE_ERROR)
-    evaluation = evaluated.evaluation
-
-    try:
-        return review_service.complete_review(
-            prepared.event.id,
-            answer_text,
-            evaluation,
+) -> StudyAnswerResult:
+    context = review_service.current_answer_context()
+    if context is None:
+        return StudyAnswerResult(StudyAnswerStatus.NO_ACTIVE)
+    if context.draft is not None:
+        choices = allowed_ratings(context.draft.evaluation.grade)
+        if context.draft.evaluation.grade is EvaluationGrade.INCORRECT:
+            return _finalized_result(
+                context,
+                choices,
+                review_service.finalize(
+                    context.prompt.id,
+                    ReviewRating.AGAIN,
+                ),
+            )
+        rating = parse_rating(answer_text, choices)
+        if rating is None:
+            return StudyAnswerResult(
+                StudyAnswerStatus.INVALID_RATING,
+                context=context,
+                allowed_ratings=choices,
+            )
+        return _finalized_result(
+            context,
+            choices,
+            review_service.finalize(context.prompt.id, rating),
         )
-    except Exception:
-        return ReviewCompletionResult(ReviewCompletionStatus.STORAGE_ERROR)
-
-
-async def complete_test_question(
-    test_service: TestSessionService,
-    provider: EvaluationProvider,
-    answer_text: str,
-) -> TestCompletionResult:
     if not isinstance(answer_text, str) or not answer_text.strip():
-        return TestCompletionResult(TestCompletionStatus.INVALID)
+        return StudyAnswerResult(
+            StudyAnswerStatus.INVALID_INPUT,
+            context=context,
+        )
 
-    try:
-        prepared = test_service.current()
-    except Exception:
-        return TestCompletionResult(TestCompletionStatus.STORAGE_ERROR)
-    if prepared.status is TestSnapshotStatus.STORAGE_ERROR:
-        return TestCompletionResult(TestCompletionStatus.STORAGE_ERROR)
-    if (
-        prepared.status is not TestSnapshotStatus.ACTIVE
-        or prepared.snapshot is None
-        or prepared.snapshot.current_question is None
-    ):
-        return TestCompletionResult(TestCompletionStatus.NO_ACTIVE)
-
-    question = prepared.snapshot.current_question
-    evaluated = await evaluate_answer(provider, question.entry, answer_text)
+    if answer_text == "show answer" or answer_text.strip().casefold() == "idk":
+        evaluated = await evaluate_answer(provider, context.entry, answer_text)
+    elif context.queue_item.card.direction is CardDirection.REVERSE:
+        evaluated = EvaluationResult(
+            EvaluationStatus.VALID,
+            _reverse_evaluation(context.entry, answer_text),
+        )
+    else:
+        evaluated = await evaluate_answer(provider, context.entry, answer_text)
     if (
         evaluated.status is not EvaluationStatus.VALID
         or evaluated.evaluation is None
     ):
-        return TestCompletionResult(TestCompletionStatus.STORAGE_ERROR)
-
-    try:
-        return test_service.complete(
-            question.id,
+        return StudyAnswerResult(
+            StudyAnswerStatus.EVALUATION_ERROR,
+            context=context,
+        )
+    if (
+        review_service.record_answer(
+            context.prompt.id,
             answer_text,
             evaluated.evaluation,
         )
-    except Exception:
-        return TestCompletionResult(TestCompletionStatus.STORAGE_ERROR)
+        is None
+    ):
+        return StudyAnswerResult(
+            StudyAnswerStatus.STORAGE_ERROR,
+            context=context,
+        )
+    persisted = review_service.current_answer_context()
+    if persisted is None or persisted.draft is None:
+        return StudyAnswerResult(StudyAnswerStatus.STALE)
+    choices = allowed_ratings(persisted.draft.evaluation.grade)
+    if persisted.draft.evaluation.grade is EvaluationGrade.INCORRECT:
+        return _finalized_result(
+            persisted,
+            choices,
+            review_service.finalize(persisted.prompt.id, ReviewRating.AGAIN),
+        )
+    return StudyAnswerResult(
+        StudyAnswerStatus.AWAITING_RATING,
+        context=persisted,
+        allowed_ratings=choices,
+    )

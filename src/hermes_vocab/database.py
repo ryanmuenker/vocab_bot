@@ -8,11 +8,14 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Iterator
 
+from .migrations import MIGRATION_BACKFILLS as _MIGRATION_BACKFILLS
+
 _MIGRATIONS = {
     1: "001_initial.sql",
     2: "002_multi_sense.sql",
     3: "003_entry_terms.sql",
     4: "004_graded_reviews_and_tests.sql",
+    5: "005_spaced_review_cards.sql",
 }
 
 
@@ -79,6 +82,9 @@ class Database:
                     self._migration_sql(target)
                 ):
                     connection.execute(statement)
+                backfill = _MIGRATION_BACKFILLS.get(target)
+                if backfill is not None:
+                    backfill(connection)
                 violations = connection.execute(
                     "PRAGMA foreign_key_check"
                 ).fetchall()

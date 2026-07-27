@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
+from math import isfinite
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .scheduling import ScheduleTransition
 
 
 class CaptureOperation(StrEnum):
@@ -102,89 +107,6 @@ class Evaluation:
     feedback: str
 
 
-class PendingReviewStatus(StrEnum):
-    PENDING = "pending"
-    NONE = "none"
-    STORAGE_ERROR = "storage_error"
-
-
-class ReviewPromptStatus(StrEnum):
-    PENDING = "pending"
-    ALREADY_COMPLETED = "already_completed"
-    TEST_ACTIVE = "test_active"
-    EMPTY = "empty"
-    STORAGE_ERROR = "storage_error"
-
-
-class ReviewCompletionStatus(StrEnum):
-    COMPLETED = "completed"
-    INVALID = "invalid"
-    NO_PENDING = "no_pending"
-    STORAGE_ERROR = "storage_error"
-
-
-@dataclass(frozen=True, slots=True)
-class ReviewEvent:
-    id: int
-    entry_id: int
-    review_date: date
-    status: str
-    prompted_at: datetime
-    answered_at: datetime | None
-    answer_text: str | None
-    grade: EvaluationGrade | None = None
-    feedback: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class PendingReviewResult:
-    status: PendingReviewStatus
-    event: ReviewEvent | None = None
-    entry: VocabularyEntry | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ReviewPromptResult:
-    status: ReviewPromptStatus
-    event: ReviewEvent | None = None
-    entry: VocabularyEntry | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ReviewCompletionResult:
-    status: ReviewCompletionStatus
-    entry: VocabularyEntry | None = None
-    answer_text: str | None = None
-    grade: EvaluationGrade | None = None
-    feedback: str | None = None
-    event_id: int | None = None
-
-
-class TestSessionStatus(StrEnum):
-    ACTIVE = "active"
-    COMPLETED = "completed"
-
-
-@dataclass(frozen=True, slots=True)
-class TestSession:
-    id: int
-    status: TestSessionStatus
-    started_at: datetime
-    completed_at: datetime | None
-
-
-@dataclass(frozen=True, slots=True)
-class TestQuestion:
-    id: int
-    session_id: int
-    position: int
-    entry: VocabularyEntry
-    answer_text: str | None
-    grade: EvaluationGrade | None
-    feedback: str | None
-    answered_at: datetime | None
-
-
 @dataclass(frozen=True, slots=True)
 class TestSummary:
     correct: int = 0
@@ -192,53 +114,243 @@ class TestSummary:
     incorrect: int = 0
 
 
+class ReviewRating(StrEnum):
+    AGAIN = "again"
+    HARD = "hard"
+    GOOD = "good"
+    EASY = "easy"
+
+
+class CardScheduleState(StrEnum):
+    NEW = "new"
+    REVIEW = "review"
+    RELEARNING = "relearning"
+
+
+class CardDirection(StrEnum):
+    FORWARD = "forward"
+    REVERSE = "reverse"
+
+
+class StudyMode(StrEnum):
+    REVIEW = "review"
+    TEST_FORWARD = "test_forward"
+    TEST_REVERSE = "test_reverse"
+
+
+class StudySessionStatus(StrEnum):
+    ACTIVE = "active"
+    INTERRUPTED = "interrupted"
+    COMPLETED = "completed"
+    EXITED = "exited"
+
+
+class StudyQueueStatus(StrEnum):
+    QUEUED = "queued"
+    CURRENT = "current"
+    COMPLETED = "completed"
+    SKIPPED = "skipped"
+
+
+class StudyPromptStatus(StrEnum):
+    PREPARED = "prepared"
+    DELIVERED = "delivered"
+    ANSWERED = "answered"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class DeliveryAttemptStatus(StrEnum):
+    UNKNOWN = "unknown"
+    FAILED = "failed"
+    DELIVERED = "delivered"
+
+
+SCHEDULER_KIND = "fsrs-6"
+SCHEDULER_VERSION = "fsrs-6.3.1-hermes-1"
+PARAMETERS_VERSION = "py-fsrs-6.3.1-default"
+PARAMETER_FINGERPRINT = (
+    "sha256:a00444e09ca114a3ce9704158c2abb90200f9aa76e4892ef87fe7d4c79b85f56"
+)
+
+
+def _is_utc(value: datetime) -> bool:
+    return (
+        value.tzinfo is not None
+        and value.utcoffset() == UTC.utcoffset(value)
+        and value.tzname() == "UTC"
+    )
+
+
 @dataclass(frozen=True, slots=True)
-class TestSessionSnapshot:
-    session: TestSession
-    questions: tuple[TestQuestion, ...]
-    current_question: TestQuestion | None
-    summary: TestSummary
+class CardSchedule:
+    state: CardScheduleState
+    due: datetime
+    stability: float | None = None
+    difficulty: float | None = None
+    last_review: datetime | None = None
+    repetitions: int = 0
+    lapses: int = 0
+    scheduler_kind: str = SCHEDULER_KIND
+    parameter_fingerprint: str = PARAMETER_FINGERPRINT
+    desired_retention: float = 0.90
+    scheduler_version: str = SCHEDULER_VERSION
+    parameters_version: str = PARAMETERS_VERSION
+
+    def __post_init__(self) -> None:
+        if not _is_utc(self.due):
+            raise ValueError("due must be a timezone-aware UTC datetime")
+        if self.last_review is not None and not _is_utc(self.last_review):
+            raise ValueError("last_review must be a timezone-aware UTC datetime")
+        if self.repetitions < 0 or self.lapses < 0:
+            raise ValueError("review counters cannot be negative")
+        if self.state is CardScheduleState.NEW:
+            if (
+                self.stability is not None
+                or self.difficulty is not None
+                or self.last_review is not None
+                or self.repetitions != 0
+                or self.lapses != 0
+            ):
+                raise ValueError("new schedules cannot contain review state")
+            return
+        if self.lapses > self.repetitions:
+            raise ValueError("review counters cannot have more lapses than repetitions")
+        if self.stability is None or self.difficulty is None:
+            raise ValueError("reviewed schedules require stability and difficulty")
+        if self.last_review is None:
+            raise ValueError("reviewed schedules require last_review")
+        if self.repetitions < 1:
+            raise ValueError("reviewed schedules require at least one repetition")
+        if not isfinite(self.stability) or self.stability <= 0:
+            raise ValueError("stability must be finite and positive")
+        if not isfinite(self.difficulty) or not 1 <= self.difficulty <= 10:
+            raise ValueError("difficulty must be finite and between 1 and 10")
 
 
-class TestStartStatus(StrEnum):
+class StudyStartStatus(StrEnum):
     STARTED = "started"
     RESUMED = "resumed"
-    INSUFFICIENT_LIBRARY = "insufficient_library"
-    DAILY_REVIEW_PENDING = "daily_review_pending"
+    EMPTY = "empty"
+    CONFLICT = "conflict"
     STORAGE_ERROR = "storage_error"
 
 
-@dataclass(frozen=True, slots=True)
-class TestStartResult:
-    status: TestStartStatus
-    snapshot: TestSessionSnapshot | None = None
-    available_count: int | None = None
-    required_count: int = 5
-
-
-class TestSnapshotStatus(StrEnum):
-    ACTIVE = "active"
-    NONE = "none"
-    STORAGE_ERROR = "storage_error"
-
-
-@dataclass(frozen=True, slots=True)
-class TestSnapshotResult:
-    status: TestSnapshotStatus
-    snapshot: TestSessionSnapshot | None = None
-
-
-class TestCompletionStatus(StrEnum):
-    ADVANCED = "advanced"
+class StudyMutationStatus(StrEnum):
     COMPLETED = "completed"
-    INVALID = "invalid"
     STALE = "stale"
-    NO_ACTIVE = "no_active"
+    STORAGE_ERROR = "storage_error"
+
+
+class FinalizeStatus(StrEnum):
+    COMPLETED = "completed"
+    STALE = "stale"
+    NO_ANSWER = "no_answer"
     STORAGE_ERROR = "storage_error"
 
 
 @dataclass(frozen=True, slots=True)
-class TestCompletionResult:
-    status: TestCompletionStatus
-    snapshot: TestSessionSnapshot | None = None
-    answered_question: TestQuestion | None = None
+class StudyCardSnapshot:
+    id: int
+    entry_id: int
+    sense_id: int | None
+    direction: CardDirection
+    state: CardScheduleState
+    stability: float | None
+    difficulty: float | None
+    due: datetime
+    effective_due: datetime
+    last_review: datetime | None
+    repetitions: int
+    lapses: int
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class StudyQueueItemSnapshot:
+    id: int
+    card: StudyCardSnapshot
+    position: int
+    status: StudyQueueStatus
+    retry_of_queue_item_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class StudyPromptSnapshot:
+    id: int
+    session_id: int
+    queue_item_id: int
+    prompt_key: str
+    prompt_text: str
+    status: StudyPromptStatus
+    prepared_at: datetime
+    delivered_at: datetime | None
+    answered_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class StudyProgress:
+    completed: int
+    total: int
+
+
+@dataclass(frozen=True, slots=True)
+class StudySnapshot:
+    session_id: int
+    mode: StudyMode
+    status: StudySessionStatus
+    local_date: date
+    queue: tuple[StudyQueueItemSnapshot, ...]
+    current_prompt: StudyPromptSnapshot | None
+    progress: StudyProgress
+
+
+@dataclass(frozen=True, slots=True)
+class StudyStartResult:
+    status: StudyStartStatus
+    snapshot: StudySnapshot | None = None
+    available_count: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FinalizeResult:
+    status: FinalizeStatus
+    transition: ScheduleTransition | None = None
+    snapshot: StudySnapshot | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StudyDraftSnapshot:
+    id: int
+    submitted_answer: str
+    evaluation: Evaluation
+    answered_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class StudyAnswerContext:
+    prompt: StudyPromptSnapshot
+    queue_item: StudyQueueItemSnapshot
+    entry: VocabularyEntry
+    sense: VocabularySense | None
+    draft: StudyDraftSnapshot | None = None
+
+
+class StudyAnswerStatus(StrEnum):
+    AWAITING_RATING = "awaiting_rating"
+    FINALIZED = "finalized"
+    INVALID_INPUT = "invalid_input"
+    INVALID_RATING = "invalid_rating"
+    EVALUATION_ERROR = "evaluation_error"
+    STORAGE_ERROR = "storage_error"
+    NO_ACTIVE = "no_active"
+    STALE = "stale"
+
+
+@dataclass(frozen=True, slots=True)
+class StudyAnswerResult:
+    status: StudyAnswerStatus
+    context: StudyAnswerContext | None = None
+    allowed_ratings: tuple[ReviewRating, ...] = ()
+    finalization: FinalizeResult | None = None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 import sqlite3
 
 from hermes_vocab.capture import (
@@ -8,7 +9,7 @@ from hermes_vocab.capture import (
     CaptureService,
     parse_capture_message,
 )
-from hermes_vocab.review import PendingReviewStatus, ReviewService
+from hermes_vocab.review import ReviewService, _timestamp
 
 
 class VocabularyHook:
@@ -16,9 +17,173 @@ class VocabularyHook:
         self,
         capture_service: CaptureService,
         review_service: ReviewService,
+        telegram_chat_id: int | None = None,
     ) -> None:
         self.capture_service = capture_service
         self.review_service = review_service
+        self.telegram_chat_id = (
+            str(telegram_chat_id) if telegram_chat_id is not None else None
+        )
+
+    def prepare_outbound(
+        self,
+        *,
+        prompt_id: int,
+        identity: str,
+        text: str,
+    ) -> bool:
+        if not identity or not text:
+            return False
+        fingerprint = sha256(text.encode("utf-8")).hexdigest()
+        try:
+            with self.review_service.database.connect() as connection:
+                existing = connection.execute(
+                    """
+                    SELECT 1 FROM prompt_delivery_attempts
+                    WHERE prompt_id = ? AND outbound_delivery_id = ?
+                      AND content_fingerprint = ?
+                    """,
+                    (prompt_id, identity, fingerprint),
+                ).fetchone()
+                if existing is not None:
+                    return True
+                attempt = connection.execute(
+                    """
+                    SELECT COALESCE(MAX(attempt_number), 0) + 1
+                    FROM prompt_delivery_attempts WHERE prompt_id = ?
+                    """,
+                    (prompt_id,),
+                ).fetchone()[0]
+                connection.execute(
+                    """
+                    INSERT INTO prompt_delivery_attempts (
+                        prompt_id, attempt_number, status, attempted_at,
+                        outbound_delivery_id, content_fingerprint
+                    ) VALUES (?, ?, 'unknown', ?, ?, ?)
+                    """,
+                    (
+                        prompt_id,
+                        attempt,
+                        _timestamp(self.review_service.clock()),
+                        identity,
+                        fingerprint,
+                    ),
+                )
+                connection.commit()
+                return True
+        except sqlite3.Error:
+            return False
+
+    def post_outbound_delivery(self, *, receipt, **kwargs) -> None:
+        del kwargs
+        if self.telegram_chat_id is None:
+            return
+        if receipt.destination != f"telegram:{self.telegram_chat_id}":
+            return
+        identity = receipt.correlation_id or receipt.cron_run_id
+        if not identity or receipt.state not in {"success", "failure", "unknown"}:
+            return
+        try:
+            with self.review_service.database.connect() as connection:
+                if receipt.correlation_id:
+                    prompt = connection.execute(
+                        "SELECT * FROM study_prompts WHERE prompt_key = ?",
+                        (receipt.correlation_id,),
+                    ).fetchone()
+                else:
+                    prompt = connection.execute(
+                        """
+                        SELECT p.* FROM study_prompts p
+                        JOIN prompt_delivery_attempts a ON a.prompt_id = p.id
+                        WHERE a.outbound_delivery_id = ?
+                        ORDER BY a.id DESC LIMIT 1
+                        """,
+                        (receipt.cron_run_id,),
+                    ).fetchone()
+                if prompt is None:
+                    return
+                if not receipt.correlation_id:
+                    # A cron run is one shot: once it reports an indeterminate
+                    # outcome, later results from that run identity are stale.
+                    resolved_run = connection.execute(
+                        """
+                        SELECT 1 FROM prompt_delivery_attempts
+                        WHERE prompt_id = ? AND outbound_delivery_id = ?
+                          AND status = 'unknown' AND receipt_at IS NOT NULL
+                        """,
+                        (prompt["id"], identity),
+                    ).fetchone()
+                    if resolved_run is not None:
+                        return
+                attempt_row = connection.execute(
+                    """
+                    SELECT a.* FROM prompt_delivery_attempts a
+                    WHERE a.prompt_id = ? AND a.outbound_delivery_id = ?
+                      AND a.content_fingerprint = ?
+                    ORDER BY a.id DESC LIMIT 1
+                    """,
+                    (prompt["id"], identity, receipt.content_fingerprint),
+                ).fetchone()
+                if attempt_row is not None:
+                    fingerprint = attempt_row["content_fingerprint"]
+                else:
+                    fingerprint = sha256(
+                        prompt["prompt_text"].encode("utf-8")
+                    ).hexdigest()
+                    if receipt.content_fingerprint != fingerprint:
+                        return
+                if receipt.state == "success":
+                    message_id = (
+                        receipt.message_ids[-1]
+                        if receipt.message_ids
+                        else identity
+                    )
+                    self.review_service.record_delivery(
+                        prompt["id"],
+                        delivery_id=str(message_id),
+                        content_fingerprint=fingerprint,
+                    )
+                    return
+                duplicate = connection.execute(
+                    """
+                    SELECT 1 FROM prompt_delivery_attempts
+                    WHERE prompt_id = ? AND status = ? AND outbound_delivery_id = ?
+                      AND receipt_at IS NOT NULL
+                    """,
+                    (prompt["id"], "failed" if receipt.state == "failure" else "unknown", identity),
+                ).fetchone()
+                if duplicate is not None:
+                    return
+                attempt = connection.execute(
+                    """
+                    SELECT COALESCE(MAX(attempt_number), 0) + 1
+                    FROM prompt_delivery_attempts WHERE prompt_id = ?
+                    """,
+                    (prompt["id"],),
+                ).fetchone()[0]
+                stamp = _timestamp(self.review_service.clock())
+                connection.execute(
+                    """
+                    INSERT INTO prompt_delivery_attempts (
+                        prompt_id, attempt_number, status, attempted_at,
+                        receipt_at, outbound_delivery_id, content_fingerprint,
+                        error_text
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        prompt["id"],
+                        attempt,
+                        "failed" if receipt.state == "failure" else "unknown",
+                        stamp,
+                        stamp,
+                        identity,
+                        fingerprint,
+                        receipt.error,
+                    ),
+                )
+                connection.commit()
+        except (AttributeError, sqlite3.Error):
+            return
 
     def pre_llm_call(
         self,
@@ -30,21 +195,9 @@ class VocabularyHook:
         platform: str,
         **kwargs,
     ):
+        del session_id, conversation_history, is_first_turn, model, kwargs
         if platform != "telegram" or user_message.lstrip().startswith("/"):
             return None
-        pending_status = self.review_service.pending_review_status()
-        if pending_status is PendingReviewStatus.STORAGE_ERROR:
-            return None
-        if pending_status is PendingReviewStatus.PENDING:
-            return (
-                "A vocabulary review is pending in SQLite. Load the "
-                "vocabulary:vocabulary plugin skill, treat the user's original "
-                "message as the raw review response, call "
-                "vocabulary_complete_review, and relay the returned text "
-                "verbatim. The tool's persisted evaluation is authoritative; "
-                "do not independently score or revise it."
-            )
-
         request = parse_capture_message(user_message)
         if request is None:
             return None

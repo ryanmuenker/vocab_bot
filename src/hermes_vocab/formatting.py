@@ -1,17 +1,15 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from .models import (
-    TestCompletionResult,
-    TestCompletionStatus,
-    TestSessionSnapshot,
-    TestStartResult,
-    TestStartStatus,
+    CardDirection,
     CaptureResult,
     CaptureStatus,
-    ReviewCompletionResult,
-    ReviewCompletionStatus,
-    ReviewPromptResult,
-    ReviewPromptStatus,
+    ReviewRating,
+    StudyAnswerContext,
+    StudyProgress,
+    StudySnapshot,
     VocabularyEntry,
     VocabularySense,
 )
@@ -68,19 +66,6 @@ def format_capture(result: CaptureResult) -> str:
     return _card(result.entry, result.sense, "✓ Saved.")
 
 
-def format_daily_review(result: ReviewPromptResult) -> str:
-    if result.status in {
-        ReviewPromptStatus.ALREADY_COMPLETED,
-        ReviewPromptStatus.TEST_ACTIVE,
-    }:
-        return ""
-    if result.status is ReviewPromptStatus.EMPTY:
-        return "Save a word first, then I'll have something to review."
-    if result.status is ReviewPromptStatus.STORAGE_ERROR or result.entry is None:
-        raise RuntimeError("Could not prepare the daily vocabulary review")
-    return f"What does '{result.entry.display_text}' mean?"
-
-
 def _canonical_reveal(entry: VocabularyEntry) -> str:
     if len(entry.senses) == 1:
         sense = entry.senses[0]
@@ -95,95 +80,93 @@ def _canonical_reveal(entry: VocabularyEntry) -> str:
     )
 
 
-def _test_prompt(snapshot: TestSessionSnapshot) -> str | None:
-    question = snapshot.current_question
-    if question is None:
-        return None
+def format_study_prompt(
+    context: StudyAnswerContext,
+    snapshot: StudySnapshot,
+    *,
+    due_backlog: int,
+) -> str:
+    current = min(snapshot.progress.completed + 1, snapshot.progress.total)
+    retry = (
+        " · retry"
+        if context.queue_item.retry_of_queue_item_id is not None
+        else ""
+    )
+    header = (
+        f"Review {current} of {snapshot.progress.total} · "
+        f"{due_backlog} due{retry}"
+    )
+    if context.queue_item.card.direction is CardDirection.REVERSE:
+        if context.sense is None:
+            raise ValueError("reverse study prompts require a selected sense")
+        question = (
+            "Which saved word or expression matches this definition?\n\n"
+            f"{context.sense.definition}"
+        )
+    else:
+        question = f"What does '{context.entry.display_text}' mean?"
+    return f"{header}\n{question}"
+
+
+def format_study_evaluation_result(context: StudyAnswerContext) -> str:
+    if context.draft is None:
+        raise ValueError("study evaluation formatting requires a persisted draft")
+    evaluation = context.draft.evaluation
+    if context.queue_item.card.direction is CardDirection.REVERSE:
+        if context.sense is None:
+            raise ValueError("reverse evaluation requires a selected sense")
+        reveal = (
+            f"Answer: {context.entry.display_text}\n\n"
+            f"Definition:\n{context.sense.definition}\n\n"
+            f"Example:\n{context.sense.example_sentence}"
+        )
+    else:
+        reveal = _canonical_reveal(context.entry)
     return (
-        f"Question {question.position} of 5\n"
-        f"What does '{question.entry.display_text}' mean?"
+        f"Grade: {evaluation.grade.value.title()}\n"
+        f"Feedback: {evaluation.feedback}\n\n"
+        f"{reveal}"
     )
 
 
-def format_test_start(result: TestStartResult) -> str:
-    if result.status is TestStartStatus.INSUFFICIENT_LIBRARY:
-        available = result.available_count or 0
-        needed = max(result.required_count - available, 0)
-        entry_word = "entry" if available == 1 else "entries"
-        return (
-            f"You have {available} saved {entry_word}. "
-            f"Save {needed} more to start a {result.required_count}-word test."
-        )
-    if result.status is TestStartStatus.DAILY_REVIEW_PENDING:
-        return "Finish your daily review before starting a test."
-    if result.status is TestStartStatus.STORAGE_ERROR or result.snapshot is None:
-        return "I couldn't start the test. Please try again."
-    prompt = _test_prompt(result.snapshot)
-    if prompt is None:
-        return "I couldn't start the test. Please try again."
-    return prompt
+def format_study_evaluation(
+    context: StudyAnswerContext,
+    choices: tuple[ReviewRating, ...],
+) -> str:
+    result = format_study_evaluation_result(context)
+    choice_text = " or ".join(choice.value.title() for choice in choices)
+    return f"{result}\n\nChoose effort: {choice_text}."
 
 
-def format_test_completion(result: TestCompletionResult) -> str:
-    if result.status is TestCompletionStatus.INVALID:
-        return "Send an answer, or type 'show answer'."
-    if result.status is TestCompletionStatus.NO_ACTIVE:
-        return "There isn't an active test."
-    if result.status is TestCompletionStatus.STALE:
-        if result.snapshot is None:
-            return "That answer was already recorded."
-        prompt = _test_prompt(result.snapshot)
-        if prompt is None:
-            return "There isn't an active test."
-        return f"That answer was already recorded.\n\n{prompt}"
-    if (
-        result.status is TestCompletionStatus.STORAGE_ERROR
-        or result.snapshot is None
-        or result.answered_question is None
-        or result.answered_question.grade is None
-        or result.answered_question.feedback is None
-        or not result.answered_question.feedback.strip()
-    ):
-        return "I couldn't evaluate that answer. Please try again."
+def format_study_schedule(
+    rating: ReviewRating,
+    effective_due: datetime,
+    progress: StudyProgress,
+    *,
+    retry_queued: bool,
+    next_prompt: str | None = None,
+) -> str:
+    due = effective_due.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [
+        f"Rated: {rating.value.title()}",
+        f"Next due: {due}",
+        f"Progress: {progress.completed} of {progress.total} complete.",
+    ]
+    if retry_queued:
+        lines.append("Retry added at the end.")
+    text = "\n".join(lines)
+    return f"{text}\n\n{next_prompt}" if next_prompt else text
 
-    answered = result.answered_question
-    text = (
-        f"Grade: {answered.grade.value.title()}\n"
-        f"Feedback: {answered.feedback}\n\n"
-        f"{_canonical_reveal(answered.entry)}"
+
+def format_directional_totals(
+    direction: CardDirection,
+    *,
+    correct: int,
+    partial: int,
+    incorrect: int,
+) -> str:
+    return (
+        f"{direction.value.title()} test complete.\n"
+        f"Results: {correct} correct, {partial} partial, "
+        f"{incorrect} incorrect."
     )
-    if result.status is TestCompletionStatus.ADVANCED:
-        prompt = _test_prompt(result.snapshot)
-        if prompt is None:
-            return "I couldn't evaluate that answer. Please try again."
-        return f"{text}\n\n{prompt}"
-    if result.status is TestCompletionStatus.COMPLETED:
-        summary = result.snapshot.summary
-        return (
-            f"{text}\n\n"
-            "Test complete.\n"
-            f"Results: {summary.correct} correct, {summary.partial} partial, "
-            f"{summary.incorrect} incorrect."
-        )
-    return "I couldn't evaluate that answer. Please try again."
-
-
-def format_review_completion(result: ReviewCompletionResult) -> str:
-    if result.status is ReviewCompletionStatus.INVALID:
-        return "Send an answer, or type 'show answer'."
-    if result.status is ReviewCompletionStatus.NO_PENDING:
-        return "There isn't a review waiting."
-    if (
-        result.status is ReviewCompletionStatus.STORAGE_ERROR
-        or result.entry is None
-        or result.grade is None
-        or result.feedback is None
-        or not result.feedback.strip()
-    ):
-        return "I couldn't evaluate that answer. Please try again."
-    evaluation = (
-        f"Grade: {result.grade.value.title()}\n"
-        f"Feedback: {result.feedback}"
-    )
-    reveal = _canonical_reveal(result.entry)
-    return f"{evaluation}\n\n{reveal}"

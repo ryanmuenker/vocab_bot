@@ -19,6 +19,13 @@ from .models import (
     VocabularyEntry,
     VocabularySense,
 )
+from .scheduling import (
+    DESIRED_RETENTION,
+    PARAMETER_FINGERPRINT,
+    PARAMETERS_VERSION,
+    SCHEDULER_KIND,
+    SCHEDULER_VERSION,
+)
 
 _MAX_ENTRY_TEXT = 500
 MAX_PART_OF_SPEECH_LENGTH = 50
@@ -179,6 +186,7 @@ class CaptureService:
                     ),
                 )
                 entry_id = int(cursor.lastrowid)
+                self._insert_card(connection, entry_id, None, "forward", timestamp)
                 for card in prepared_cards:
                     self._insert_batch_sense(
                         connection,
@@ -219,7 +227,14 @@ class CaptureService:
                         """,
                         (display_text, normalized_text, timestamp),
                     )
-                    entry_id = cursor.lastrowid
+                    entry_id = int(cursor.lastrowid)
+                    self._insert_card(
+                        connection,
+                        entry_id,
+                        None,
+                        "forward",
+                        timestamp,
+                    )
                     sense_id = self._insert_sense(
                         connection,
                         entry_id,
@@ -275,6 +290,39 @@ class CaptureService:
             return CaptureResult(CaptureStatus.STORAGE_ERROR)
 
     @staticmethod
+    def _insert_card(
+        connection: sqlite3.Connection,
+        entry_id: int,
+        sense_id: int | None,
+        direction: str,
+        timestamp: str,
+    ) -> None:
+        """Create one unseen directional card inside the caller's transaction."""
+        connection.execute(
+            """
+            INSERT INTO vocabulary_cards (
+                entry_id, sense_id, direction, state, due_at, effective_due_at,
+                repetitions, lapses, scheduler_kind, scheduler_version,
+                parameters_version, parameter_fingerprint, desired_retention,
+                created_at
+            ) VALUES (?, ?, ?, 'new', ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                entry_id,
+                sense_id,
+                direction,
+                timestamp,
+                timestamp,
+                SCHEDULER_KIND,
+                SCHEDULER_VERSION,
+                PARAMETERS_VERSION,
+                PARAMETER_FINGERPRINT,
+                DESIRED_RETENTION,
+                timestamp,
+            ),
+        )
+
+    @staticmethod
     def _insert_sense(
         connection: sqlite3.Connection,
         entry_id: int,
@@ -298,7 +346,15 @@ class CaptureService:
                 timestamp,
             ),
         )
-        return cursor.lastrowid
+        sense_id = int(cursor.lastrowid)
+        CaptureService._insert_card(
+            connection,
+            entry_id,
+            sense_id,
+            "reverse",
+            timestamp,
+        )
+        return sense_id
 
     @staticmethod
     def _insert_batch_sense(
