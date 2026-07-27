@@ -213,6 +213,32 @@ describe("VocabularyCompanion delivery gating", () => {
     expect((await stub.summary()).entries).toBe(2);
   });
 
+  it("still interrupts capture after a day rollover cancels the undelivered prompt", async () => {
+    const io = transport();
+    io.telegramFails = true;
+    const stub = companion("rollover-gap");
+    await stub.importSnapshot(library(2));
+
+    expect(await stub.enqueueTelegramUpdate(message(1, "/review"))).toBe("enqueued");
+    await drain(stub, 12);
+    expect(io.sent).toHaveLength(0);
+
+    // The next ordinary message arrives on the following local day: the
+    // rollover reconcile cancels the prepared prompt, but the message must
+    // still surface the review instead of being captured.
+    io.telegramFails = false;
+    expect(
+      await stub.enqueueTelegramUpdate(message(2, "obdurate", "2026-07-24T04:00:00Z")),
+    ).toBe("enqueued");
+    await drain(stub);
+
+    expect(io.modelCalls()).toBe(0);
+    expect(io.sent).toHaveLength(1);
+    expect(io.sent[0]).toContain("Review due. Answer this delivered question first:");
+    expect(io.sent[0]).toContain("Your original message was:\nobdurate");
+    expect((await stub.summary()).entries).toBe(2);
+  });
+
   it("delivers, grades an answer, applies the rating, and buries the entry's siblings", async () => {
     const io = transport();
     const stub = companion("graded");

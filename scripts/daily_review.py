@@ -62,9 +62,11 @@ def main() -> int:
     with database.connect() as connection:
         # A send is only "in flight" while its attempt is recent. Without this
         # bound a gateway killed between prepare and receipt would leave the
-        # prompt pending forever and silence the ticker for good. attempted_at is
-        # written by SQLite's datetime('now'), so the bound is computed the same
-        # way; an ISO-8601 string would not compare against it.
+        # prompt pending forever and silence the ticker for good. attempted_at
+        # is an ISO-8601 Z timestamp written by the hook, so the cutoff is
+        # rendered the same way; legacy `datetime('now')` rows sort before any
+        # Z string of the same date and are therefore treated as abandoned.
+        cutoff = _timestamp(datetime.now(UTC) - ABANDONED_DELIVERY_AFTER)
         in_flight = connection.execute(
             """
             SELECT 1 FROM study_prompts p
@@ -76,10 +78,10 @@ def main() -> int:
             )
             WHERE s.status = 'active' AND q.status = 'current'
               AND p.status = 'prepared' AND a.receipt_at IS NULL
-              AND a.attempted_at > datetime('now', ?)
+              AND a.attempted_at > ?
             LIMIT 1
             """,
-            (f"-{int(ABANDONED_DELIVERY_AFTER.total_seconds())} seconds",),
+            (cutoff,),
         ).fetchone()
         older_backlog = connection.execute(
             """

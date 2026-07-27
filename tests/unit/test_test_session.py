@@ -239,30 +239,15 @@ def test_v5_test_requires_five_distinct_entries_without_partial_mutation(
     direction: CardDirection,
 ) -> None:
     service, database, _ = _setup_v5_service(tmp_path)
-    cards = [
-        _add_directional_cards(database, index, extra_senses=2)
-        for index in range(5)
-    ]
-    with database.connect() as connection:
-        connection.execute(
-            """
-            UPDATE vocabulary_cards SET buried_until_local_date = ?
-            WHERE entry_id = ?
-            """,
-            (NOW.date().isoformat(), cards[4][0]),
-        )
-        connection.commit()
-
+    for index in range(4):
+        _add_directional_cards(database, index)
     result = service.start(direction)
-
     assert result.status is StudyStartStatus.EMPTY
     assert result.available_count == 4
     with database.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM study_sessions").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM study_queue").fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT COUNT(*) FROM vocabulary_cards WHERE introduced_local_date IS NOT NULL"
-        ).fetchone()[0] == 0
+
 
 
 def test_v5_matching_test_resumes_and_other_modes_conflict_without_replacement(

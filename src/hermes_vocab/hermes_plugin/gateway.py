@@ -13,6 +13,7 @@ from hermes_vocab.models import (
     StudyPromptSnapshot,
     StudyPromptStatus,
     StudySessionStatus,
+    StudyStartResult,
     StudyStartStatus,
 )
 from hermes_vocab.review import ReviewService
@@ -148,11 +149,26 @@ class VocabularyGatewayRouter:
                 "Complete or exit the study session, then resubmit it.",
             )
 
-        if snapshot is None and self._review_service.due_but_not_answerable():
-            # Due work exists but cron never prepared a prompt (for example the
-            # computer was off). Ordinary text must surface that work instead of
-            # being graded or captured.
-            started = self._review_service.start()
+        # A review session whose prepared prompt was cancelled by a day
+        # rollover is active but has no live prompt; it needs surfacing just
+        # like the no-session case below.
+        rollover_gap = (
+            snapshot is not None
+            and prompt is None
+            and snapshot.mode is StudyMode.REVIEW
+            and snapshot.status is StudySessionStatus.ACTIVE
+        )
+        if rollover_gap or (
+            snapshot is None and self._review_service.due_but_not_answerable()
+        ):
+            # Due work exists but no prompt is outstanding (for example the
+            # computer was off, or the day rolled over). Ordinary text must
+            # surface that work instead of being graded or captured.
+            started = (
+                StudyStartResult(StudyStartStatus.RESUMED)
+                if rollover_gap
+                else self._review_service.start()
+            )
             if started.status in {
                 StudyStartStatus.STARTED,
                 StudyStartStatus.RESUMED,
@@ -231,9 +247,9 @@ class VocabularyGatewayRouter:
         if row is None:
             return None
         current = min(snapshot.progress.completed + 1, snapshot.progress.total)
-        remaining = max(snapshot.progress.total - snapshot.progress.completed, 0)
+        due_backlog = self._review_service.due_count()
         text = (
-            f"Review {current} of {snapshot.progress.total} · {remaining} due\n"
+            f"Review {current} of {snapshot.progress.total} · {due_backlog} due\n"
             f"What does '{row['display_text']}' mean?"
         )
         return self._review_service.prepare_current_prompt(

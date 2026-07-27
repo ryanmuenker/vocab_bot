@@ -451,25 +451,6 @@ class ReviewService:
                     connection.rollback()
                     return FinalizeResult(FinalizeStatus.STALE)
 
-                local_date = self._local_date(now).isoformat()
-                connection.execute(
-                    """
-                    UPDATE vocabulary_cards
-                    SET buried_until_local_date = ?
-                    WHERE entry_id = ? AND id != ?
-                    """,
-                    (local_date, row["entry_id"], row["card_id"]),
-                )
-                connection.execute(
-                    """
-                    UPDATE study_queue SET status = 'skipped'
-                    WHERE session_id = ? AND status = 'queued' AND card_id IN (
-                        SELECT id FROM vocabulary_cards
-                        WHERE entry_id = ? AND id != ?
-                    )
-                    """,
-                    (row["session_id"], row["entry_id"], row["card_id"]),
-                )
                 connection.execute(
                     """
                     UPDATE study_prompts SET status = 'completed'
@@ -661,8 +642,9 @@ class ReviewService:
     def due_but_not_answerable(self) -> bool:
         if self.answerable_prompt() is not None:
             return False
-        now = _timestamp(self.clock())
-        local_date = self._local_date(self.clock()).isoformat()
+        moment = self.clock()
+        now = _timestamp(moment)
+        local_date = self._local_date(moment).isoformat()
         try:
             with self.database.connect() as connection:
                 row = connection.execute(
@@ -677,6 +659,25 @@ class ReviewService:
                 return row is not None
         except sqlite3.Error:
             return False
+
+    def due_count(self) -> int:
+        """Number of genuinely overdue cards — seen cards past their due instant."""
+        moment = self.clock()
+        now = _timestamp(moment)
+        local_date = self._local_date(moment).isoformat()
+        try:
+            with self.database.connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT COUNT(*) AS n FROM vocabulary_cards
+                    WHERE state != 'new' AND effective_due_at <= ?
+                      AND (buried_until_local_date IS NULL OR buried_until_local_date < ?)
+                    """,
+                    (now, local_date),
+                ).fetchone()
+                return row["n"] if row else 0
+        except sqlite3.Error:
+            return 0
 
     def progress(self) -> StudyProgress | None:
         snapshot = self.snapshot()
@@ -710,7 +711,7 @@ class ReviewService:
         excluded_ids: set[int] | None = None,
     ) -> list[StudyCardSnapshot]:
         local_date = self._local_date(now).isoformat()
-        parameters: list[object] = [local_date]
+        parameters: list[object] = []
         direction_sql = ""
         if direction is not None:
             direction_sql = "AND direction = ?"
@@ -718,14 +719,14 @@ class ReviewService:
         rows = connection.execute(
             f"""
             SELECT * FROM vocabulary_cards
-            WHERE (buried_until_local_date IS NULL OR buried_until_local_date < ?)
+            WHERE 1=1
               {direction_sql}
             """,
             parameters,
         ).fetchall()
         excluded_ids = excluded_ids or set()
         introduced_today = connection.execute(
-            "SELECT COUNT(*) FROM vocabulary_cards WHERE introduced_local_date = ?",
+            "SELECT COUNT(DISTINCT entry_id) FROM vocabulary_cards WHERE introduced_local_date = ?",
             (local_date,),
         ).fetchone()[0]
         remaining_new = max(self.new_card_limit - introduced_today, 0)
@@ -852,11 +853,10 @@ class ReviewService:
                     """
                     UPDATE vocabulary_cards
                     SET introduced_local_date = COALESCE(introduced_local_date, ?)
-                    WHERE id = ?
+                    WHERE entry_id = ?
                     """,
-                    (introduced, card.id),
+                    (introduced, card.entry_id),
                 )
-
     def _reconcile_rollover(
         self,
         connection: sqlite3.Connection,
@@ -1013,9 +1013,9 @@ class ReviewService:
                     """
                     UPDATE vocabulary_cards
                     SET introduced_local_date = COALESCE(introduced_local_date, ?)
-                    WHERE id = ?
+                    WHERE entry_id = ?
                     """,
-                    (introduced, value.id),
+                    (introduced, value.entry_id),
                 )
         connection.execute(
             "UPDATE study_sessions SET local_date = ? WHERE id = ? AND local_date != ?",

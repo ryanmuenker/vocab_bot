@@ -797,9 +797,9 @@ def test_populated_v3_upgrade_preserves_legacy_audit_and_uses_v5_scheduling(
     assert completion.transition.before.state.value == "new"
     assert completion.transition.after.state.value == "review"
     assert review.exit() is StudyMutationStatus.COMPLETED
-
-    # The reviewed card is the only remaining eligible entry: same-day burial and
-    # the exhausted new-card quota keep the other migrated cards out of a test.
+    # The per-entry quota marks all cards of each introduced entry, so only
+    # the reviewed entry and the two unseen, unintroduced entries remain eligible
+    # for a test.
     tests = VocabularyTestSessionService(
         database,
         timezone,
@@ -807,7 +807,7 @@ def test_populated_v3_upgrade_preserves_legacy_audit_and_uses_v5_scheduling(
     )
     started = tests.start(CardDirection.FORWARD)
     assert started.status is StudyStartStatus.EMPTY
-    assert started.available_count == 1
+    assert started.available_count == 3
     assert started.snapshot is None
 
     with database.connect() as connection:

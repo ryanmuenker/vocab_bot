@@ -890,3 +890,47 @@ def test_interactive_prompt_identity_promotes_after_an_unknown_receipt(
 
     answerable = review.answerable_prompt()
     assert answerable is not None and answerable.id == prompt.id
+
+
+def test_rollover_cancelled_prompt_still_interrupts_capture(
+    tmp_path: Path,
+) -> None:
+    """A day rollover cancels an undelivered prompt; ordinary text must still
+    surface the review instead of being silently captured."""
+    from datetime import timedelta
+
+    moment = {"now": NOW}
+    database = Database(tmp_path / "data" / "vocabulary.sqlite3")
+    database.initialize()
+    capture = CaptureService(database, clock=lambda: moment["now"])
+    review = ReviewService(database, ZoneInfo("UTC"), clock=lambda: moment["now"])
+    definition = FakeProvider()
+    router = VocabularyGatewayRouter(
+        capture,
+        review,
+        SessionService(database, ZoneInfo("UTC"), clock=lambda: moment["now"]),
+        definition,
+        FakeEvaluationProvider(),
+        CHAT_ID,
+    )
+    capture.capture_entry("laconic", CARDS)
+    review.start()
+    prepared = router.prepare_review_prompt()
+    assert prepared is not None
+    assert review.answerable_prompt() is None
+
+    # The next local day begins before the prompt was ever delivered.
+    moment["now"] = NOW + timedelta(days=1)
+
+    response = asyncio.run(route(router, "Xanthocroid"))
+
+    assert response is not None
+    assert "Answer this delivered question first" in response
+    assert "Xanthocroid" in response
+    assert definition.calls == []
+    assert capture.get_entry("xanthocroid") is None
+    # A fresh prompt was prepared for the reshuffled queue in the same turn.
+    snapshot = review.snapshot()
+    assert snapshot is not None
+    assert snapshot.current_prompt is not None
+    assert snapshot.current_prompt.id != prepared.id

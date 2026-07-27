@@ -15,7 +15,7 @@ import {
   StudyStartStatus,
 } from "../src/domain/models";
 import type { Evaluation, FinalizeResult, SenseCard, StudyPromptSnapshot } from "../src/domain/models";
-import { VocabularyStore } from "../src/storage/vocabulary-store";
+import { VocabularyStore, localMidnightUtc } from "../src/storage/vocabulary-store";
 
 const CARD: SenseCard = {
   partOfSpeech: "noun",
@@ -570,5 +570,29 @@ describe("VocabularyStore session boundaries", () => {
       store.recordDelivery(prompt.id, { deliveryId: "13", contentFingerprint: "0".repeat(64) });
       expect(store.dueButNotAnswerable(now)).toBe(false);
     });
+  });
+});
+
+describe("localMidnightUtc", () => {
+  it("resolves fractional-offset zones exactly, matching Python's ZoneInfo", () => {
+    expect(localMidnightUtc("2026-07-24", "Asia/Kolkata").toISOString()).toBe(
+      "2026-07-23T18:30:00.000Z",
+    );
+    expect(localMidnightUtc("2026-07-24", "Asia/Kathmandu").toISOString()).toBe(
+      "2026-07-23T18:15:00.000Z",
+    );
+    expect(localMidnightUtc("2026-07-24", "America/St_Johns").toISOString()).toBe(
+      "2026-07-24T02:30:00.000Z",
+    );
+  });
+
+  it("keeps whole-hour zones correct across DST", () => {
+    expect(localMidnightUtc("2026-07-24", "UTC").toISOString()).toBe("2026-07-24T00:00:00.000Z");
+    expect(localMidnightUtc("2026-07-24", "America/New_York").toISOString()).toBe(
+      "2026-07-24T04:00:00.000Z",
+    );
+    expect(localMidnightUtc("2026-01-24", "America/New_York").toISOString()).toBe(
+      "2026-01-24T05:00:00.000Z",
+    );
   });
 });

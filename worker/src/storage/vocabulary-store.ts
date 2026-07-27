@@ -88,6 +88,8 @@ interface ZonedFields {
   readonly month: number;
   readonly day: number;
   readonly hour: number;
+  readonly minute: number;
+  readonly second: number;
 }
 
 const ZONED_FORMATTERS = new Map<string, Intl.DateTimeFormat>();
@@ -114,6 +116,8 @@ function zonedFields(at: Date, timeZone: string): ZonedFields {
     month: Number(parts.month),
     day: Number(parts.day),
     hour: Number(parts.hour),
+    minute: Number(parts.minute),
+    second: Number(parts.second),
   };
 }
 
@@ -133,11 +137,13 @@ function addLocalDays(date: string, days: number): string {
  * the naive instant and then re-sampled at the candidate so a DST shift that
  * straddles midnight resolves to the offset actually in force.
  */
-function localMidnightUtc(date: string, timeZone: string): Date {
+export function localMidnightUtc(date: string, timeZone: string): Date {
   const naive = Date.parse(`${date}T00:00:00Z`);
   const offsetAt = (instant: number): number => {
-    const { year, month, day, hour } = zonedFields(new Date(instant), timeZone);
-    return Date.UTC(year, month - 1, day, hour) - Math.floor(instant / 3_600_000) * 3_600_000;
+    const { year, month, day, hour, minute, second } = zonedFields(new Date(instant), timeZone);
+    // Whole-second wall-clock reconstruction keeps fractional-offset zones
+    // (UTC+05:30, UTC+05:45, UTC-03:30) exact, matching Python's ZoneInfo.
+    return Date.UTC(year, month - 1, day, hour, minute, second) - Math.floor(instant / 1000) * 1000;
   };
   const first = offsetAt(naive);
   const candidate = naive - first;

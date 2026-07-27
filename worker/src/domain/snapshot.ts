@@ -304,6 +304,7 @@ export function encodeReal(value: number): string {
   if (
     !Number.isFinite(value) ||
     value < 0 ||
+    Object.is(value, -0) ||
     (value !== 0 && (value < REAL_MIN || value >= REAL_MAX))
   ) {
     throw new TypeError("Real outside the snapshot domain");

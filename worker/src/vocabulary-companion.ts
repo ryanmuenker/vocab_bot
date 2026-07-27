@@ -424,10 +424,21 @@ export class VocabularyCompanion extends DurableObject<Env> {
         prompt.id,
       );
     }
-    if (snapshot === null && this.store.dueButNotAnswerable(now)) {
-      // Due work exists but no tick ever prepared a prompt. Ordinary text must
-      // surface that work instead of being graded or captured.
-      const started = this.store.startReview(now);
+    // A review session whose prepared prompt was cancelled by a day rollover
+    // is active but has no live prompt; it needs surfacing just like the
+    // no-session case.
+    const rolloverGap =
+      snapshot !== null &&
+      prompt === null &&
+      snapshot.mode === StudyMode.REVIEW &&
+      snapshot.status === StudySessionStatus.ACTIVE;
+    if (rolloverGap || (snapshot === null && this.store.dueButNotAnswerable(now))) {
+      // Due work exists but no prompt is outstanding (for example the machine
+      // was off, or the day rolled over). Ordinary text must surface that work
+      // instead of being graded or captured.
+      const started = rolloverGap
+        ? { status: StudyStartStatus.RESUMED }
+        : this.store.startReview(now);
       if (
         started.status === StudyStartStatus.STARTED ||
         started.status === StudyStartStatus.RESUMED

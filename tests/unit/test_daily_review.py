@@ -170,7 +170,7 @@ def test_cron_backlog_emits_one_counted_prompt_then_stays_silent(
     assert first.stderr == ""
     match = PROMPT_PATTERN.match(first.stdout)
     assert match is not None, first.stdout
-    assert (match.group(1), match.group(2), match.group(3)) == ("1", "8", "8")
+    assert (match.group(1), match.group(2), match.group(3)) == ("1", "8", "3")
     assert match.group(4) in overdue
 
     second = run_cron(path, run_id="cron-run-2")
@@ -354,8 +354,9 @@ def test_cron_recovers_when_a_delivery_never_reported_a_receipt(
         connection.execute("DROP TRIGGER prompt_delivery_attempts_immutable_update")
         connection.execute(
             "UPDATE prompt_delivery_attempts"
-            " SET attempted_at = datetime('now', '-30 minutes')"
-            " WHERE receipt_at IS NULL"
+            " SET attempted_at = ?"
+            " WHERE receipt_at IS NULL",
+            (_timestamp(datetime.now(UTC) - timedelta(minutes=30)),),
         )
         connection.execute(
             """

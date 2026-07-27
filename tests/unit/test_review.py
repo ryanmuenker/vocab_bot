@@ -493,11 +493,11 @@ def test_selector_supports_direction_distinct_entries_and_shared_daily_quota(
     assert third in [card.id for card in service.select_cards(maximum_count=5)]
 
 
-def test_finalization_buries_siblings_without_changing_due_and_next_day_reappears(
+def test_finalization_does_not_bury_siblings_and_completes_only_current_card(
     tmp_path: Path,
 ) -> None:
     service, clock, database = setup_service(tmp_path)
-    forward = add_seen(database, 1, due=NOW - timedelta(days=1))
+    add_seen(database, 1, due=NOW - timedelta(days=1))
     sibling = add_card(
         database,
         entry_id=201,
@@ -523,24 +523,30 @@ def test_finalization_buries_siblings_without_changing_due_and_next_day_reappear
 
     assert finalized.status is FinalizeStatus.COMPLETED
     assert finalized.snapshot is not None
-    assert finalized.snapshot.status is StudySessionStatus.COMPLETED
+    # Without burial, the sibling remains queued and becomes the current card.
+    assert finalized.snapshot.status is StudySessionStatus.ACTIVE
     assert finalized.snapshot.progress.completed == 1
-    assert finalized.snapshot.progress.total == 1
-    assert sum(
-        item.status is StudyQueueStatus.SKIPPED
-        for item in finalized.snapshot.queue
-    ) == 1
+    assert finalized.snapshot.progress.total == 2
+    # Siblings are not buried — they remain immediately eligible.
     with database.connect() as connection:
-        sibling_row = connection.execute(
-            "SELECT effective_due_at, buried_until_local_date FROM vocabulary_cards WHERE id = ?",
+        assert connection.execute(
+            "SELECT buried_until_local_date FROM vocabulary_cards WHERE id = ?",
             (sibling,),
-        ).fetchone()
-    assert tuple(sibling_row) == (sibling_due, "2026-07-20")
-    assert sibling not in [card.id for card in service.select_cards()]
-    clock.value = NOW + timedelta(days=1)
+        ).fetchone()[0] is None
+        # ...and finalize left the sibling's schedule untouched.
+        assert connection.execute(
+            "SELECT effective_due_at FROM vocabulary_cards WHERE id = ?",
+            (sibling,),
+        ).fetchone()[0] == sibling_due
     assert sibling in [card.id for card in service.select_cards()]
-    assert forward != sibling
-
+    # The queue advances to the sibling card (no prompt prepared yet).
+    assert finalized.snapshot.current_prompt is None
+    with database.connect() as connection:
+        next_queue = connection.execute(
+            "SELECT status, card_id FROM study_queue WHERE id != ? AND session_id = ?",
+            (prompt.queue_item_id, finalized.snapshot.session_id),
+        ).fetchone()
+        assert next_queue is not None and next_queue["status"] == "current"
 
 @pytest.mark.parametrize("prepare_prompt", [False, True])
 def test_rollover_without_answerable_prompt_reorders_newly_due_before_unseen_current(

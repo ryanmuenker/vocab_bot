@@ -9,7 +9,7 @@ from hermes_vocab.capture import (
     CaptureService,
     parse_capture_message,
 )
-from hermes_vocab.review import ReviewService
+from hermes_vocab.review import ReviewService, _timestamp
 
 
 class VocabularyHook:
@@ -59,9 +59,15 @@ class VocabularyHook:
                     INSERT INTO prompt_delivery_attempts (
                         prompt_id, attempt_number, status, attempted_at,
                         outbound_delivery_id, content_fingerprint
-                    ) VALUES (?, ?, 'unknown', datetime('now'), ?, ?)
+                    ) VALUES (?, ?, 'unknown', ?, ?, ?)
                     """,
-                    (prompt_id, attempt, identity, fingerprint),
+                    (
+                        prompt_id,
+                        attempt,
+                        _timestamp(self.review_service.clock()),
+                        identity,
+                        fingerprint,
+                    ),
                 )
                 connection.commit()
                 return True
@@ -155,18 +161,21 @@ class VocabularyHook:
                     """,
                     (prompt["id"],),
                 ).fetchone()[0]
+                stamp = _timestamp(self.review_service.clock())
                 connection.execute(
                     """
                     INSERT INTO prompt_delivery_attempts (
                         prompt_id, attempt_number, status, attempted_at,
                         receipt_at, outbound_delivery_id, content_fingerprint,
                         error_text
-                    ) VALUES (?, ?, ?, datetime('now'), datetime('now'), ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         prompt["id"],
                         attempt,
                         "failed" if receipt.state == "failure" else "unknown",
+                        stamp,
+                        stamp,
                         identity,
                         fingerprint,
                         receipt.error,
