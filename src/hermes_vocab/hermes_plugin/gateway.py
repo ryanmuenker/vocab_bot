@@ -159,7 +159,9 @@ class VocabularyGatewayRouter:
             and snapshot.status is StudySessionStatus.ACTIVE
         )
         if rollover_gap or (
-            snapshot is None and self._review_service.due_but_not_answerable()
+            snapshot is None
+            and self._review_service.due_but_not_answerable()
+            and not self._review_service.study_was_exited()
         ):
             # Due work exists but no prompt is outstanding (for example the
             # computer was off, or the day rolled over). Ordinary text must

@@ -660,6 +660,28 @@ class ReviewService:
         except sqlite3.Error:
             return False
 
+    def study_was_exited(self) -> bool:
+        """True when the learner exited and nothing has restarted study since.
+
+        An explicit exit is a decision. R4 promises a message resubmitted
+        after an exit is captured, so the branch that surfaces due work from
+        ordinary text must respect it; otherwise the instruction to 'exit,
+        then resubmit' cannot be followed and no word can ever be saved while
+        anything is due. Any later session — from the ticker or /review —
+        replaces this row and re-arms the branch on its own.
+        """
+        try:
+            with self.database.connect() as connection:
+                row = connection.execute(
+                    "SELECT status FROM study_sessions ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                return (
+                    row is not None
+                    and row["status"] == StudySessionStatus.EXITED.value
+                )
+        except sqlite3.Error:
+            return False
+
     def due_count(self) -> int:
         """Number of genuinely overdue cards — seen cards past their due instant."""
         moment = self.clock()
