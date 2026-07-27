@@ -58,7 +58,12 @@ const NO_ACTIVE_REPLY = "There isn't a delivered study prompt waiting.";
 const STALE_PROMPT_REPLY = "That study prompt is no longer current.";
 const INVALID_ANSWER_REPLY = "Send a non-empty answer.";
 const INVALID_RATING_REPLY = "Send one of the listed effort ratings.";
-const EVALUATION_ERROR_REPLY = "I couldn't evaluate that answer. Please try again.";
+// The prompt stays answerable after a failed evaluation, so the next message
+// is graded as the answer. Say so: a learner who replies with a question
+// instead of re-sending their answer gets that question graded.
+const EVALUATION_ERROR_REPLY =
+  "I couldn't evaluate that answer, and nothing was recorded. " +
+  "Send your answer again — the next message you send is graded as your answer.";
 const REVIEW_USAGE = "Usage: /review";
 const ENDSTUDY_USAGE = "Usage: /endstudy";
 const TEST_USAGE =
@@ -151,10 +156,14 @@ export class VocabularyCompanion extends DurableObject<Env> {
   private readonly provider: OpenCodeAdapter;
   private readonly telegram: TelegramAdapter;
   private readonly reviewHour: number;
+  private readonly timeZone: string;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.store = new VocabularyStore(ctx.storage, env.HERMES_TIMEZONE);
+    // Keep the default in step with VocabularyStore's, so a missing
+    // HERMES_TIMEZONE renders due times in the same zone the scheduler uses.
+    this.timeZone = env.HERMES_TIMEZONE || "Asia/Kuala_Lumpur";
+    this.store = new VocabularyStore(ctx.storage, this.timeZone);
     this.provider = new OpenCodeAdapter({
       apiKey: env.OPENCODE_API_KEY,
       baseUrl: env.OPENCODE_BASE_URL,
@@ -697,6 +706,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
     }
     const schedule = formatStudySchedule(rating, transition.effectiveDue, snapshot.progress, {
       retryQueued: transition.retrySameSession,
+      timeZone: this.timeZone,
       nextPrompt: next?.promptText ?? null,
     });
     return { text: this.withEvaluation(context, schedule), promptId: next?.id ?? null };

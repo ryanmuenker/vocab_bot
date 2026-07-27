@@ -1135,7 +1135,11 @@ def test_registered_test_cross_path_survives_restart_and_evaluator_failure(
     assert failed == {
         "status": "evaluation_error",
         "allowed_ratings": [],
-        "text": "I couldn't evaluate that answer. Please try again.",
+        "text": (
+            "I couldn't evaluate that answer, and nothing was recorded. "
+            "Send your answer again — the next message you send is graded "
+            "as your answer."
+        ),
     }
     with database.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM answer_drafts").fetchone()[0] == 1
