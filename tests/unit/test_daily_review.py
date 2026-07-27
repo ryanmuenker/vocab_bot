@@ -5,13 +5,13 @@ import re
 import subprocess
 import sys
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-from hermes_vocab.capture import CaptureService
+from hermes_vocab.capture import CaptureService, _timestamp
 from hermes_vocab.database import Database
 from hermes_vocab.hermes_plugin.hooks import VocabularyHook
 from hermes_vocab.models import (
@@ -325,3 +325,61 @@ def test_cron_retries_the_same_prompt_after_a_failed_delivery_receipt(
         ("failed", "cron-run-1"),
         ("unknown", "cron-run-2"),
     ]
+
+
+def test_cron_recovers_when_a_delivery_never_reported_a_receipt(
+    tmp_path: Path,
+) -> None:
+    """A gateway killed mid-send must not silence the ticker forever."""
+    path = tmp_path / "data" / "vocabulary.sqlite3"
+    database = seed_cards(path, ["laconic"])
+
+    first = run_cron(path, run_id="cron-run-1")
+    assert PROMPT_PATTERN.match(first.stdout) is not None, first.stdout
+
+    # No receipt ever arrives: the process died between prepare and callback.
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM prompt_delivery_attempts WHERE receipt_at IS NULL"
+        ).fetchone()[0] == 1
+
+    # A tick while the send is genuinely in flight stays silent.
+    assert run_cron(path, run_id="cron-run-2").stdout == ""
+
+    # Once the attempt is older than the staleness bound it is abandoned, and the
+    # same prompt identity is retried rather than the queue going quiet forever.
+    # Attempts are append-only by trigger, so age the row with the guard lifted:
+    # this stands in for 30 minutes passing, not for a write the product makes.
+    with database.connect() as connection:
+        connection.execute("DROP TRIGGER prompt_delivery_attempts_immutable_update")
+        connection.execute(
+            "UPDATE prompt_delivery_attempts"
+            " SET attempted_at = datetime('now', '-30 minutes')"
+            " WHERE receipt_at IS NULL"
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER prompt_delivery_attempts_immutable_update
+            BEFORE UPDATE ON prompt_delivery_attempts
+            BEGIN
+                SELECT RAISE(ABORT, 'delivery attempts are immutable');
+            END
+            """
+        )
+        connection.commit()
+
+    recovered = run_cron(path, run_id="cron-run-3")
+
+    assert recovered.returncode == 0
+    assert recovered.stdout == first.stdout
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM study_prompts"
+        ).fetchone()[0] == 1
+        assert [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT status, outbound_delivery_id"
+                " FROM prompt_delivery_attempts ORDER BY id"
+            )
+        ] == [("unknown", "cron-run-1"), ("unknown", "cron-run-3")]

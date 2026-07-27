@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
-from hermes_vocab.capture import CaptureService
+from hermes_vocab.capture import CaptureService, _timestamp
 from hermes_vocab.config import ConfigurationError, Settings
 from hermes_vocab.database import Database
 from hermes_vocab.hermes_plugin.gateway import VocabularyGatewayRouter
@@ -13,6 +13,11 @@ from hermes_vocab.hermes_plugin.hooks import VocabularyHook
 from hermes_vocab.models import StudyMode, StudyStartStatus
 from hermes_vocab.review import ReviewService
 from hermes_vocab.test_session import TestSessionService
+
+
+# A prepared send with no receipt is treated as abandoned after this long, so a
+# crash between preparing a prompt and recording its receipt cannot wedge cron.
+ABANDONED_DELIVERY_AFTER = timedelta(minutes=5)
 
 
 def main() -> int:
@@ -55,6 +60,11 @@ def main() -> int:
 
     now = datetime.now(settings.timezone)
     with database.connect() as connection:
+        # A send is only "in flight" while its attempt is recent. Without this
+        # bound a gateway killed between prepare and receipt would leave the
+        # prompt pending forever and silence the ticker for good. attempted_at is
+        # written by SQLite's datetime('now'), so the bound is computed the same
+        # way; an ISO-8601 string would not compare against it.
         in_flight = connection.execute(
             """
             SELECT 1 FROM study_prompts p
@@ -66,8 +76,10 @@ def main() -> int:
             )
             WHERE s.status = 'active' AND q.status = 'current'
               AND p.status = 'prepared' AND a.receipt_at IS NULL
+              AND a.attempted_at > datetime('now', ?)
             LIMIT 1
-            """
+            """,
+            (f"-{int(ABANDONED_DELIVERY_AFTER.total_seconds())} seconds",),
         ).fetchone()
         older_backlog = connection.execute(
             """
