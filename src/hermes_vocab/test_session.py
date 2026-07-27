@@ -3,335 +3,230 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 from .capture import _timestamp
 from .database import Database
 from .models import (
-    Evaluation,
+    CardDirection,
     EvaluationGrade,
-    TestCompletionResult,
-    TestCompletionStatus,
-    TestQuestion,
-    TestSession,
-    TestSessionSnapshot,
-    TestSessionStatus,
-    TestSnapshotResult,
-    TestSnapshotStatus,
-    TestStartResult,
-    TestStartStatus,
+    StudyMode,
+    StudyPromptStatus,
+    StudySnapshot,
+    StudyStartResult,
+    StudyStartStatus,
     TestSummary,
 )
-from .review import _entry_by_id, _parse_timestamp
+from .review import ReviewService
+
+_REQUIRED_CARDS = 5
 
 
-_REQUIRED_QUESTIONS = 5
-
-
-def _session_from_row(row: sqlite3.Row) -> TestSession:
-    started_at = _parse_timestamp(row["started_at"])
-    assert started_at is not None
-    return TestSession(
-        id=row["id"],
-        status=TestSessionStatus(row["status"]),
-        started_at=started_at,
-        completed_at=_parse_timestamp(row["completed_at"]),
-    )
-
-
-def _question_from_row(
-    connection: sqlite3.Connection,
-    row: sqlite3.Row,
-) -> TestQuestion:
-    return TestQuestion(
-        id=row["id"],
-        session_id=row["session_id"],
-        position=row["position"],
-        entry=_entry_by_id(connection, row["entry_id"]),
-        answer_text=row["answer_text"],
-        grade=(
-            EvaluationGrade(row["grade"])
-            if row["grade"] is not None
-            else None
-        ),
-        feedback=row["evaluation_feedback"],
-        answered_at=_parse_timestamp(row["answered_at"]),
-    )
-
-
-def _snapshot(
-    connection: sqlite3.Connection,
-    session_row: sqlite3.Row,
-) -> TestSessionSnapshot:
-    question_rows = connection.execute(
-        """
-        SELECT * FROM test_questions
-        WHERE session_id = ?
-        ORDER BY position
-        """,
-        (session_row["id"],),
-    ).fetchall()
-    questions = tuple(
-        _question_from_row(connection, row) for row in question_rows
-    )
-    current = next(
-        (question for question in questions if question.answer_text is None),
-        None,
-    )
-    counts = {grade: 0 for grade in EvaluationGrade}
-    for question in questions:
-        if question.grade is not None:
-            counts[question.grade] += 1
-    return TestSessionSnapshot(
-        session=_session_from_row(session_row),
-        questions=questions,
-        current_question=current,
-        summary=TestSummary(
-            correct=counts[EvaluationGrade.CORRECT],
-            partial=counts[EvaluationGrade.PARTIAL],
-            incorrect=counts[EvaluationGrade.INCORRECT],
-        ),
-    )
+def _mode(direction: CardDirection) -> StudyMode:
+    if direction is CardDirection.FORWARD:
+        return StudyMode.TEST_FORWARD
+    if direction is CardDirection.REVERSE:
+        return StudyMode.TEST_REVERSE
+    raise ValueError(f"unsupported card direction: {direction!r}")
 
 
 class TestSessionService:
+    """Create deterministic directional tests on the shared study queue."""
+
     def __init__(
         self,
         database: Database,
+        timezone: ZoneInfo,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self.database = database
+        self.timezone = timezone
         self.clock = clock
+        self.study = ReviewService(database, timezone, clock=clock)
 
-    def start(self) -> TestStartResult:
+    def start(self, direction: CardDirection) -> StudyStartResult:
+        if not isinstance(direction, CardDirection):
+            raise ValueError("direction must be forward or reverse")
+        now = self.clock()
+        local_date = now.astimezone(self.timezone).date()
+        mode = _mode(direction)
         try:
             with self.database.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                active = connection.execute(
-                    """
-                    SELECT * FROM test_sessions
-                    WHERE status = 'active'
-                    LIMIT 1
-                    """
-                ).fetchone()
-                if active is not None:
-                    snapshot = _snapshot(connection, active)
+                open_session = self.study._open_session(connection)
+                if open_session is not None:
+                    if open_session["mode"] != mode.value:
+                        connection.commit()
+                        return StudyStartResult(StudyStartStatus.CONFLICT)
+                    self._prepare_prompt(
+                        connection,
+                        open_session["id"],
+                        now,
+                    )
+                    snapshot = self.study._snapshot(connection, open_session["id"])
                     connection.commit()
-                    return TestStartResult(
-                        TestStartStatus.RESUMED,
-                        snapshot=snapshot,
+                    return StudyStartResult(StudyStartStatus.RESUMED, snapshot)
+
+                cards = self.study._select_cards(
+                    connection,
+                    now=now,
+                    maximum_count=_REQUIRED_CARDS,
+                    include_seen_non_due=True,
+                    direction=direction,
+                    distinct_entries=True,
+                )
+                if len(cards) != _REQUIRED_CARDS:
+                    connection.commit()
+                    return StudyStartResult(
+                        StudyStartStatus.EMPTY,
+                        available_count=len(cards),
                     )
 
-                pending_review = connection.execute(
-                    """
-                    SELECT 1 FROM review_events
-                    WHERE status = 'pending'
-                    LIMIT 1
-                    """
-                ).fetchone()
-                if pending_review is not None:
-                    connection.commit()
-                    return TestStartResult(
-                        TestStartStatus.DAILY_REVIEW_PENDING
-                    )
-
-                entry_rows = connection.execute(
-                    """
-                    SELECT entry.id
-                    FROM vocabulary_entries AS entry
-                    LEFT JOIN (
-                        SELECT
-                            question.entry_id,
-                            MAX(session.started_at) AS last_tested_at
-                        FROM test_questions AS question
-                        JOIN test_sessions AS session
-                            ON session.id = question.session_id
-                        GROUP BY question.entry_id
-                    ) AS test_history
-                        ON test_history.entry_id = entry.id
-                    WHERE EXISTS (
-                        SELECT 1
-                        FROM vocabulary_senses AS sense
-                        WHERE sense.entry_id = entry.id
-                    )
-                    ORDER BY
-                        CASE WHEN test_history.last_tested_at IS NULL THEN 0 ELSE 1 END,
-                        test_history.last_tested_at,
-                        CASE WHEN entry.last_reviewed IS NULL THEN 0 ELSE 1 END,
-                        COALESCE(entry.last_reviewed, entry.date_added),
-                        entry.date_added,
-                        entry.id
-                    LIMIT ?
-                    """,
-                    (_REQUIRED_QUESTIONS,),
-                ).fetchall()
-                if len(entry_rows) < _REQUIRED_QUESTIONS:
-                    connection.commit()
-                    return TestStartResult(
-                        TestStartStatus.INSUFFICIENT_LIBRARY,
-                        available_count=len(entry_rows),
-                    )
-
-                started_at = _timestamp(self.clock())
                 session_id = connection.execute(
                     """
-                    INSERT INTO test_sessions (status, started_at)
-                    VALUES ('active', ?)
+                    INSERT INTO study_sessions (mode, status, started_at, local_date)
+                    VALUES (?, 'active', ?, ?)
                     """,
-                    (started_at,),
+                    (mode.value, _timestamp(now), local_date.isoformat()),
                 ).lastrowid
                 assert session_id is not None
-                connection.executemany(
+                self.study._enqueue_cards(
+                    connection,
+                    session_id,
+                    cards,
+                    local_date,
+                )
+                connection.execute(
                     """
-                    INSERT INTO test_questions (
-                        session_id, entry_id, position
-                    ) VALUES (?, ?, ?)
+                    UPDATE study_queue SET status = 'current'
+                    WHERE id = (
+                        SELECT id FROM study_queue
+                        WHERE session_id = ? ORDER BY position LIMIT 1
+                    )
                     """,
-                    (
-                        (session_id, row["id"], position)
-                        for position, row in enumerate(entry_rows, start=1)
-                    ),
-                )
-                session_row = connection.execute(
-                    "SELECT * FROM test_sessions WHERE id = ?",
                     (session_id,),
-                ).fetchone()
-                assert session_row is not None
-                snapshot = _snapshot(connection, session_row)
+                )
+                self._prepare_prompt(connection, session_id, now)
+                snapshot = self.study._snapshot(connection, session_id)
                 connection.commit()
-                return TestStartResult(
-                    TestStartStatus.STARTED,
-                    snapshot=snapshot,
-                )
+                return StudyStartResult(StudyStartStatus.STARTED, snapshot)
         except sqlite3.Error:
-            return TestStartResult(TestStartStatus.STORAGE_ERROR)
+            return StudyStartResult(StudyStartStatus.STORAGE_ERROR)
 
-    def current(self) -> TestSnapshotResult:
-        try:
-            with self.database.connect() as connection:
-                active = connection.execute(
-                    """
-                    SELECT * FROM test_sessions
-                    WHERE status = 'active'
-                    LIMIT 1
-                    """
-                ).fetchone()
-                if active is None:
-                    return TestSnapshotResult(TestSnapshotStatus.NONE)
-                return TestSnapshotResult(
-                    TestSnapshotStatus.ACTIVE,
-                    snapshot=_snapshot(connection, active),
-                )
-        except sqlite3.Error:
-            return TestSnapshotResult(TestSnapshotStatus.STORAGE_ERROR)
-
-    def complete(
-        self,
-        expected_question_id: int,
-        answer_text: str,
-        evaluation: Evaluation | None,
-    ) -> TestCompletionResult:
-        if (
-            not answer_text.strip()
-            or evaluation is None
-            or not isinstance(evaluation.grade, EvaluationGrade)
-            or not evaluation.feedback.strip()
-        ):
-            return TestCompletionResult(TestCompletionStatus.INVALID)
-
-        answered_at = _timestamp(self.clock())
+    def prepare_current_prompt(self) -> StudySnapshot | None:
+        """Prepare, but never mark delivered, the current test prompt."""
+        now = self.clock()
         try:
             with self.database.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                session_row = connection.execute(
-                    """
-                    SELECT * FROM test_sessions
-                    WHERE status = 'active'
-                    LIMIT 1
-                    """
-                ).fetchone()
-                if session_row is None:
+                session = self.study._open_session(connection)
+                if session is None or session["mode"] == StudyMode.REVIEW.value:
                     connection.commit()
-                    return TestCompletionResult(
-                        TestCompletionStatus.NO_ACTIVE
-                    )
+                    return None
+                self._prepare_prompt(connection, session["id"], now)
+                snapshot = self.study._snapshot(connection, session["id"])
+                connection.commit()
+                return snapshot
+        except sqlite3.Error:
+            return None
 
-                current_row = connection.execute(
-                    """
-                    SELECT * FROM test_questions
-                    WHERE session_id = ? AND answer_text IS NULL
-                    ORDER BY position
-                    LIMIT 1
-                    """,
-                    (session_row["id"],),
+    def summary(self, session_id: int) -> TestSummary | None:
+        """Return correctness for the five original questions, never retries."""
+        try:
+            with self.database.connect() as connection:
+                session = connection.execute(
+                    "SELECT mode FROM study_sessions WHERE id = ?",
+                    (session_id,),
                 ).fetchone()
                 if (
-                    current_row is None
-                    or current_row["id"] != expected_question_id
+                    session is None
+                    or session["mode"] == StudyMode.REVIEW.value
                 ):
-                    snapshot = _snapshot(connection, session_row)
-                    connection.commit()
-                    return TestCompletionResult(
-                        TestCompletionStatus.STALE,
-                        snapshot=snapshot,
-                    )
-
-                updated = connection.execute(
+                    return None
+                rows = connection.execute(
                     """
-                    UPDATE test_questions
-                    SET answer_text = ?,
-                        grade = ?,
-                        evaluation_feedback = ?,
-                        answered_at = ?
-                    WHERE id = ?
-                      AND session_id = ?
-                      AND answer_text IS NULL
+                    SELECT attempt.evaluator_grade
+                    FROM study_queue queue
+                    JOIN review_attempts attempt
+                      ON attempt.id = queue.completed_attempt_id
+                    WHERE queue.session_id = ?
+                      AND queue.retry_of_queue_item_id IS NULL
                     """,
-                    (
-                        answer_text,
-                        evaluation.grade.value,
-                        evaluation.feedback,
-                        answered_at,
-                        expected_question_id,
-                        session_row["id"],
-                    ),
-                )
-                if updated.rowcount != 1:
-                    connection.rollback()
-                    return TestCompletionResult(TestCompletionStatus.STALE)
-
-                status = TestCompletionStatus.ADVANCED
-                if current_row["position"] == _REQUIRED_QUESTIONS:
-                    completed = connection.execute(
-                        """
-                        UPDATE test_sessions
-                        SET status = 'completed', completed_at = ?
-                        WHERE id = ? AND status = 'active'
-                        """,
-                        (answered_at, session_row["id"]),
-                    )
-                    if completed.rowcount != 1:
-                        connection.rollback()
-                        return TestCompletionResult(
-                            TestCompletionStatus.STALE
-                        )
-                    status = TestCompletionStatus.COMPLETED
-
-                latest_session = connection.execute(
-                    "SELECT * FROM test_sessions WHERE id = ?",
-                    (session_row["id"],),
-                ).fetchone()
-                assert latest_session is not None
-                snapshot = _snapshot(connection, latest_session)
-                answered_question = next(
-                    question
-                    for question in snapshot.questions
-                    if question.id == expected_question_id
-                )
-                connection.commit()
-                return TestCompletionResult(
-                    status=status,
-                    snapshot=snapshot,
-                    answered_question=answered_question,
-                )
+                    (session_id,),
+                ).fetchall()
         except sqlite3.Error:
-            return TestCompletionResult(TestCompletionStatus.STORAGE_ERROR)
+            return None
+        counts = {grade: 0 for grade in EvaluationGrade}
+        for row in rows:
+            if row["evaluator_grade"] is not None:
+                counts[EvaluationGrade(row["evaluator_grade"])] += 1
+        return TestSummary(
+            correct=counts[EvaluationGrade.CORRECT],
+            partial=counts[EvaluationGrade.PARTIAL],
+            incorrect=counts[EvaluationGrade.INCORRECT],
+        )
+
+    def _prepare_prompt(
+        self,
+        connection: sqlite3.Connection,
+        session_id: int,
+        now: datetime,
+    ) -> None:
+        active = connection.execute(
+            """
+            SELECT 1 FROM study_prompts
+            WHERE session_id = ? AND status IN ('prepared', 'delivered', 'answered')
+            LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        if active is not None:
+            return
+        row = connection.execute(
+            """
+            SELECT q.id AS queue_id, q.position, q.retry_of_queue_item_id,
+                   s.mode, e.display_text, sense.definition
+            FROM study_queue q
+            JOIN study_sessions s ON s.id = q.session_id
+            JOIN vocabulary_cards c ON c.id = q.card_id
+            JOIN vocabulary_entries e ON e.id = c.entry_id
+            LEFT JOIN vocabulary_senses sense ON sense.id = c.sense_id
+            WHERE q.session_id = ? AND q.status = 'current'
+            """,
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return
+        if row["mode"] == StudyMode.TEST_FORWARD.value:
+            question = f"What does '{row['display_text']}' mean?"
+        else:
+            if row["definition"] is None:
+                raise sqlite3.IntegrityError("reverse test card has no sense definition")
+            question = (
+                "Which saved word matches this definition?\n"
+                f"{row['definition']}"
+            )
+        position = _REQUIRED_CARDS if row["retry_of_queue_item_id"] else row["position"]
+        retry = " · retry" if row["retry_of_queue_item_id"] else ""
+        prompt_text = (
+            f"Question {position} of {_REQUIRED_CARDS}{retry}\n{question}"
+        )
+        connection.execute(
+            """
+            INSERT INTO study_prompts (
+                session_id, queue_item_id, prompt_key, prompt_text,
+                status, prepared_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                row["queue_id"],
+                f"test:{row['mode']}:{session_id}:{row['queue_id']}",
+                prompt_text,
+                StudyPromptStatus.PREPARED.value,
+                _timestamp(now),
+            ),
+        )
+
+
+__all__ = ["TestSessionService"]

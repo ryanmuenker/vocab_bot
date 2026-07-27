@@ -2,28 +2,37 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
-from hermes_vocab.capture import CaptureService
 from hermes_vocab.database import Database
 
 from hermes_vocab.hermes_plugin.evaluation import (
     MAX_EVALUATION_FEEDBACK_LENGTH,
-    SHOW_ANSWER_FEEDBACK,
     EvaluationProvider,
     EvaluationResult,
     EvaluationStatus,
-    complete_pending_review,
+    allowed_ratings,
+    continue_study_answer,
+    normalize_reverse_answer,
     parse_evaluation_response,
+    parse_rating,
 )
 from hermes_vocab.models import (
+    CardDirection,
     Evaluation,
     EvaluationGrade,
-    ReviewCompletionStatus,
-    SenseCard,
+    FinalizeStatus,
+    PARAMETER_FINGERPRINT,
+    PARAMETERS_VERSION,
+    ReviewRating,
+    SCHEDULER_KIND,
+    SCHEDULER_VERSION,
+    StudyAnswerStatus,
+    StudyPromptStatus,
     VocabularyEntry,
     VocabularySense,
 )
@@ -213,150 +222,404 @@ class StubEvaluationProvider:
         self, entry: VocabularyEntry, answer_text: str
     ) -> EvaluationResult:
         self.calls.append((entry, answer_text))
+        await asyncio.sleep(0)
         return self.result
 
 
-def pending_review(tmp_path: Path) -> tuple[ReviewService, Database, int]:
+def timestamp(value: datetime) -> str:
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def answerable_study(
+    tmp_path: Path,
+    *,
+    direction: CardDirection = CardDirection.FORWARD,
+) -> tuple[ReviewService, Database, int]:
     database = Database(tmp_path / "vocabulary.sqlite3")
     database.initialize()
-    CaptureService(database, clock=lambda: NOW).capture_entry(
-        "laconic",
-        (
-            SenseCard(
-                "adjective",
-                "Using very few words.",
-                "His reply was laconic.",
+    sense_id = 12 if direction is CardDirection.REVERSE else None
+    with database.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO vocabulary_entries (
+                id, display_text, normalized_text, date_added,
+                last_reviewed, review_status
+            ) VALUES (1, 'Pro Forma', 'pro forma', ?, NULL, 'new')
+            """,
+            (timestamp(NOW - timedelta(days=20)),),
+        )
+        connection.executemany(
+            """
+            INSERT INTO vocabulary_senses (
+                id, entry_id, definition, part_of_speech,
+                example_sentence, source_context, date_added
+            ) VALUES (?, 1, ?, 'phrase', ?, NULL, ?)
+            """,
+            (
+                (
+                    11,
+                    "Done as a matter of form or convention.",
+                    "The board made a pro forma approval.",
+                    timestamp(NOW - timedelta(days=20)),
+                ),
+                (
+                    12,
+                    "A projected financial statement.",
+                    "The pro forma showed next year's revenue.",
+                    timestamp(NOW - timedelta(days=19)),
+                ),
             ),
-        ),
-    )
+        )
+        connection.execute(
+            """
+            INSERT INTO vocabulary_cards (
+                id, entry_id, sense_id, direction, state, stability,
+                difficulty, due_at, effective_due_at, last_review_at,
+                repetitions, lapses, scheduler_kind, scheduler_version,
+                parameters_version, parameter_fingerprint,
+                desired_retention, created_at
+            ) VALUES (
+                101, 1, ?, ?, 'new', NULL, NULL, ?, ?, NULL,
+                0, 0, ?, ?, ?, ?, 0.9, ?
+            )
+            """,
+            (
+                sense_id,
+                direction.value,
+                timestamp(NOW - timedelta(days=1)),
+                timestamp(NOW - timedelta(days=1)),
+                SCHEDULER_KIND,
+                SCHEDULER_VERSION,
+                PARAMETERS_VERSION,
+                PARAMETER_FINGERPRINT,
+                timestamp(NOW - timedelta(days=20)),
+            ),
+        )
+        connection.commit()
     service = ReviewService(database, ZoneInfo("UTC"), clock=lambda: NOW)
-    prepared = service.daily_review()
-    assert prepared.event is not None
-    return service, database, prepared.event.id
+    started = service.start()
+    assert started.snapshot is not None
+    prompt = service.prepare_current_prompt(
+        f"{direction.value}-prompt",
+        "Persisted prompt text.",
+    )
+    assert prompt is not None
+    delivered = service.record_delivery(
+        prompt.id,
+        delivery_id=f"{direction.value}-delivery",
+        content_fingerprint=f"{direction.value}-fingerprint",
+    )
+    assert delivered is not None
+    assert delivered.status is StudyPromptStatus.DELIVERED
+    return service, database, prompt.id
 
 
-def test_complete_pending_review_persists_semantic_grade_and_raw_answer(
-    tmp_path: Path,
-) -> None:
-    service, database, event_id = pending_review(tmp_path)
-    provider = StubEvaluationProvider(
+def valid_provider(grade: EvaluationGrade) -> StubEvaluationProvider:
+    return StubEvaluationProvider(
         EvaluationResult(
             EvaluationStatus.VALID,
-            Evaluation(EvaluationGrade.CORRECT, "Accurate paraphrase."),
+            Evaluation(grade, f"{grade.value.title()} feedback."),
         )
     )
-    answer = "It means being brief and direct."
 
-    result = asyncio.run(complete_pending_review(service, provider, answer))
 
-    assert result.status is ReviewCompletionStatus.COMPLETED
-    assert result.event_id == event_id
-    assert result.grade is EvaluationGrade.CORRECT
-    assert result.feedback == "Accurate paraphrase."
+def test_partial_forward_persists_one_draft_and_waits_for_allowed_rating(
+    tmp_path: Path,
+) -> None:
+    service, database, prompt_id = answerable_study(tmp_path)
+    provider = valid_provider(EvaluationGrade.PARTIAL)
+    answer = "It is a projected statement."
+
+    evaluated = asyncio.run(continue_study_answer(service, provider, answer))
+
+    assert evaluated.status is StudyAnswerStatus.AWAITING_RATING
+    assert evaluated.allowed_ratings == (ReviewRating.AGAIN, ReviewRating.HARD)
     assert len(provider.calls) == 1
-    assert provider.calls[0][1] == answer
     with database.connect() as connection:
-        event = connection.execute(
-            "SELECT status, answer_text, grade, evaluation_feedback FROM review_events"
-        ).fetchone()
-    assert tuple(event) == (
-        "answered",
-        answer,
-        "correct",
-        "Accurate paraphrase.",
+        assert tuple(
+            connection.execute(
+                """
+                SELECT submitted_answer, evaluator_grade, evaluation_feedback
+                FROM answer_drafts WHERE prompt_id = ?
+                """,
+                (prompt_id,),
+            ).fetchone()
+        ) == (answer, "partial", "Partial feedback.")
+        assert connection.execute("SELECT COUNT(*) FROM review_attempts").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT repetitions FROM vocabulary_cards WHERE id = 101"
+        ).fetchone()[0] == 0
+
+    invalid = asyncio.run(continue_study_answer(service, provider, "good"))
+    finalized = asyncio.run(continue_study_answer(service, provider, " HARD "))
+
+    assert invalid.status is StudyAnswerStatus.INVALID_RATING
+    assert invalid.allowed_ratings == (ReviewRating.AGAIN, ReviewRating.HARD)
+    assert finalized.status is StudyAnswerStatus.FINALIZED
+    assert finalized.finalization.status is FinalizeStatus.COMPLETED
+    assert len(provider.calls) == 1
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT rating FROM review_attempts"
+        ).fetchone()[0] == "hard"
+
+
+def test_correct_forward_restart_and_invalid_rating_never_re_evaluate(
+    tmp_path: Path,
+) -> None:
+    service, database, _ = answerable_study(tmp_path)
+    provider = valid_provider(EvaluationGrade.CORRECT)
+    first = asyncio.run(
+        continue_study_answer(service, provider, "A conventional projected statement.")
     )
+    restarted = ReviewService(database, ZoneInfo("UTC"), clock=lambda: NOW)
+
+    invalid = asyncio.run(continue_study_answer(restarted, provider, "again"))
+    completed = asyncio.run(continue_study_answer(restarted, provider, "easy"))
+
+    assert first.allowed_ratings == (
+        ReviewRating.HARD,
+        ReviewRating.GOOD,
+        ReviewRating.EASY,
+    )
+    assert invalid.status is StudyAnswerStatus.INVALID_RATING
+    assert completed.status is StudyAnswerStatus.FINALIZED
+    assert len(provider.calls) == 1
 
 
 @pytest.mark.parametrize(
-    "status",
-    [EvaluationStatus.INVALID_RESPONSE, EvaluationStatus.PROVIDER_ERROR],
+    ("answer", "provider_grade", "expected_calls"),
+    [
+        ("wrong meaning", EvaluationGrade.INCORRECT, 1),
+        ("show answer", EvaluationGrade.CORRECT, 0),
+        (" IDK ", EvaluationGrade.CORRECT, 0),
+    ],
 )
-def test_evaluator_failure_leaves_review_pending(
+def test_incorrect_and_surrender_auto_finalize_again_and_append_retry(
     tmp_path: Path,
-    status: EvaluationStatus,
+    answer: str,
+    provider_grade: EvaluationGrade,
+    expected_calls: int,
 ) -> None:
-    service, database, _ = pending_review(tmp_path)
-    provider = StubEvaluationProvider(EvaluationResult(status))
+    service, database, _ = answerable_study(tmp_path)
+    provider = valid_provider(provider_grade)
 
-    result = asyncio.run(complete_pending_review(service, provider, "my attempt"))
+    result = asyncio.run(continue_study_answer(service, provider, answer))
 
-    assert result.status is ReviewCompletionStatus.STORAGE_ERROR
+    assert result.status is StudyAnswerStatus.FINALIZED
+    assert result.finalization.transition.retry_same_session is True
+    assert len(provider.calls) == expected_calls
     with database.connect() as connection:
-        event = connection.execute(
-            "SELECT status, answer_text, grade, evaluation_feedback FROM review_events"
-        ).fetchone()
-        entry = connection.execute(
-            "SELECT review_status, last_reviewed FROM vocabulary_entries"
-        ).fetchone()
-    assert tuple(event) == ("pending", None, None, None)
-    assert tuple(entry) == ("new", None)
+        assert connection.execute(
+            "SELECT rating FROM review_attempts"
+        ).fetchone()[0] == "again"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM study_queue WHERE retry_of_queue_item_id IS NOT NULL"
+        ).fetchone()[0] == 1
 
 
-def test_show_answer_bypasses_provider_and_persists_deterministic_surrender(
-    tmp_path: Path,
-) -> None:
-    service, database, _ = pending_review(tmp_path)
-    provider = StubEvaluationProvider(
-        EvaluationResult(
-            EvaluationStatus.VALID,
-            Evaluation(EvaluationGrade.CORRECT, "Should not be used."),
-        )
-    )
-
-    result = asyncio.run(complete_pending_review(service, provider, "show answer"))
-
-    assert result.status is ReviewCompletionStatus.COMPLETED
-    assert result.grade is EvaluationGrade.INCORRECT
-    assert result.feedback == SHOW_ANSWER_FEEDBACK
-    assert provider.calls == []
-    with database.connect() as connection:
-        stored = connection.execute(
-            "SELECT answer_text, grade, evaluation_feedback FROM review_events"
-        ).fetchone()
-    assert tuple(stored) == (
-        "show answer",
-        "incorrect",
-        SHOW_ANSWER_FEEDBACK,
-    )
-
-
-@pytest.mark.parametrize("answer", ["answer", " show answer", "show answer "])
-def test_only_exact_show_answer_bypasses_provider(
+@pytest.mark.parametrize("answer", [" show answer", "show answer "])
+def test_only_exact_show_answer_bypasses_forward_provider(
     tmp_path: Path,
     answer: str,
 ) -> None:
-    service, _, _ = pending_review(tmp_path)
-    provider = StubEvaluationProvider(
-        EvaluationResult(
-            EvaluationStatus.VALID,
-            Evaluation(EvaluationGrade.INCORRECT, "Evaluated normally."),
-        )
+    service, _, _ = answerable_study(tmp_path)
+    provider = valid_provider(EvaluationGrade.CORRECT)
+
+    result = asyncio.run(continue_study_answer(service, provider, answer))
+
+    assert result.status is StudyAnswerStatus.AWAITING_RATING
+    assert len(provider.calls) == 1
+    assert provider.calls[0][1] == answer
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected_grade"),
+    [
+        (" pro   forma. ", EvaluationGrade.CORRECT),
+        ("PRO FORMA!!!", EvaluationGrade.CORRECT),
+        ("pro form", EvaluationGrade.INCORRECT),
+        ("projected statement", EvaluationGrade.INCORRECT),
+        ("obdurate", EvaluationGrade.INCORRECT),
+    ],
+)
+def test_reverse_answer_is_normalized_exactly_without_model(
+    tmp_path: Path,
+    answer: str,
+    expected_grade: EvaluationGrade,
+) -> None:
+    service, _, _ = answerable_study(tmp_path, direction=CardDirection.REVERSE)
+    provider = valid_provider(EvaluationGrade.CORRECT)
+
+    result = asyncio.run(continue_study_answer(service, provider, answer))
+
+    assert result.context.draft.evaluation.grade is expected_grade
+    assert result.context.sense is not None
+    assert result.context.sense.id == 12
+    assert len(result.context.entry.senses) == 2
+    assert provider.calls == []
+    assert result.status is (
+        StudyAnswerStatus.AWAITING_RATING
+        if expected_grade is EvaluationGrade.CORRECT
+        else StudyAnswerStatus.FINALIZED
     )
 
-    result = asyncio.run(complete_pending_review(service, provider, answer))
 
-    assert result.status is ReviewCompletionStatus.COMPLETED
-    assert provider.calls[0][1] == answer
-    assert result.feedback == "Evaluated normally."
+def test_reverse_normalizer_and_rating_parser_are_state_deterministic() -> None:
+    assert normalize_reverse_answer("  Pro   Forma...  ") == "pro forma"
+    assert parse_rating(
+        " GOOD ",
+        (ReviewRating.HARD, ReviewRating.GOOD, ReviewRating.EASY),
+    ) is ReviewRating.GOOD
+    assert parse_rating(
+        "good",
+        (ReviewRating.AGAIN, ReviewRating.HARD),
+    ) is None
+    assert allowed_ratings(EvaluationGrade.INCORRECT) == ()
 
 
-def test_whitespace_answer_is_rejected_without_provider_or_transition(
+@pytest.mark.parametrize(
+    "provider_status",
+    [EvaluationStatus.INVALID_RESPONSE, EvaluationStatus.PROVIDER_ERROR],
+)
+def test_provider_failure_keeps_same_answerable_prompt_and_writes_nothing(
+    tmp_path: Path,
+    provider_status: EvaluationStatus,
+) -> None:
+    service, database, prompt_id = answerable_study(tmp_path)
+    provider = StubEvaluationProvider(EvaluationResult(provider_status))
+
+    result = asyncio.run(continue_study_answer(service, provider, "my answer"))
+
+    assert result.status is StudyAnswerStatus.EVALUATION_ERROR
+    assert service.answerable_prompt().id == prompt_id
+    with database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM answer_drafts").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM review_attempts").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT repetitions FROM vocabulary_cards WHERE id = 101"
+        ).fetchone()[0] == 0
+
+
+def test_rating_persistence_failure_retains_draft_without_duplicate_evaluation(
     tmp_path: Path,
 ) -> None:
-    service, database, _ = pending_review(tmp_path)
-    provider = StubEvaluationProvider(
-        EvaluationResult(
-            EvaluationStatus.VALID,
-            Evaluation(EvaluationGrade.CORRECT, "Should not be used."),
-        )
-    )
-
-    result = asyncio.run(complete_pending_review(service, provider, "  \n "))
-
-    assert result.status is ReviewCompletionStatus.INVALID
-    assert provider.calls == []
+    service, database, _ = answerable_study(tmp_path)
+    provider = valid_provider(EvaluationGrade.PARTIAL)
+    awaiting = asyncio.run(continue_study_answer(service, provider, "partial answer"))
+    assert awaiting.status is StudyAnswerStatus.AWAITING_RATING
     with database.connect() as connection:
-        stored = connection.execute(
-            "SELECT status, answer_text FROM review_events"
-        ).fetchone()
-    assert tuple(stored) == ("pending", None)
+        connection.execute(
+            """
+            CREATE TRIGGER fail_u5_attempt
+            BEFORE INSERT ON review_attempts
+            BEGIN SELECT RAISE(ABORT, 'injected U5 attempt failure'); END
+            """
+        )
+        connection.commit()
+
+    failed = asyncio.run(continue_study_answer(service, provider, "hard"))
+
+    assert failed.status is StudyAnswerStatus.STORAGE_ERROR
+    assert failed.allowed_ratings == (ReviewRating.AGAIN, ReviewRating.HARD)
+    assert len(provider.calls) == 1
+    with database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM answer_drafts").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM review_attempts").fetchone()[0] == 0
+        connection.execute("DROP TRIGGER fail_u5_attempt")
+        connection.commit()
+
+    retried = asyncio.run(continue_study_answer(service, provider, "hard"))
+    assert retried.status is StudyAnswerStatus.FINALIZED
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("answer", "provider_grade", "expected_calls"),
+    [
+        ("wrong meaning", EvaluationGrade.INCORRECT, 1),
+        ("show answer", EvaluationGrade.CORRECT, 0),
+        ("idk", EvaluationGrade.CORRECT, 0),
+    ],
+)
+def test_auto_again_persistence_failure_retries_from_draft_without_re_evaluation(
+    tmp_path: Path,
+    answer: str,
+    provider_grade: EvaluationGrade,
+    expected_calls: int,
+) -> None:
+    service, database, _ = answerable_study(tmp_path)
+    provider = valid_provider(provider_grade)
+    with database.connect() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER fail_auto_again_attempt
+            BEFORE INSERT ON review_attempts
+            BEGIN SELECT RAISE(ABORT, 'injected auto Again failure'); END
+            """
+        )
+        connection.commit()
+
+    failed = asyncio.run(continue_study_answer(service, provider, answer))
+
+    assert failed.status is StudyAnswerStatus.STORAGE_ERROR
+    assert failed.context.draft.evaluation.grade is EvaluationGrade.INCORRECT
+    assert failed.allowed_ratings == ()
+    assert len(provider.calls) == expected_calls
+    with database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM answer_drafts").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM review_attempts").fetchone()[0] == 0
+        connection.execute("DROP TRIGGER fail_auto_again_attempt")
+        connection.commit()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        retried = list(
+            executor.map(
+                lambda _: asyncio.run(
+                    continue_study_answer(service, provider, "not a rating")
+                ),
+                range(2),
+            )
+        )
+
+    assert StudyAnswerStatus.FINALIZED in {result.status for result in retried}
+    assert {result.status for result in retried} <= {
+        StudyAnswerStatus.FINALIZED,
+        StudyAnswerStatus.STALE,
+        StudyAnswerStatus.NO_ACTIVE,
+    }
+    assert len(provider.calls) == expected_calls
+    with database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM answer_drafts").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM review_attempts").fetchone()[0] == 1
+        assert connection.execute("SELECT rating FROM review_attempts").fetchone()[0] == "again"
+
+
+def test_concurrent_answers_and_ratings_persist_one_draft_and_attempt(
+    tmp_path: Path,
+) -> None:
+    service, database, _ = answerable_study(tmp_path)
+    provider = valid_provider(EvaluationGrade.CORRECT)
+
+    async def answer_twice():
+        return await asyncio.gather(
+            continue_study_answer(service, provider, "first answer"),
+            continue_study_answer(service, provider, "second answer"),
+        )
+
+    asyncio.run(answer_twice())
+    restarted = ReviewService(database, ZoneInfo("UTC"), clock=lambda: NOW)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        ratings = list(
+            executor.map(
+                lambda _: asyncio.run(
+                    continue_study_answer(restarted, provider, "good")
+                ),
+                range(2),
+            )
+        )
+
+    assert StudyAnswerStatus.FINALIZED in {result.status for result in ratings}
+    with database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM answer_drafts").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM review_attempts").fetchone()[0] == 1

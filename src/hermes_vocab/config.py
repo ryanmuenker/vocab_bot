@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+DAILY_NEW_CARD_LIMIT = 5
+DEFAULT_REVIEW_HOUR = 12
+
 
 class ConfigurationError(ValueError):
     """Raised when required local configuration is invalid."""
@@ -15,6 +18,8 @@ class Settings:
     database_path: Path
     timezone: ZoneInfo
     telegram_chat_id: int | None = None
+    daily_new_card_limit: int = DAILY_NEW_CARD_LIMIT
+    review_hour: int = DEFAULT_REVIEW_HOUR
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -44,8 +49,23 @@ class Settings:
             raise ConfigurationError(
                 "HERMES_VOCAB_TELEGRAM_CHAT_ID must be a base-10 integer"
             ) from error
+        review_hour_text = os.environ.get(
+            "HERMES_VOCAB_REVIEW_HOUR",
+            str(DEFAULT_REVIEW_HOUR),
+        ).strip()
+        try:
+            review_hour = int(review_hour_text)
+        except ValueError as error:
+            raise ConfigurationError(
+                "HERMES_VOCAB_REVIEW_HOUR must be an integer from 0 to 23"
+            ) from error
+        if not 0 <= review_hour <= 23:
+            raise ConfigurationError(
+                "HERMES_VOCAB_REVIEW_HOUR must be an integer from 0 to 23"
+            )
         return cls(
             database_path=database_path,
             timezone=timezone,
             telegram_chat_id=telegram_chat_id,
+            review_hour=review_hour,
         )

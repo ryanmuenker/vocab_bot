@@ -3,18 +3,29 @@ from __future__ import annotations
 import json
 
 from hermes_vocab.capture import CaptureService
-from hermes_vocab.formatting import format_capture, format_review_completion
+from hermes_vocab.formatting import (
+    format_capture,
+    format_directional_totals,
+    format_study_evaluation,
+    format_study_evaluation_result,
+    format_study_schedule,
+)
 from hermes_vocab.models import (
     CaptureCommand,
     CaptureOperation,
     CaptureResult,
     CaptureStatus,
-    ReviewCompletionResult,
-    ReviewCompletionStatus,
+    CardDirection,
+    EvaluationGrade,
     SenseCard,
+    StudyAnswerResult,
+    StudyAnswerStatus,
+    StudyMode,
+    StudySessionStatus,
 )
 from hermes_vocab.review import ReviewService
-from .evaluation import EvaluationProvider, complete_pending_review
+from hermes_vocab.test_session import TestSessionService
+from .evaluation import EvaluationProvider, continue_study_answer
 
 
 _CARD_FIELDS = ("part_of_speech", "definition", "example_sentence")
@@ -83,10 +94,12 @@ class ToolHandlers:
         capture_service: CaptureService,
         review_service: ReviewService,
         evaluation_provider: EvaluationProvider,
+        test_service: TestSessionService,
     ) -> None:
         self.capture_service = capture_service
         self.review_service = review_service
         self.evaluation_provider = evaluation_provider
+        self.test_service = test_service
 
     def save_card(self, args: dict, **kwargs) -> str:
         command = _capture_command(args)
@@ -97,28 +110,122 @@ class ToolHandlers:
         )
         return json.dumps(_capture_payload(result), ensure_ascii=False)
 
-    async def complete_review(self, args: dict, **kwargs) -> str:
+    async def continue_study(self, args: dict, **kwargs) -> str:
         try:
             answer_text = args.get("answer_text", "")
-            result = await complete_pending_review(
+            result = await continue_study_answer(
                 self.review_service,
                 self.evaluation_provider,
                 answer_text,
             )
             return json.dumps(
-                {
-                    "status": result.status.value,
-                    "text": format_review_completion(result),
-                },
+                self._study_payload(result),
                 ensure_ascii=False,
             )
         except Exception:
-            result = ReviewCompletionResult(
-                ReviewCompletionStatus.STORAGE_ERROR
-            )
             return json.dumps(
                 {
-                    "status": result.status.value,
-                    "text": format_review_completion(result),
+                    "status": StudyAnswerStatus.STORAGE_ERROR.value,
+                    "text": "I couldn't save that study step. Please try again.",
                 }
             )
+
+    def _study_payload(self, result: StudyAnswerResult) -> dict:
+        payload: dict[str, object] = {
+            "status": result.status.value,
+            "allowed_ratings": [
+                rating.value for rating in result.allowed_ratings
+            ],
+        }
+        if (
+            result.status is StudyAnswerStatus.AWAITING_RATING
+            and result.context is not None
+        ):
+            payload["text"] = format_study_evaluation(
+                result.context,
+                result.allowed_ratings,
+            )
+            return payload
+        if (
+            result.status is StudyAnswerStatus.FINALIZED
+            and result.finalization is not None
+            and result.finalization.transition is not None
+            and result.finalization.snapshot is not None
+        ):
+            snapshot = result.finalization.snapshot
+            if (
+                snapshot.status is StudySessionStatus.ACTIVE
+                and snapshot.mode is not StudyMode.REVIEW
+            ):
+                prepared = self.test_service.prepare_current_prompt()
+                if prepared is not None:
+                    snapshot = prepared
+            if (
+                snapshot.status is StudySessionStatus.COMPLETED
+                and snapshot.mode is not StudyMode.REVIEW
+            ):
+                totals = self.test_service.summary(snapshot.session_id)
+                if totals is not None:
+                    direction = (
+                        CardDirection.FORWARD
+                        if snapshot.mode is StudyMode.TEST_FORWARD
+                        else CardDirection.REVERSE
+                    )
+                    totals_text = format_directional_totals(
+                        direction,
+                        correct=totals.correct,
+                        partial=totals.partial,
+                        incorrect=totals.incorrect,
+                    )
+                    payload["text"] = self._with_finalized_evaluation(
+                        result,
+                        totals_text,
+                    )
+                    return payload
+            transition = result.finalization.transition
+            schedule_text = format_study_schedule(
+                result.finalization.transition.rating,
+                transition.effective_due,
+                snapshot.progress,
+                retry_queued=transition.retry_same_session,
+                next_prompt=(
+                    snapshot.current_prompt.prompt_text
+                    if (
+                        snapshot.mode is not StudyMode.REVIEW
+                        and snapshot.current_prompt is not None
+                    )
+                    else None
+                ),
+            )
+            payload["text"] = self._with_finalized_evaluation(
+                result,
+                schedule_text,
+            )
+            return payload
+        messages = {
+            StudyAnswerStatus.INVALID_INPUT: "Send a non-empty answer.",
+            StudyAnswerStatus.INVALID_RATING: "Send one of the listed effort ratings.",
+            StudyAnswerStatus.EVALUATION_ERROR: "I couldn't evaluate that answer. Please try again.",
+            StudyAnswerStatus.NO_ACTIVE: "There isn't a delivered study prompt waiting.",
+            StudyAnswerStatus.STALE: "That study prompt is no longer current.",
+            StudyAnswerStatus.STORAGE_ERROR: "I couldn't save that study step. Please try again.",
+        }
+        payload["text"] = messages.get(
+            result.status,
+            "I couldn't continue that study step.",
+        )
+        return payload
+
+    @staticmethod
+    def _with_finalized_evaluation(
+        result: StudyAnswerResult,
+        continuation: str,
+    ) -> str:
+        if (
+            result.context is not None
+            and result.context.draft is not None
+            and result.context.draft.evaluation.grade is EvaluationGrade.INCORRECT
+        ):
+            evaluation = format_study_evaluation_result(result.context)
+            return f"{evaluation}\n\n{continuation}"
+        return continuation

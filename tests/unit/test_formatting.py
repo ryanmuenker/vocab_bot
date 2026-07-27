@@ -1,30 +1,36 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from hermes_vocab.formatting import (
     format_capture,
     format_entry,
     format_hint,
-    format_review_completion,
-    format_test_completion,
-    format_test_start,
+    format_directional_totals,
+    format_study_evaluation,
+    format_study_evaluation_result,
+    format_study_prompt,
+    format_study_schedule,
 )
 from hermes_vocab.models import (
+    CardDirection,
+    CardScheduleState,
     CaptureResult,
     CaptureStatus,
     EvaluationGrade,
-    ReviewCompletionResult,
-    ReviewCompletionStatus,
-    TestCompletionResult as CompletionResult,
-    TestCompletionStatus as CompletionStatus,
-    TestQuestion as Question,
-    TestSession as Session,
-    TestSessionSnapshot as SessionSnapshot,
-    TestSessionStatus as SessionStatus,
-    TestStartResult as StartResult,
-    TestStartStatus as StartStatus,
-    TestSummary as Summary,
+    Evaluation,
+    ReviewRating,
+    StudyAnswerContext,
+    StudyCardSnapshot,
+    StudyDraftSnapshot,
+    StudyMode,
+    StudyProgress,
+    StudyPromptSnapshot,
+    StudyPromptStatus,
+    StudyQueueItemSnapshot,
+    StudyQueueStatus,
+    StudySessionStatus,
+    StudySnapshot,
     VocabularySense,
     VocabularyEntry,
 )
@@ -162,35 +168,116 @@ def test_format_hint_uses_first_stored_sense_for_multi_sense_entry() -> None:
     )
 
 
-def test_review_completion_formats_grade_and_feedback_before_single_sense() -> None:
-    result = ReviewCompletionResult(
-        status=ReviewCompletionStatus.COMPLETED,
-        entry=WORD,
-        answer_text="It means stubborn.",
-        grade=EvaluationGrade.CORRECT,
-        feedback="Accurate paraphrase.",
-        event_id=7,
+def study_context(
+    *,
+    direction: CardDirection = CardDirection.FORWARD,
+    entry: VocabularyEntry = WORD,
+    sense: VocabularySense | None = None,
+    grade: EvaluationGrade | None = None,
+    retry: bool = False,
+) -> StudyAnswerContext:
+    card = StudyCardSnapshot(
+        id=101,
+        entry_id=entry.id,
+        sense_id=sense.id if sense is not None else None,
+        direction=direction,
+        state=CardScheduleState.NEW,
+        stability=None,
+        difficulty=None,
+        due=datetime(2026, 7, 20, 12, tzinfo=UTC),
+        effective_due=datetime(2026, 7, 20, 12, tzinfo=UTC),
+        last_review=None,
+        repetitions=0,
+        lapses=0,
+        created_at=datetime(2026, 7, 1, tzinfo=UTC),
+    )
+    queue = StudyQueueItemSnapshot(
+        id=201,
+        card=card,
+        position=3 if retry else 1,
+        status=StudyQueueStatus.CURRENT,
+        retry_of_queue_item_id=99 if retry else None,
+    )
+    prompt = StudyPromptSnapshot(
+        id=301,
+        session_id=401,
+        queue_item_id=queue.id,
+        prompt_key="prompt-1",
+        prompt_text="Persisted.",
+        status=(
+            StudyPromptStatus.ANSWERED
+            if grade is not None
+            else StudyPromptStatus.DELIVERED
+        ),
+        prepared_at=datetime(2026, 7, 20, 12, tzinfo=UTC),
+        delivered_at=datetime(2026, 7, 20, 12, tzinfo=UTC),
+        answered_at=(
+            datetime(2026, 7, 20, 12, 1, tzinfo=UTC)
+            if grade is not None
+            else None
+        ),
+    )
+    draft = (
+        StudyDraftSnapshot(
+            id=501,
+            submitted_answer="learner answer",
+            evaluation=Evaluation(grade, "Right direction."),
+            answered_at=datetime(2026, 7, 20, 12, 1, tzinfo=UTC),
+        )
+        if grade is not None
+        else None
+    )
+    return StudyAnswerContext(prompt, queue, entry, sense, draft)
+
+
+def study_snapshot(
+    context: StudyAnswerContext,
+    *,
+    completed: int,
+    total: int,
+) -> StudySnapshot:
+    return StudySnapshot(
+        session_id=context.prompt.session_id,
+        mode=StudyMode.REVIEW,
+        status=StudySessionStatus.ACTIVE,
+        local_date=date(2026, 7, 20),
+        queue=(context.queue_item,),
+        current_prompt=context.prompt,
+        progress=StudyProgress(completed, total),
     )
 
-    assert format_review_completion(result) == (
-        "Grade: Correct\n"
-        "Feedback: Accurate paraphrase.\n\n"
-        "Definition:\n"
-        "Stubbornly refusing to change one's opinion.\n\n"
-        "Example:\n"
-        "The committee remained obdurate despite new evidence."
+
+def test_study_prompt_formats_current_total_backlog_and_tail_retry_exactly() -> None:
+    current = study_context()
+    retry = study_context(retry=True)
+
+    assert format_study_prompt(
+        current,
+        study_snapshot(current, completed=0, total=3),
+        due_backlog=2,
+    ) == (
+        "Review 1 of 3 · 2 due\n"
+        "What does 'obdurate' mean?"
+    )
+    assert format_study_prompt(
+        retry,
+        study_snapshot(retry, completed=2, total=3),
+        due_backlog=1,
+    ) == (
+        "Review 3 of 3 · 1 due · retry\n"
+        "What does 'obdurate' mean?"
     )
 
 
-def test_review_completion_keeps_multi_sense_reveal_in_database_order() -> None:
-    second = VocabularySense(
+def test_reverse_multi_sense_prompt_contains_only_selected_definition() -> None:
+    selected = VocabularySense(
         id=3,
-        entry_id=1,
+        entry_id=WORD.id,
         definition="Resistant to persuasion.",
         part_of_speech="adjective",
         example_sentence="The witness remained obdurate.",
         source_context=None,
-        date_added=datetime(2026, 7, 16, tzinfo=UTC),
+        date_added=WORD.date_added,
     )
     entry = VocabularyEntry(
         id=WORD.id,
@@ -199,177 +286,105 @@ def test_review_completion_keeps_multi_sense_reveal_in_database_order() -> None:
         date_added=WORD.date_added,
         last_reviewed=None,
         review_status="new",
-        senses=(SENSE, second),
+        senses=(SENSE, selected),
     )
-    result = ReviewCompletionResult(
-        status=ReviewCompletionStatus.COMPLETED,
+    context = study_context(
+        direction=CardDirection.REVERSE,
         entry=entry,
-        answer_text="Only partly right.",
-        grade=EvaluationGrade.PARTIAL,
-        feedback="You identified part of the meaning.",
-        event_id=7,
+        sense=selected,
     )
 
-    assert format_review_completion(result) == (
-        "Grade: Partial\n"
-        "Feedback: You identified part of the meaning.\n\n"
-        "1. adjective — Stubbornly refusing to change one's opinion.\n"
-        "   Example: The committee remained obdurate despite new evidence.\n\n"
-        "2. adjective — Resistant to persuasion.\n"
-        "   Example: The witness remained obdurate."
+    text = format_study_prompt(
+        context,
+        study_snapshot(context, completed=0, total=5),
+        due_backlog=4,
     )
 
-
-def test_review_evaluation_failure_gives_retry_without_revealing_answer() -> None:
-    text = format_review_completion(
-        ReviewCompletionResult(ReviewCompletionStatus.STORAGE_ERROR)
+    assert text == (
+        "Review 1 of 5 · 4 due\n"
+        "Which saved word or expression matches this definition?\n\n"
+        "Resistant to persuasion."
     )
-
-    assert text == "I couldn't evaluate that answer. Please try again."
-    assert "Definition:" not in text
+    assert "obdurate" not in text.casefold()
+    assert selected.example_sentence not in text
     assert SENSE.definition not in text
 
 
-def test_test_start_formats_progress_and_exact_current_question() -> None:
-    question = Question(
-        id=11,
-        session_id=7,
-        position=3,
-        entry=WORD,
-        answer_text=None,
-        grade=None,
-        feedback=None,
-        answered_at=None,
-    )
-    snapshot = SessionSnapshot(
-        session=Session(
-            id=7,
-            status=SessionStatus.ACTIVE,
-            started_at=datetime(2026, 7, 19, tzinfo=UTC),
-            completed_at=None,
-        ),
-        questions=(question,),
-        current_question=question,
-        summary=Summary(correct=1, partial=1),
+def test_study_evaluation_reveals_grade_feedback_before_allowed_choices() -> None:
+    context = study_context(grade=EvaluationGrade.PARTIAL)
+
+    text = format_study_evaluation(
+        context,
+        (ReviewRating.AGAIN, ReviewRating.HARD),
     )
 
-    assert format_test_start(
-        StartResult(StartStatus.RESUMED, snapshot=snapshot)
-    ) == (
-        "Question 3 of 5\n"
-        "What does 'obdurate' mean?"
-    )
-
-
-def test_test_start_formats_insufficient_count_conflict_and_storage_failure() -> None:
-    assert format_test_start(
-        StartResult(
-            StartStatus.INSUFFICIENT_LIBRARY,
-            available_count=3,
-        )
-    ) == "You have 3 saved entries. Save 2 more to start a 5-word test."
-    assert format_test_start(
-        StartResult(StartStatus.DAILY_REVIEW_PENDING)
-    ) == "Finish your daily review before starting a test."
-    assert format_test_start(
-        StartResult(StartStatus.STORAGE_ERROR)
-    ) == "I couldn't start the test. Please try again."
-
-
-def test_advanced_test_answer_formats_grade_reveal_then_next_progress() -> None:
-    answered = Question(
-        id=11,
-        session_id=7,
-        position=1,
-        entry=WORD,
-        answer_text="It means stubborn.",
-        grade=EvaluationGrade.PARTIAL,
-        feedback="Right direction.",
-        answered_at=datetime(2026, 7, 19, tzinfo=UTC),
-    )
-    current = Question(
-        id=12,
-        session_id=7,
-        position=2,
-        entry=WORD,
-        answer_text=None,
-        grade=None,
-        feedback=None,
-        answered_at=None,
-    )
-    snapshot = SessionSnapshot(
-        session=Session(
-            id=7,
-            status=SessionStatus.ACTIVE,
-            started_at=datetime(2026, 7, 19, tzinfo=UTC),
-            completed_at=None,
-        ),
-        questions=(answered, current),
-        current_question=current,
-        summary=Summary(partial=1),
-    )
-
-    assert format_test_completion(
-        CompletionResult(
-            CompletionStatus.ADVANCED,
-            snapshot=snapshot,
-            answered_question=answered,
-        )
-    ) == (
+    assert text == (
         "Grade: Partial\n"
         "Feedback: Right direction.\n\n"
         "Definition:\n"
         "Stubbornly refusing to change one's opinion.\n\n"
         "Example:\n"
         "The committee remained obdurate despite new evidence.\n\n"
-        "Question 2 of 5\n"
-        "What does 'obdurate' mean?"
+        "Choose effort: Again or Hard."
+    )
+    assert text.index("Grade:") < text.index("Definition:")
+    assert text.index("Definition:") < text.index("Choose effort:")
+
+def test_finalized_incorrect_evaluation_reveals_without_empty_effort_prompt() -> None:
+    context = study_context(grade=EvaluationGrade.INCORRECT)
+
+    text = format_study_evaluation_result(context)
+
+    assert text == (
+        "Grade: Incorrect\n"
+        "Feedback: Right direction.\n\n"
+        "Definition:\n"
+        "Stubbornly refusing to change one's opinion.\n\n"
+        "Example:\n"
+        "The committee remained obdurate despite new evidence."
+    )
+    assert "Choose effort:" not in text
+
+
+
+def test_study_schedule_formats_progress_retry_and_next_prompt() -> None:
+    next_prompt = (
+        "Review 2 of 3 · 1 due\n"
+        "What does 'laconic' mean?"
+    )
+
+    assert format_study_schedule(
+        ReviewRating.AGAIN,
+        datetime(2026, 7, 21, 4, tzinfo=UTC),
+        StudyProgress(completed=1, total=3),
+        retry_queued=True,
+        next_prompt=next_prompt,
+    ) == (
+        "Rated: Again\n"
+        "Next due: 2026-07-21 04:00 UTC\n"
+        "Progress: 1 of 3 complete.\n"
+        "Retry added at the end.\n\n"
+        "Review 2 of 3 · 1 due\n"
+        "What does 'laconic' mean?"
     )
 
 
-def test_completed_test_answer_formats_reveal_then_category_totals() -> None:
-    answered = Question(
-        id=15,
-        session_id=7,
-        position=5,
-        entry=WORD,
-        answer_text="attempt",
-        grade=EvaluationGrade.INCORRECT,
-        feedback="That is not the stored meaning.",
-        answered_at=datetime(2026, 7, 19, tzinfo=UTC),
-    )
-    snapshot = SessionSnapshot(
-        session=Session(
-            id=7,
-            status=SessionStatus.COMPLETED,
-            started_at=datetime(2026, 7, 19, tzinfo=UTC),
-            completed_at=datetime(2026, 7, 19, 0, 5, tzinfo=UTC),
-        ),
-        questions=(answered,),
-        current_question=None,
-        summary=Summary(correct=2, partial=2, incorrect=1),
-    )
-
-    text = format_test_completion(
-        CompletionResult(
-            CompletionStatus.COMPLETED,
-            snapshot=snapshot,
-            answered_question=answered,
-        )
-    )
-
-    assert text.endswith(
-        "Test complete.\n"
+def test_final_directional_totals_are_exact() -> None:
+    assert format_directional_totals(
+        CardDirection.FORWARD,
+        correct=2,
+        partial=2,
+        incorrect=1,
+    ) == (
+        "Forward test complete.\n"
         "Results: 2 correct, 2 partial, 1 incorrect."
     )
-    assert text.index("Grade: Incorrect") < text.index("Definition:")
-    assert text.index("Definition:") < text.index("Test complete.")
-
-
-def test_test_evaluation_failure_never_reveals() -> None:
-    text = format_test_completion(
-        CompletionResult(CompletionStatus.STORAGE_ERROR)
+    assert format_directional_totals(
+        CardDirection.REVERSE,
+        correct=4,
+        partial=0,
+        incorrect=1,
+    ) == (
+        "Reverse test complete.\n"
+        "Results: 4 correct, 0 partial, 1 incorrect."
     )
-
-    assert text == "I couldn't evaluate that answer. Please try again."
-    assert "Definition:" not in text

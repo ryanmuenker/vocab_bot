@@ -3,6 +3,9 @@ version: 0.1.0
 description: Local-first vocabulary capture, graded daily review, and five-word tests
 provides_tools:
   - vocabulary_save_card
-  - vocabulary_complete_review
+  - vocabulary_continue_study
 provides_hooks:
   - pre_llm_call
+
+provides_commands:
+  - test

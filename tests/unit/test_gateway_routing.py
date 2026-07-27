@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
+from types import SimpleNamespace
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,17 +21,15 @@ from hermes_vocab.hermes_plugin.definition import (
 from hermes_vocab.hermes_plugin.evaluation import (
     EvaluationResult,
     EvaluationStatus,
-    SHOW_ANSWER_FEEDBACK,
 )
 from hermes_vocab.hermes_plugin.gateway import VocabularyGatewayRouter
+from hermes_vocab.hermes_plugin.hooks import VocabularyHook
 from hermes_vocab.test_session import TestSessionService as SessionService
-from hermes_vocab.hermes_plugin.tools import ToolHandlers
 from hermes_vocab.models import (
     CaptureStatus,
     EntryCaptureResult,
     Evaluation,
     EvaluationGrade,
-    PendingReviewStatus,
     SenseCard,
 )
 from hermes_vocab.review import ReviewService
@@ -111,7 +112,7 @@ def make_router(
     review = ReviewService(database, ZoneInfo("UTC"), clock=lambda: NOW)
     definition = provider or FakeProvider()
     evaluation = evaluator or FakeEvaluationProvider()
-    test_session = SessionService(database, clock=lambda: NOW)
+    test_session = SessionService(database, ZoneInfo("UTC"), clock=lambda: NOW)
     return (
         VocabularyGatewayRouter(
             capture,
@@ -153,6 +154,176 @@ def add_test_entries(capture: CaptureService, count: int = 5) -> None:
                 ),
             ),
         )
+
+
+OVERDUE_PROMPT_TEXT = "Review 1 of 1 · 1 due\nWhat does 'laconic' mean?"
+
+
+def make_overdue_forward_only(capture: CaptureService, entry_id: int) -> None:
+    """Leave exactly one overdue forward card for the entry capture just saved."""
+    with capture.database.connect() as connection:
+        connection.execute(
+            "DELETE FROM vocabulary_cards WHERE entry_id = ? AND direction = 'reverse'",
+            (entry_id,),
+        )
+        connection.execute(
+            """
+            UPDATE vocabulary_cards
+            SET state = 'review', stability = 2.0, difficulty = 5.0,
+                due_at = ?, effective_due_at = ?, last_review_at = ?,
+                repetitions = 1, lapses = 0, created_at = ?
+            WHERE entry_id = ? AND direction = 'forward'
+            """,
+            (
+                "2026-07-16T12:00:00Z",
+                "2026-07-16T12:00:00Z",
+                "2026-07-10T12:00:00Z",
+                "2026-07-01T12:00:00Z",
+                entry_id,
+            ),
+        )
+        connection.commit()
+
+
+def seed_overdue_review_prompt(
+    capture: CaptureService,
+    review: ReviewService,
+    *,
+    prompt_key: str,
+):
+    """Persist one overdue forward card and prepare its review prompt."""
+    captured = capture.capture_entry(
+        "laconic",
+        (SenseCard("adjective", "Using few words.", "His reply was laconic."),),
+    )
+    assert captured.entry is not None
+    make_overdue_forward_only(capture, captured.entry.id)
+    started = review.start()
+    assert started.snapshot is not None
+    prompt = review.prepare_current_prompt(prompt_key, OVERDUE_PROMPT_TEXT)
+    assert prompt is not None
+    return prompt
+
+
+def seed_overdue_card_without_session(capture: CaptureService) -> None:
+    """Persist one overdue forward card and start no study session at all."""
+    captured = capture.capture_entry(
+        "laconic",
+        (SenseCard("adjective", "Using few words.", "His reply was laconic."),),
+    )
+    assert captured.entry is not None
+    make_overdue_forward_only(capture, captured.entry.id)
+
+
+def test_undelivered_due_work_interrupts_capture_when_no_session_exists(
+    tmp_path: Path,
+) -> None:
+    """Covers AE2/R4 when cron never ran: due work must never be silently captured."""
+    router, capture, review, definition = make_router(tmp_path)
+    seed_overdue_card_without_session(capture)
+    assert review.snapshot() is None
+    assert review.due_but_not_answerable() is True
+
+    response = asyncio.run(route(router, "Xanthocroid"))
+
+    assert response is not None
+    assert "What does 'laconic' mean?" in response
+    assert "Xanthocroid" in response
+    assert "resubmit" in response
+    assert definition.calls == []
+    assert router._evaluation_provider.calls == []
+    assert capture.get_entry("xanthocroid") is None
+    assert review.answerable_prompt() is None
+    with capture.database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM study_prompts"
+        ).fetchone()[0] == 1
+
+
+def test_review_error_paths_return_copy_instead_of_raising(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The review-unavailable branches must be reachable copy, not a NameError."""
+    router, capture, review, definition = make_router(tmp_path)
+    prompt = seed_overdue_review_prompt(capture, review, prompt_key="review:hint-error")
+    assert review.record_delivery(
+        prompt.id,
+        delivery_id="delivered",
+        content_fingerprint="fingerprint",
+    ) is not None
+    monkeypatch.setattr(review, "current_answer_context", lambda: None)
+
+    assert asyncio.run(route(router, "hint")) == (
+        "I couldn't load that review. Please try again."
+    )
+    assert definition.calls == []
+    assert router._evaluation_provider.calls == []
+
+
+def cron_receipt(
+    state: str,
+    run_id: str,
+    fingerprint: str,
+    *,
+    message_ids: tuple[str, ...] = (),
+    error: str | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        state=state,
+        destination=f"telegram:{CHAT_ID}",
+        message_ids=message_ids,
+        correlation_id=None,
+        cron_run_id=run_id,
+        content_fingerprint=fingerprint,
+        error=error,
+    )
+
+
+
+def test_prepared_prompt_for_new_cards_still_echoes_the_original_message(
+    tmp_path: Path,
+) -> None:
+    """R4: an intercepted message must never vanish without a resubmit request."""
+    router, capture, review, definition = make_router(tmp_path)
+    capture.capture_entry(
+        "laconic",
+        (SenseCard("adjective", "Using few words.", "His reply was laconic."),),
+    )
+    review.start()
+    prepared = router.prepare_review_prompt()
+    assert prepared is not None
+    assert review.answerable_prompt() is None
+
+    response = asyncio.run(route(router, "Xanthocroid"))
+
+    assert response is not None
+    assert prepared.prompt_text in response
+    assert "Xanthocroid" in response
+    assert "resubmit" in response
+    assert definition.calls == []
+    assert router._evaluation_provider.calls == []
+    assert capture.get_entry("xanthocroid") is None
+
+
+def interactive_receipt(
+    state: str,
+    prompt_key: str,
+    fingerprint: str,
+    *,
+    message_ids: tuple[str, ...] = (),
+    error: str | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        state=state,
+        destination=f"telegram:{CHAT_ID}",
+        message_ids=message_ids,
+        correlation_id=prompt_key,
+        cron_run_id=None,
+        content_fingerprint=fingerprint,
+        error=error,
+    )
+
 
 @pytest.mark.parametrize(
     "overrides",
@@ -201,348 +372,28 @@ def test_router_rejects_invalid_entry_text_without_provider_or_writes(
         assert connection.execute("SELECT COUNT(*) FROM vocabulary_entries").fetchone()[0] == 0
 
 
-def test_pending_review_is_semantically_evaluated_and_formatted_grade_first(
-    tmp_path: Path,
-) -> None:
-    evaluator = FakeEvaluationProvider(
-        EvaluationResult(
-            EvaluationStatus.VALID,
-            Evaluation(EvaluationGrade.PARTIAL, "Right direction, but incomplete."),
-        )
-    )
-    router, capture, review, provider = make_router(tmp_path, evaluator=evaluator)
-    capture.capture_entry(
-        "laconic",
-        (SenseCard("adjective", "Using few words.", "His reply was laconic."),),
-    )
-    pending = review.daily_review()
-    assert pending.event is not None
-    answer = "Something brief."
-
-    result = asyncio.run(route(router, answer))
-
-    assert result == (
-        "Grade: Partial\n"
-        "Feedback: Right direction, but incomplete.\n\n"
-        "Definition:\nUsing few words.\n\n"
-        "Example:\nHis reply was laconic."
-    )
-    assert provider.calls == []
-    assert len(evaluator.calls) == 1
-    assert evaluator.calls[0][1] == answer
-    with capture.database.connect() as connection:
-        event = connection.execute(
-            "SELECT status, answer_text, grade, evaluation_feedback FROM review_events"
-        ).fetchone()
-    assert tuple(event) == (
-        "answered",
-        answer,
-        "partial",
-        "Right direction, but incomplete.",
-    )
 
 
-@pytest.mark.parametrize("hint_request", HINT_REQUESTS)
-def test_daily_review_hint_preserves_pending_answer_state(
-    tmp_path: Path,
-    hint_request: str,
-) -> None:
-    evaluator = FakeEvaluationProvider()
-    router, capture, review, _ = make_router(tmp_path, evaluator=evaluator)
-    capture.capture_entry(
-        "laconic",
-        (
-            SenseCard("adjective", "Using few words.", "His reply was laconic."),
-            SenseCard(
-                "noun",
-                "A concise expression.",
-                "The laconic ended the note.",
-            ),
-        ),
-    )
-    started = review.daily_review()
-    assert started.event is not None
-    event_id = started.event.id
-
-    result = asyncio.run(route(router, hint_request))
-
-    assert result == "Hint: His reply was laconic."
-    assert evaluator.calls == []
-    pending = review.pending_review()
-    assert pending.status is PendingReviewStatus.PENDING
-    assert pending.event is not None
-    assert pending.event.id == event_id
-    assert pending.event.answer_text is None
-    assert pending.event.grade is None
-    assert pending.event.feedback is None
-    assert pending.event.answered_at is None
-    assert pending.entry is not None
-    assert pending.entry.display_text == "laconic"
-    assert pending.entry.last_reviewed is None
 
 
-def test_daily_review_answer_after_hint_grades_same_entry(tmp_path: Path) -> None:
-    evaluator = FakeEvaluationProvider()
-    router, capture, review, _ = make_router(tmp_path, evaluator=evaluator)
-    capture.capture_entry(
-        "laconic",
-        (SenseCard("adjective", "Using few words.", "His reply was laconic."),),
-    )
-    review.daily_review()
-
-    assert asyncio.run(route(router, "give me a hint")) == (
-        "Hint: His reply was laconic."
-    )
-    response = asyncio.run(route(router, "brief or concise"))
-
-    assert response is not None and response.startswith("Grade: Correct")
-    assert evaluator.calls[0][0].display_text == "laconic"
-    assert evaluator.calls[0][1] == "brief or concise"
 
 
-def test_evaluator_failure_keeps_pending_and_does_not_reveal(
-    tmp_path: Path,
-) -> None:
-    evaluator = FakeEvaluationProvider(
-        EvaluationResult(EvaluationStatus.PROVIDER_ERROR)
-    )
-    router, capture, review, _ = make_router(tmp_path, evaluator=evaluator)
-    capture.capture_entry(
-        "laconic",
-        (SenseCard("adjective", "Using few words.", "His reply was laconic."),),
-    )
-    review.daily_review()
-
-    result = asyncio.run(route(router, "my attempt"))
-
-    assert result == "I couldn't evaluate that answer. Please try again."
-    assert "Using few words." not in result
-    with capture.database.connect() as connection:
-        event = connection.execute(
-            "SELECT status, answer_text, grade FROM review_events"
-        ).fetchone()
-    assert tuple(event) == ("pending", None, None)
 
 
-def test_exact_show_answer_bypasses_evaluator_and_reveals(
-    tmp_path: Path,
-) -> None:
-    evaluator = FakeEvaluationProvider()
-    router, capture, review, _ = make_router(tmp_path, evaluator=evaluator)
-    capture.capture_entry(
-        "laconic",
-        (SenseCard("adjective", "Using few words.", "His reply was laconic."),),
-    )
-    review.daily_review()
-
-    result = asyncio.run(route(router, "show answer"))
-
-    assert result == (
-        "Grade: Incorrect\n"
-        f"Feedback: {SHOW_ANSWER_FEEDBACK}\n\n"
-        "Definition:\nUsing few words.\n\n"
-        "Example:\nHis reply was laconic."
-    )
-    assert evaluator.calls == []
 
 
-def test_plain_answer_is_sent_to_evaluator(tmp_path: Path) -> None:
-    evaluator = FakeEvaluationProvider()
-    router, capture, review, _ = make_router(tmp_path, evaluator=evaluator)
-    capture.capture_entry(
-        "laconic",
-        (SenseCard("adjective", "Using few words.", "His reply was laconic."),),
-    )
-    review.daily_review()
-
-    asyncio.run(route(router, "answer"))
-
-    assert evaluator.calls[0][1] == "answer"
 
 
-def test_gateway_and_async_tool_share_completion_behavior(tmp_path: Path) -> None:
-    result = EvaluationResult(
-        EvaluationStatus.VALID,
-        Evaluation(EvaluationGrade.PARTIAL, "Right direction, but incomplete."),
-    )
-    gateway_evaluator = FakeEvaluationProvider(result)
-    gateway, gateway_capture, gateway_review, _ = make_router(
-        tmp_path / "gateway",
-        evaluator=gateway_evaluator,
-    )
-    tool_evaluator = FakeEvaluationProvider(result)
-    _, tool_capture, tool_review, _ = make_router(
-        tmp_path / "tool",
-        evaluator=tool_evaluator,
-    )
-    card = SenseCard(
-        "adjective",
-        "Using few words.",
-        "His reply was laconic.",
-    )
-    gateway_capture.capture_entry("laconic", (card,))
-    tool_capture.capture_entry("laconic", (card,))
-    gateway_review.daily_review()
-    tool_review.daily_review()
-    answer = "Something brief."
-
-    gateway_text = asyncio.run(route(gateway, answer))
-    tool_payload = json.loads(
-        asyncio.run(
-            ToolHandlers(
-                tool_capture,
-                tool_review,
-                tool_evaluator,
-            ).complete_review({"answer_text": answer})
-        )
-    )
-
-    assert tool_payload == {
-        "status": "completed",
-        "text": gateway_text,
-    }
-    for capture in (gateway_capture, tool_capture):
-        with capture.database.connect() as connection:
-            stored = connection.execute(
-                "SELECT answer_text, grade, evaluation_feedback FROM review_events"
-            ).fetchone()
-        assert tuple(stored) == (
-            answer,
-            "partial",
-            "Right direction, but incomplete.",
-        )
 
 
-def test_pending_review_consumes_entire_original_message_first(tmp_path: Path) -> None:
-    router, capture, review, provider = make_router(tmp_path)
-    capture.capture_entry("laconic", (SenseCard("adjective", "Using few words.", "His reply was laconic."),))
-    review.daily_review()
-    answer = "I think it means brief.\nThat is my whole answer."
-
-    result = asyncio.run(route(router, answer))
-
-    assert result == (
-        "Grade: Correct\n"
-        "Feedback: Accurate paraphrase.\n\n"
-        "Definition:\nUsing few words.\n\n"
-        "Example:\nHis reply was laconic."
-    )
-    assert provider.calls == []
-    with capture.database.connect() as connection:
-        stored = connection.execute("SELECT answer_text FROM review_events").fetchone()[0]
-    assert stored == answer
 
 
-def test_active_test_is_routed_after_pending_review_check(tmp_path: Path) -> None:
-    evaluator = FakeEvaluationProvider(
-        EvaluationResult(
-            EvaluationStatus.VALID,
-            Evaluation(EvaluationGrade.PARTIAL, "Directionally right."),
-        )
-    )
-    router, capture, _, provider = make_router(tmp_path, evaluator=evaluator)
-    add_test_entries(capture)
-    started = router._test_service.start()
-    assert started.snapshot is not None
-
-    result = asyncio.run(route(router, "my first answer"))
-
-    assert result == (
-        "Grade: Partial\n"
-        "Feedback: Directionally right.\n\n"
-        "Definition:\nDefinition 0.\n\n"
-        "Example:\nExample 0.\n\n"
-        "Question 2 of 5\n"
-        "What does 'word-1' mean?"
-    )
-    assert provider.calls == []
-    assert evaluator.calls[0][0].display_text == "word-0"
-    assert evaluator.calls[0][1] == "my first answer"
-    current = router._test_service.current().snapshot.current_question
-    assert current is not None and current.position == 2
 
 
-@pytest.mark.parametrize("hint_request", HINT_REQUESTS)
-def test_active_test_hint_does_not_evaluate_or_advance(
-    tmp_path: Path,
-    hint_request: str,
-) -> None:
-    evaluator = FakeEvaluationProvider()
-    router, capture, _, _ = make_router(tmp_path, evaluator=evaluator)
-    capture.capture_entry(
-        "laconic",
-        (
-            SenseCard("adjective", "Using few words.", "His reply was laconic."),
-            SenseCard(
-                "noun",
-                "A concise expression.",
-                "The laconic ended the note.",
-            ),
-        ),
-    )
-    add_test_entries(capture, count=4)
-    before = router._test_service.start().snapshot
-    assert before is not None and before.current_question is not None
-    question_id = before.current_question.id
-    totals = (
-        before.summary.correct,
-        before.summary.partial,
-        before.summary.incorrect,
-    )
-
-    result = asyncio.run(route(router, hint_request))
-
-    assert result == "Hint: His reply was laconic."
-    assert evaluator.calls == []
-    after = router._test_service.current().snapshot
-    assert after is not None and after.current_question is not None
-    assert after.current_question.id == question_id
-    assert after.current_question.position == 1
-    assert after.current_question.entry.display_text == "laconic"
-    assert after.current_question.answer_text is None
-    assert after.current_question.grade is None
-    assert after.current_question.feedback is None
-    assert after.current_question.answered_at is None
-    assert (
-        after.summary.correct,
-        after.summary.partial,
-        after.summary.incorrect,
-    ) == totals
 
 
-def test_active_test_answer_after_hint_grades_same_entry(tmp_path: Path) -> None:
-    evaluator = FakeEvaluationProvider()
-    router, capture, _, _ = make_router(tmp_path, evaluator=evaluator)
-    capture.capture_entry(
-        "laconic",
-        (SenseCard("adjective", "Using few words.", "His reply was laconic."),),
-    )
-    add_test_entries(capture, count=4)
-    router._test_service.start()
-
-    assert asyncio.run(route(router, "give me a hint")) == (
-        "Hint: His reply was laconic."
-    )
-    response = asyncio.run(route(router, "brief or concise"))
-
-    assert response is not None and response.startswith("Grade: Correct")
-    assert evaluator.calls[0][0].display_text == "laconic"
-    assert evaluator.calls[0][1] == "brief or concise"
-    current = router._test_service.current().snapshot.current_question
-    assert current is not None and current.position == 2
 
 
-def test_nonmatching_hint_text_is_still_evaluated_during_test(tmp_path: Path) -> None:
-    evaluator = FakeEvaluationProvider()
-    router, capture, _, _ = make_router(tmp_path, evaluator=evaluator)
-    add_test_entries(capture)
-    router._test_service.start()
-
-    asyncio.run(route(router, "give me another hint"))
-
-    assert evaluator.calls[0][1] == "give me another hint"
-    current = router._test_service.current().snapshot.current_question
-    assert current is not None and current.position == 2
 
 
 def test_hint_phrase_outside_study_flow_uses_capture_route(tmp_path: Path) -> None:
@@ -555,184 +406,18 @@ def test_hint_phrase_outside_study_flow_uses_capture_route(tmp_path: Path) -> No
     assert capture.get_entry("hint") is not None
 
 
-def test_concurrent_test_replies_only_advance_the_prepared_question_once(
-    tmp_path: Path,
-) -> None:
-    async def exercise() -> None:
-        evaluator = BlockingEvaluationProvider()
-        router, capture, _, _ = make_router(tmp_path, evaluator=evaluator)
-        add_test_entries(capture)
-        router._test_service.start()
-
-        replies = [
-            asyncio.create_task(route(router, answer))
-            for answer in ("first answer", "second answer")
-        ]
-        await asyncio.wait_for(evaluator.both_started.wait(), timeout=1)
-        evaluator.release.set()
-        results = await asyncio.gather(*replies)
-
-        stale_reply = (
-            "That answer was already recorded.\n\n"
-            "Question 2 of 5\n"
-            "What does 'word-1' mean?"
-        )
-        assert results.count(stale_reply) == 1
-        advanced_replies = [result for result in results if result != stale_reply]
-        assert len(advanced_replies) == 1
-        assert advanced_replies[0] == (
-            "Grade: Correct\n"
-            "Feedback: Accurate paraphrase.\n\n"
-            "Definition:\nDefinition 0.\n\n"
-            "Example:\nExample 0.\n\n"
-            "Question 2 of 5\n"
-            "What does 'word-1' mean?"
-        )
-
-        snapshot = router._test_service.current().snapshot
-        assert snapshot is not None
-        assert sum(question.answer_text is not None for question in snapshot.questions) == 1
-        assert snapshot.current_question is not None
-        assert snapshot.current_question.position == 2
-        assert snapshot.current_question.answer_text is None
-        assert len(evaluator.calls) == 2
-        assert all(call[0].display_text == "word-0" for call in evaluator.calls)
-
-    asyncio.run(exercise())
 
 
-def test_pending_review_takes_precedence_over_active_test_if_state_is_corrupt(
-    tmp_path: Path,
-) -> None:
-    router, capture, review, _ = make_router(tmp_path)
-    add_test_entries(capture)
-    started = router._test_service.start()
-    assert started.snapshot is not None
-    with capture.database.connect() as connection:
-        connection.execute(
-            """
-            INSERT INTO review_events (
-                entry_id, review_date, status, prompted_at
-            )
-            VALUES (?, '2026-07-17', 'pending', '2026-07-17T12:00:00Z')
-            """,
-            (started.snapshot.questions[-1].entry.id,),
-        )
-        connection.commit()
-
-    result = asyncio.run(route(router, "daily answer"))
-
-    assert result is not None and "Grade: Correct" in result
-    evaluator = router._evaluation_provider
-    assert evaluator.calls[0][0].display_text == "word-4"
-    current = router._test_service.current().snapshot.current_question
-    assert current is not None and current.position == 1
 
 
-def test_test_show_answer_bypasses_evaluator_and_advances(tmp_path: Path) -> None:
-    evaluator = FakeEvaluationProvider()
-    router, capture, _, _ = make_router(tmp_path, evaluator=evaluator)
-    add_test_entries(capture)
-    router._test_service.start()
-
-    result = asyncio.run(route(router, "show answer"))
-
-    assert result == (
-        "Grade: Incorrect\n"
-        f"Feedback: {SHOW_ANSWER_FEEDBACK}\n\n"
-        "Definition:\nDefinition 0.\n\n"
-        "Example:\nExample 0.\n\n"
-        "Question 2 of 5\n"
-        "What does 'word-1' mean?"
-    )
-    assert evaluator.calls == []
-    snapshot = router._test_service.current().snapshot
-    assert snapshot.summary.incorrect == 1
-    assert snapshot.current_question.position == 2
 
 
-def test_test_evaluator_failure_does_not_advance_or_reveal(tmp_path: Path) -> None:
-    evaluator = FakeEvaluationProvider(
-        EvaluationResult(EvaluationStatus.PROVIDER_ERROR)
-    )
-    router, capture, _, _ = make_router(tmp_path, evaluator=evaluator)
-    add_test_entries(capture)
-    started = router._test_service.start().snapshot
-    question_id = started.current_question.id
-
-    result = asyncio.run(route(router, "attempt"))
-
-    assert result == "I couldn't evaluate that answer. Please try again."
-    assert "Definition 0." not in result
-    current = router._test_service.current().snapshot.current_question
-    assert current.id == question_id
-    assert current.answer_text is None
 
 
-def test_five_test_answers_finish_with_exact_category_totals(
-    tmp_path: Path,
-) -> None:
-    evaluator = FakeEvaluationProvider()
-    router, capture, _, provider = make_router(tmp_path, evaluator=evaluator)
-    add_test_entries(capture)
-    router._test_service.start()
-    grades = [
-        EvaluationGrade.CORRECT,
-        EvaluationGrade.PARTIAL,
-        EvaluationGrade.INCORRECT,
-        EvaluationGrade.CORRECT,
-        EvaluationGrade.PARTIAL,
-    ]
-
-    responses = []
-    for index, grade in enumerate(grades, start=1):
-        evaluator.result = EvaluationResult(
-            EvaluationStatus.VALID,
-            Evaluation(grade, f"Feedback {index}."),
-        )
-        responses.append(asyncio.run(route(router, f"answer {index}")))
-
-    assert all(
-        f"Question {index + 1} of 5" in responses[index - 1]
-        for index in range(1, 5)
-    )
-    assert responses[-1].endswith(
-        "Test complete.\n"
-        "Results: 2 correct, 2 partial, 1 incorrect."
-    )
-    assert router._test_service.current().snapshot is None
-    assert provider.calls == []
-    assert len(evaluator.calls) == 5
 
 
-def test_completed_test_falls_through_to_normal_lookup(tmp_path: Path) -> None:
-    router, capture, _, provider = make_router(tmp_path)
-    add_test_entries(capture)
-    router._test_service.start()
-    for index in range(5):
-        asyncio.run(route(router, f"answer {index}"))
-
-    result = asyncio.run(route(router, "word-0"))
-
-    assert result is not None and result.endswith("Already saved.")
-    assert provider.calls == []
 
 
-def test_test_answer_continuation_is_root_dm_only_and_slash_bypassed(
-    tmp_path: Path,
-) -> None:
-    evaluator = FakeEvaluationProvider()
-    router, capture, _, _ = make_router(tmp_path, evaluator=evaluator)
-    add_test_entries(capture)
-    router._test_service.start()
-
-    assert asyncio.run(route(router, "/test")) is None
-    assert asyncio.run(route(router, "answer", chat_id="elsewhere")) is None
-    assert asyncio.run(route(router, "answer", chat_type="group")) is None
-    assert asyncio.run(route(router, "answer", thread_id="topic")) is None
-    assert asyncio.run(route(router, "answer", platform="discord")) is None
-    assert evaluator.calls == []
-    assert router._test_service.current().snapshot.current_question.position == 1
 
 
 def test_stored_entry_returns_every_sense_without_provider_or_write(tmp_path: Path) -> None:
@@ -849,21 +534,6 @@ def test_batch_storage_failure_returns_exact_copy(tmp_path: Path, monkeypatch) -
     assert provider.calls == ["perfidy"]
 
 
-def test_review_state_failure_is_handled_without_provider(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    router, _, review, provider = make_router(tmp_path)
-
-    def fail_connect():
-        raise sqlite3.OperationalError("private state")
-
-    monkeypatch.setattr(review.database, "connect", fail_connect)
-
-    assert asyncio.run(route(router, "perfidy")) == (
-        "I couldn't check your review. Please try again."
-    )
-    assert provider.calls == []
 
 
 def test_simultaneous_misses_share_one_provider_and_save(tmp_path: Path) -> None:
@@ -913,3 +583,310 @@ def test_cancelled_waiter_does_not_cancel_shared_enrichment(tmp_path: Path) -> N
         assert provider.calls == ["Pro Forma"]
 
     asyncio.run(scenario())
+
+
+def test_failed_prepared_review_intercepts_xanthocroid_without_evaluation_or_capture(
+    tmp_path: Path,
+) -> None:
+    router, capture, review, definition = make_router(tmp_path)
+    prompt = seed_overdue_review_prompt(
+        capture,
+        review,
+        prompt_key="review:failed-delivery",
+    )
+    hook = VocabularyHook(capture, review, CHAT_ID)
+    hook.post_outbound_delivery(
+        receipt=SimpleNamespace(
+            state="failure",
+            destination=f"telegram:{CHAT_ID}",
+            message_ids=(),
+            correlation_id=prompt.prompt_key,
+            cron_run_id=None,
+            content_fingerprint=sha256(prompt.prompt_text.encode()).hexdigest(),
+            error="transport unavailable",
+        )
+    )
+
+    response = asyncio.run(route(router, "Xanthocroid"))
+
+    assert response == (
+        "Review due. Answer this delivered question first:\n\n"
+        "Review 1 of 1 · 1 due\n"
+        "What does 'laconic' mean?\n\n"
+        "Your original message was:\n"
+        "Xanthocroid\n\n"
+        "Complete or exit the study session, then resubmit it."
+    )
+    assert definition.calls == []
+    assert router._evaluation_provider.calls == []
+    assert capture.get_entry("xanthocroid") is None
+    with capture.database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM answer_drafts").fetchone()[0] == 0
+
+    hook.post_outbound_delivery(
+        receipt=SimpleNamespace(
+            state="success",
+            destination=f"telegram:{CHAT_ID}",
+            message_ids=("wrong",),
+            correlation_id=prompt.prompt_key,
+            cron_run_id=None,
+            content_fingerprint="0" * 64,
+            error=None,
+        )
+    )
+    assert review.answerable_prompt() is None
+    hook.post_outbound_delivery(
+        receipt=SimpleNamespace(
+            state="success",
+            destination=f"telegram:{CHAT_ID}",
+            message_ids=("telegram-message-1",),
+            correlation_id=prompt.prompt_key,
+            cron_run_id=None,
+            content_fingerprint=sha256(prompt.prompt_text.encode()).hexdigest(),
+            error=None,
+        )
+    )
+    answer = asyncio.run(route(router, "Using few words."))
+    assert answer is not None and answer.startswith("Grade: Correct")
+    assert router._evaluation_provider.calls[0][1] == "Using few words."
+
+
+def test_unknown_cron_receipt_stays_retryable_and_a_retry_run_promotes_once(
+    tmp_path: Path,
+) -> None:
+    _, capture, review, _ = make_router(tmp_path)
+    prompt = seed_overdue_review_prompt(
+        capture,
+        review,
+        prompt_key="review:unknown-receipt",
+    )
+    hook = VocabularyHook(capture, review, CHAT_ID)
+    fingerprint = sha256(prompt.prompt_text.encode()).hexdigest()
+
+    assert hook.prepare_outbound(
+        prompt_id=prompt.id,
+        identity="cron-run-1",
+        text=prompt.prompt_text,
+    )
+    hook.post_outbound_delivery(
+        receipt=cron_receipt(
+            "unknown",
+            "cron-run-1",
+            fingerprint,
+            error="telegram timed out",
+        )
+    )
+
+    assert review.answerable_prompt() is None
+    assert review.due_but_not_answerable() is True
+
+    hook.post_outbound_delivery(
+        receipt=cron_receipt(
+            "success",
+            "cron-run-1",
+            fingerprint,
+            message_ids=("late-message",),
+        )
+    )
+
+    assert review.answerable_prompt() is None
+
+    assert hook.prepare_outbound(
+        prompt_id=prompt.id,
+        identity="cron-run-2",
+        text=prompt.prompt_text,
+    )
+    for _ in range(2):
+        hook.post_outbound_delivery(
+            receipt=cron_receipt(
+                "success",
+                "cron-run-2",
+                fingerprint,
+                message_ids=("telegram-message-9",),
+            )
+        )
+
+    answerable = review.answerable_prompt()
+    assert answerable is not None and answerable.id == prompt.id
+    with capture.database.connect() as connection:
+        attempts = connection.execute(
+            """
+            SELECT status, outbound_delivery_id, receipt_at IS NOT NULL
+            FROM prompt_delivery_attempts
+            WHERE prompt_id = ? ORDER BY attempt_number
+            """,
+            (prompt.id,),
+        ).fetchall()
+    assert [tuple(row) for row in attempts] == [
+        ("unknown", "cron-run-1", 0),
+        ("unknown", "cron-run-1", 1),
+        ("unknown", "cron-run-2", 0),
+        ("delivered", "telegram-message-9", 1),
+    ]
+
+
+def test_good_is_a_rating_only_while_awaiting_rating(tmp_path: Path) -> None:
+    evaluator = FakeEvaluationProvider()
+    router, capture, review, _ = make_router(tmp_path, evaluator=evaluator)
+    prompt = seed_overdue_review_prompt(
+        capture,
+        review,
+        prompt_key="review:rating-token",
+    )
+    assert review.record_delivery(
+        prompt.id,
+        delivery_id="telegram-message-1",
+        content_fingerprint=sha256(prompt.prompt_text.encode()).hexdigest(),
+    ) is not None
+
+    answered = asyncio.run(route(router, "good"))
+
+    assert evaluator.calls == [(evaluator.calls[0][0], "good")]
+    assert evaluator.calls[0][0].display_text == "laconic"
+    assert answered is not None and answered.startswith("Grade: Correct")
+    awaiting = review.awaiting_rating()
+    assert awaiting is not None and awaiting.id == prompt.id
+    with capture.database.connect() as connection:
+        assert connection.execute(
+            "SELECT submitted_answer FROM answer_drafts WHERE prompt_id = ?",
+            (prompt.id,),
+        ).fetchone()[0] == "good"
+
+    rated = asyncio.run(route(router, "good"))
+
+    assert rated is not None and not rated.startswith("Send one of the listed")
+    assert len(evaluator.calls) == 1
+    assert review.awaiting_rating() is None
+    with capture.database.connect() as connection:
+        assert connection.execute(
+            "SELECT rating FROM review_attempts"
+        ).fetchone()[0] == "good"
+
+
+def test_concurrent_delivery_receipts_promote_one_prompt_once(tmp_path: Path) -> None:
+    _, capture, review, _ = make_router(tmp_path)
+    prompt = seed_overdue_review_prompt(
+        capture,
+        review,
+        prompt_key="review:concurrent-receipt",
+    )
+    hook = VocabularyHook(capture, review, CHAT_ID)
+    fingerprint = sha256(prompt.prompt_text.encode()).hexdigest()
+    assert hook.prepare_outbound(
+        prompt_id=prompt.id,
+        identity="cron-run-1",
+        text=prompt.prompt_text,
+    )
+    start = threading.Barrier(2)
+
+    def deliver() -> None:
+        start.wait(timeout=10)
+        hook.post_outbound_delivery(
+            receipt=cron_receipt(
+                "success",
+                "cron-run-1",
+                fingerprint,
+                message_ids=("telegram-message-1",),
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for future in [pool.submit(deliver), pool.submit(deliver)]:
+            future.result(timeout=30)
+
+    answerable = review.answerable_prompt()
+    assert answerable is not None and answerable.id == prompt.id
+    with capture.database.connect() as connection:
+        attempts = connection.execute(
+            """
+            SELECT status, COUNT(*) FROM prompt_delivery_attempts
+            WHERE prompt_id = ? GROUP BY status ORDER BY status
+            """,
+            (prompt.id,),
+        ).fetchall()
+    assert [tuple(row) for row in attempts] == [("delivered", 1), ("unknown", 1)]
+
+
+def test_concurrent_inbound_answers_persist_one_draft(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        evaluator = BlockingEvaluationProvider()
+        router, capture, review, _ = make_router(tmp_path, evaluator=evaluator)
+        prompt = seed_overdue_review_prompt(
+            capture,
+            review,
+            prompt_key="review:concurrent-answer",
+        )
+        assert review.record_delivery(
+            prompt.id,
+            delivery_id="telegram-message-1",
+            content_fingerprint=sha256(prompt.prompt_text.encode()).hexdigest(),
+        ) is not None
+
+        first = asyncio.create_task(route(router, "Using few words."))
+        second = asyncio.create_task(route(router, "Terse and sparing."))
+        await evaluator.both_started.wait()
+        evaluator.release.set()
+        results = await asyncio.gather(first, second)
+
+        assert [call[1] for call in evaluator.calls] == [
+            "Using few words.",
+            "Terse and sparing.",
+        ]
+        assert all(
+            result is not None and result.startswith("Grade: Correct")
+            for result in results
+        )
+        awaiting = review.awaiting_rating()
+        assert awaiting is not None and awaiting.id == prompt.id
+        with capture.database.connect() as connection:
+            drafts = connection.execute(
+                "SELECT submitted_answer FROM answer_drafts"
+            ).fetchall()
+        assert [row[0] for row in drafts] == ["Using few words."]
+
+    asyncio.run(scenario())
+
+
+def test_interactive_prompt_identity_promotes_after_an_unknown_receipt(
+    tmp_path: Path,
+) -> None:
+    _, capture, review, _ = make_router(tmp_path)
+    prompt = seed_overdue_review_prompt(
+        capture,
+        review,
+        prompt_key="review:interactive-retry",
+    )
+    hook = VocabularyHook(capture, review, CHAT_ID)
+    fingerprint = sha256(prompt.prompt_text.encode()).hexdigest()
+    assert hook.prepare_outbound(
+        prompt_id=prompt.id,
+        identity=prompt.prompt_key,
+        text=prompt.prompt_text,
+    )
+    hook.post_outbound_delivery(
+        receipt=interactive_receipt(
+            "unknown",
+            prompt.prompt_key,
+            fingerprint,
+            error="telegram timed out",
+        )
+    )
+
+    assert review.answerable_prompt() is None
+
+    assert hook.prepare_outbound(
+        prompt_id=prompt.id,
+        identity=prompt.prompt_key,
+        text=prompt.prompt_text,
+    )
+    hook.post_outbound_delivery(
+        receipt=interactive_receipt(
+            "success",
+            prompt.prompt_key,
+            fingerprint,
+            message_ids=("telegram-message-2",),
+        )
+    )
+
+    answerable = review.answerable_prompt()
+    assert answerable is not None and answerable.id == prompt.id

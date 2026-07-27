@@ -1,239 +1,327 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
-from datetime import UTC, date, datetime
+from collections.abc import Sequence
+from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from hermes_vocab.capture import CaptureService
 from hermes_vocab.database import Database
-from hermes_vocab.formatting import format_daily_review, format_review_completion
+from hermes_vocab.hermes_plugin.hooks import VocabularyHook
 from hermes_vocab.models import (
     CaptureCommand,
     CaptureOperation,
-    EvaluationGrade,
-    ReviewCompletionResult,
-    ReviewCompletionStatus,
-    ReviewEvent,
-    ReviewPromptResult,
-    ReviewPromptStatus,
     SenseCard,
-    VocabularySense,
-    VocabularyEntry,
 )
-from hermes_vocab.test_session import TestSessionService as VocabularyTestSessionService
+from hermes_vocab.migrations.v005_backfill import backfill_v5
+from hermes_vocab.review import ReviewService
 
-
-FIRST_SENSE = VocabularySense(
-    id=1,
-    entry_id=1,
-    definition="Using very few words.",
-    part_of_speech="adjective",
-    example_sentence="His laconic reply ended the discussion.",
-    source_context=None,
-    date_added=datetime(2026, 7, 1, tzinfo=UTC),
-)
-WORD = VocabularyEntry(
-    id=1,
-    display_text="laconic",
-    normalized_text="laconic",
-    date_added=datetime(2026, 7, 1, tzinfo=UTC),
-    last_reviewed=None,
-    review_status="new",
-    senses=(FIRST_SENSE,),
-)
-EVENT = ReviewEvent(
-    id=1,
-    entry_id=1,
-    review_date=date(2026, 7, 16),
-    status="pending",
-    prompted_at=datetime(2026, 7, 16, 12, tzinfo=UTC),
-    answered_at=None,
-    answer_text=None,
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+HERMES_ROOT = Path.home() / ".hermes" / "hermes-agent"
+CHAT_ID = "7747352551"
+PROMPT_PATTERN = re.compile(
+    r"^Review (\d+) of (\d+) · (\d+) due\nWhat does '(.+)' mean\?\n$"
 )
 
 
-def test_pending_review_outputs_exact_question() -> None:
-    assert format_daily_review(
-        ReviewPromptResult(ReviewPromptStatus.PENDING, EVENT, WORD)
-    ) == "What does 'laconic' mean?"
-
-
-def test_answered_same_day_outputs_nothing() -> None:
-    assert format_daily_review(
-        ReviewPromptResult(ReviewPromptStatus.ALREADY_COMPLETED, EVENT, WORD)
-    ) == ""
-
-
-def test_active_test_outputs_nothing() -> None:
-    assert format_daily_review(
-        ReviewPromptResult(ReviewPromptStatus.TEST_ACTIVE)
-    ) == ""
-
-
-def test_empty_library_outputs_capture_first_guidance() -> None:
-    assert format_daily_review(ReviewPromptResult(ReviewPromptStatus.EMPTY)) == (
-        "Save a word first, then I'll have something to review."
-    )
-
-
-def test_one_sense_completion_is_grade_first_before_canonical_reveal() -> None:
-    text = format_review_completion(
-        ReviewCompletionResult(
-            ReviewCompletionStatus.COMPLETED,
-            entry=WORD,
-            answer_text="show answer",
-            grade=EvaluationGrade.INCORRECT,
-            feedback="You chose to reveal the answer.",
-        )
-    )
-
-    assert text == (
-        "Grade: Incorrect\n"
-        "Feedback: You chose to reveal the answer.\n\n"
-        "Definition:\nUsing very few words.\n\n"
-        "Example:\nHis laconic reply ended the discussion."
-    )
-
-
-def test_multi_sense_completion_numbers_every_sense_in_capture_order() -> None:
-    second_sense = VocabularySense(
-        id=2,
-        entry_id=1,
-        definition="Land alongside a river.",
-        part_of_speech="noun",
-        example_sentence="They rested on the grassy bank.",
-        source_context="They rested beside the river.",
-        date_added=datetime(2026, 7, 2, tzinfo=UTC),
-    )
-    bank = VocabularyEntry(
-        id=1,
-        display_text="bank",
-        normalized_text="bank",
-        date_added=datetime(2026, 7, 1, tzinfo=UTC),
-        last_reviewed=None,
-        review_status="new",
-        senses=(
-            VocabularySense(
-                id=1,
-                entry_id=1,
-                definition="A financial institution.",
-                part_of_speech="noun",
-                example_sentence="She deposited the cheque at the bank.",
-                source_context=None,
-                date_added=datetime(2026, 7, 1, tzinfo=UTC),
-            ),
-            second_sense,
-        ),
-    )
-
-    text = format_review_completion(
-        ReviewCompletionResult(
-            ReviewCompletionStatus.COMPLETED,
-            entry=bank,
-            answer_text="a partly correct answer",
-            grade=EvaluationGrade.PARTIAL,
-            feedback="You identified only one sense.",
-        )
-    )
-
-    assert text == (
-        "Grade: Partial\n"
-        "Feedback: You identified only one sense.\n\n"
-        "1. noun — A financial institution.\n"
-        "   Example: She deposited the cheque at the bank.\n\n"
-        "2. noun — Land alongside a river.\n"
-        "   Example: They rested on the grassy bank."
-    )
-
-
-def test_daily_script_prints_question_from_configured_database(tmp_path: Path) -> None:
-    path = tmp_path / "data" / "vocabulary.sqlite3"
-    database = Database(path)
-    database.initialize()
-    CaptureService(database).capture(
-        CaptureCommand(
-            display_text="laconic",
-            operation=CaptureOperation.NEW_ENTRY,
-            card=SenseCard(
-                part_of_speech="adjective",
-                definition="Using very few words.",
-                example_sentence="His laconic reply ended the discussion.",
-            ),
-        )
-    )
-    environment = {
-        **os.environ,
-        "HERMES_VOCAB_DB": str(path),
-        "HERMES_TIMEZONE": "UTC",
-    }
-
-    completed = subprocess.run(
-        [sys.executable, "scripts/daily_review.py"],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
-    )
-
-    assert completed.returncode == 0
-    assert completed.stdout == "What does 'laconic' mean?\n"
-    assert completed.stderr == ""
-
-    repeated = subprocess.run(
-        [sys.executable, "scripts/daily_review.py"],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
-    )
-    assert repeated.returncode == 0
-    assert repeated.stdout == "What does 'laconic' mean?\n"
-    assert repeated.stderr == ""
-    with database.connect() as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM review_events"
-        ).fetchone()[0] == 1
-
-
-def test_daily_script_is_silent_and_creates_no_event_during_active_test(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "data" / "vocabulary.sqlite3"
+def seed_cards(path: Path, words: Sequence[str]) -> Database:
+    """Capture one forward card per word and project v5 scheduling state."""
     database = Database(path)
     database.initialize()
     capture = CaptureService(database)
-    for index in range(5):
+    for word in words:
         capture.capture(
             CaptureCommand(
-                display_text=f"word-{index}",
+                display_text=word,
                 operation=CaptureOperation.NEW_ENTRY,
                 card=SenseCard(
-                    part_of_speech="noun",
-                    definition=f"Definition {index}.",
-                    example_sentence=f"Example {index}.",
+                    part_of_speech="adjective",
+                    definition=f"The quality of being {word}.",
+                    example_sentence=f"His {word} reply ended the discussion.",
                 ),
             )
         )
-    started = VocabularyTestSessionService(database).start()
+    with database.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        backfill_v5(connection)
+        connection.commit()
+    return database
 
-    completed = subprocess.run(
+
+def make_overdue(database: Database, words: Sequence[str], due_at: str) -> None:
+    with database.connect() as connection:
+        for word in words:
+            connection.execute(
+                """
+                UPDATE vocabulary_cards
+                SET state = 'review', stability = 2.0, difficulty = 5.0,
+                    due_at = ?, effective_due_at = ?, last_review_at = ?,
+                    repetitions = 1, lapses = 0
+                WHERE direction = 'forward' AND entry_id = (
+                    SELECT id FROM vocabulary_entries WHERE display_text = ?
+                )
+                """,
+                (due_at, due_at, due_at, word),
+            )
+        connection.commit()
+
+
+def fixed_offset_timezone(local_hour: int) -> str:
+    """Return an IANA fixed-offset zone whose current local hour is exact."""
+    offset = (local_hour - datetime.now(UTC).hour) % 24
+    if offset > 14:
+        offset -= 24
+    return f"Etc/GMT-{offset}" if offset >= 0 else f"Etc/GMT+{-offset}"
+
+
+def run_cron(
+    path: Path,
+    *,
+    run_id: str | None = "cron-run-1",
+    review_hour: str = "0",
+    timezone: str = "UTC",
+    chat_id: str | None = CHAT_ID,
+    python_path: Sequence[str] = (),
+) -> subprocess.CompletedProcess[str]:
+    environment = {
+        **os.environ,
+        "HERMES_VOCAB_DB": str(path),
+        "HERMES_TIMEZONE": timezone,
+        "HERMES_VOCAB_REVIEW_HOUR": review_hour,
+        "PYTHONPATH": os.pathsep.join(
+            (
+                *python_path,
+                str(PROJECT_ROOT / "src"),
+                str(HERMES_ROOT),
+                os.environ.get("PYTHONPATH", ""),
+            )
+        ),
+    }
+    if chat_id is None:
+        environment.pop("HERMES_VOCAB_TELEGRAM_CHAT_ID", None)
+    else:
+        environment["HERMES_VOCAB_TELEGRAM_CHAT_ID"] = chat_id
+    if run_id is None:
+        environment.pop("HERMES_CRON_RUN_ID", None)
+    else:
+        environment["HERMES_CRON_RUN_ID"] = run_id
+    return subprocess.run(
         [sys.executable, "scripts/daily_review.py"],
+        cwd=PROJECT_ROOT,
         check=False,
         capture_output=True,
         text=True,
-        env={
-            **os.environ,
-            "HERMES_VOCAB_DB": str(path),
-            "HERMES_TIMEZONE": "UTC",
-        },
+        env=environment,
+    )
+
+
+def study_state_counts(database: Database) -> tuple[int, int, int]:
+    with database.connect() as connection:
+        return tuple(
+            connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("study_sessions", "study_prompts", "study_queue")
+        )
+
+
+def test_cron_prepares_one_correlated_prompt_without_marking_it_delivered(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "data" / "vocabulary.sqlite3"
+    database = seed_cards(path, ["laconic"])
+
+    completed = run_cron(path)
+
+    assert completed.returncode == 0
+    assert completed.stdout.startswith("Review 1 of ")
+    assert completed.stdout.endswith("What does 'laconic' mean?\n")
+    assert completed.stderr == ""
+    with database.connect() as connection:
+        prompt = connection.execute(
+            "SELECT id, status FROM study_prompts"
+        ).fetchone()
+        assert prompt is not None and prompt["status"] == "prepared"
+        attempt = connection.execute(
+            """
+            SELECT status, outbound_delivery_id
+            FROM prompt_delivery_attempts WHERE prompt_id = ?
+            """,
+            (prompt["id"],),
+        ).fetchone()
+        assert tuple(attempt) == ("unknown", "cron-run-1")
+
+
+def test_cron_backlog_emits_one_counted_prompt_then_stays_silent(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "data" / "vocabulary.sqlite3"
+    overdue = ["laconic", "perfidy", "obdurate"]
+    database = seed_cards(path, [*overdue, *(f"word-{index}" for index in range(5))])
+    make_overdue(database, overdue, "2026-01-05T12:00:00Z")
+
+    first = run_cron(path, run_id="cron-run-1")
+
+    assert first.returncode == 0
+    assert first.stderr == ""
+    match = PROMPT_PATTERN.match(first.stdout)
+    assert match is not None, first.stdout
+    assert (match.group(1), match.group(2), match.group(3)) == ("1", "8", "8")
+    assert match.group(4) in overdue
+
+    second = run_cron(path, run_id="cron-run-2")
+
+    assert second.returncode == 0
+    assert second.stdout == ""
+    assert second.stderr == ""
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*), MIN(status) FROM study_prompts"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT status FROM study_prompts"
+        ).fetchone()[0] == "prepared"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM prompt_delivery_attempts"
+        ).fetchone()[0] == 1
+
+
+def test_cron_before_review_hour_writes_nothing_without_older_backlog(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "data" / "vocabulary.sqlite3"
+    database = seed_cards(path, [f"word-{index}" for index in range(5)])
+
+    completed = run_cron(
+        path,
+        review_hour="12",
+        timezone=fixed_offset_timezone(3),
     )
 
     assert completed.returncode == 0
     assert completed.stdout == ""
     assert completed.stderr == ""
+    assert study_state_counts(database) == (0, 0, 0)
     with database.connect() as connection:
         assert connection.execute(
-            "SELECT COUNT(*) FROM review_events"
+            "SELECT COUNT(*) FROM prompt_delivery_attempts"
         ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM vocabulary_cards WHERE introduced_local_date IS NOT NULL"
+        ).fetchone()[0] == 0
+
+
+def test_cron_before_review_hour_catches_up_on_older_backlog(tmp_path: Path) -> None:
+    path = tmp_path / "data" / "vocabulary.sqlite3"
+    database = seed_cards(
+        path,
+        ["laconic", *(f"word-{index}" for index in range(5))],
+    )
+    make_overdue(database, ["laconic"], "2020-01-01T00:00:00Z")
+
+    completed = run_cron(
+        path,
+        review_hour="12",
+        timezone=fixed_offset_timezone(3),
+    )
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    match = PROMPT_PATTERN.match(completed.stdout)
+    assert match is not None, completed.stdout
+    assert match.group(1) == "1"
+    assert match.group(4) == "laconic"
+    sessions, prompts, _ = study_state_counts(database)
+    assert (sessions, prompts) == (1, 1)
+
+
+def incompatible_hermes(tmp_path: Path) -> str:
+    """Return a sys.path root whose hermes_cli lacks the receipt contract."""
+    package = tmp_path / "incompatible" / "hermes_cli"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "plugin_contracts.py").write_text(
+        "OutboundResponse = object\nPluginCommandSource = object\n",
+        encoding="utf-8",
+    )
+    return str(package.parent)
+
+
+def test_cron_fails_closed_when_hermes_lacks_the_receipt_contract(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "data" / "vocabulary.sqlite3"
+    database = seed_cards(path, ["laconic"])
+
+    completed = run_cron(path, python_path=(incompatible_hermes(tmp_path),))
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr.startswith("Vocabulary cron configuration error:")
+    assert "OutboundDeliveryReceipt" in completed.stderr
+    assert study_state_counts(database) == (0, 0, 0)
+
+
+def test_cron_fails_closed_without_hermes_run_correlation(tmp_path: Path) -> None:
+    path = tmp_path / "data" / "vocabulary.sqlite3"
+    database = seed_cards(path, ["laconic"])
+
+    completed = run_cron(path, run_id=None)
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr.strip() == (
+        "Vocabulary cron configuration error: Delivery-safe cron requires "
+        "Telegram chat and Hermes run identity"
+    )
+    assert study_state_counts(database) == (0, 0, 0)
+
+
+def test_cron_retries_the_same_prompt_after_a_failed_delivery_receipt(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "data" / "vocabulary.sqlite3"
+    database = seed_cards(path, ["laconic"])
+
+    first = run_cron(path, run_id="cron-run-1")
+
+    assert PROMPT_PATTERN.match(first.stdout) is not None, first.stdout
+    prompt_text = first.stdout.rstrip("\n")
+    review = ReviewService(database, ZoneInfo("UTC"))
+    hook = VocabularyHook(CaptureService(database), review, int(CHAT_ID))
+    hook.post_outbound_delivery(
+        receipt=SimpleNamespace(
+            state="failure",
+            destination=f"telegram:{CHAT_ID}",
+            message_ids=(),
+            correlation_id=None,
+            cron_run_id="cron-run-1",
+            content_fingerprint=sha256(prompt_text.encode()).hexdigest(),
+            error="transport unavailable",
+        )
+    )
+    assert review.answerable_prompt() is None
+
+    second = run_cron(path, run_id="cron-run-2")
+
+    assert second.returncode == 0
+    assert second.stdout == first.stdout
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM study_prompts"
+        ).fetchone()[0] == 1
+        attempts = connection.execute(
+            """
+            SELECT status, outbound_delivery_id
+            FROM prompt_delivery_attempts ORDER BY id
+            """
+        ).fetchall()
+    assert [tuple(row) for row in attempts] == [
+        ("unknown", "cron-run-1"),
+        ("failed", "cron-run-1"),
+        ("unknown", "cron-run-2"),
+    ]

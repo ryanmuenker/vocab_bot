@@ -7,16 +7,55 @@ import sys
 import types
 from dataclasses import dataclass
 from unittest.mock import AsyncMock, Mock
-from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from hermes_vocab.capture import MAX_SOURCE_CONTEXT_LENGTH
 from hermes_vocab.database import Database
-from hermes_vocab.config import Settings
-from hermes_vocab.formatting import format_daily_review, format_entry
+from hermes_vocab.config import ConfigurationError, Settings
+from hermes_vocab.formatting import format_entry
 from hermes_vocab.hermes_plugin import register
-from hermes_vocab.models import ReviewPromptStatus
-from hermes_vocab.review import PendingReviewStatus, ReviewService
+from hermes_vocab.migrations.v005_backfill import backfill_v5
+from hermes_vocab.review import ReviewService
+
+@dataclass(frozen=True)
+class PluginCommandSource:
+    authenticated: bool
+    platform: str
+    chat_id: str
+    chat_type: str
+    thread_id: str | None
+    sender_id: str | None = None
+
+
+@dataclass(frozen=True)
+class OutboundResponse:
+    text: str
+    correlation_id: str
+
+
+@dataclass(frozen=True)
+class GatewayInterceptResponse:
+    text: str
+    correlation_id: str | None = None
+
+
+SOURCE_ERROR = (
+    "Vocabulary study is available only in the configured Telegram root DM."
+)
+
+
+def root_command_source() -> PluginCommandSource:
+    return PluginCommandSource(
+        authenticated=True,
+        platform="telegram",
+        chat_id="7747352551",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+# Names Hermes' own command registry owns; plugin registrations never win.
+RESERVED_COMMAND_NAMES = frozenset({"exit", "quit", "stop", "help", "status"})
 
 
 class FakeContext:
@@ -31,6 +70,7 @@ class FakeContext:
         self.commands: dict[str, object] = {}
         self.command_descriptions: dict[str, str] = {}
         self.command_args_hints: dict[str, str] = {}
+        self.command_source_aware: dict[str, bool] = {}
 
     def register_tool(
         self, *, name, toolset, schema, handler, is_async: bool = False
@@ -46,10 +86,18 @@ class FakeContext:
         handler,
         description: str = "",
         args_hint: str = "",
+        source_aware: bool = False,
     ) -> None:
+        # Hermes reserves its built-in command names; a plugin that claims one
+        # is silently dropped at runtime, so refuse it here too.
+        if name in RESERVED_COMMAND_NAMES:
+            raise AssertionError(
+                f"/{name} collides with a Hermes built-in command"
+            )
         self.commands[name] = handler
         self.command_descriptions[name] = description
         self.command_args_hints[name] = args_hint
+        self.command_source_aware[name] = source_aware
 
     def register_hook(self, name, callback) -> None:
         self.hooks[name] = callback
@@ -85,11 +133,22 @@ def install_auxiliary_client(monkeypatch, response: str) -> AsyncMock:
     return call_llm
 
 
+VALID_HOOKS = frozenset(
+    {
+        "pre_llm_call",
+        "gateway_inbound_intercept",
+        "post_outbound_delivery",
+    }
+)
+
+
 def register_plugin(
     monkeypatch,
     tmp_path: Path,
     *,
     chat_id: int | None = None,
+    valid_hooks: frozenset[str] = VALID_HOOKS,
+    omit_contracts: tuple[str, ...] = (),
 ) -> tuple[FakeContext, Path]:
     path = tmp_path / "data" / "vocabulary.sqlite3"
     monkeypatch.setenv("HERMES_VOCAB_DB", str(path))
@@ -98,6 +157,19 @@ def register_plugin(
         monkeypatch.delenv("HERMES_VOCAB_TELEGRAM_CHAT_ID", raising=False)
     else:
         monkeypatch.setenv("HERMES_VOCAB_TELEGRAM_CHAT_ID", str(chat_id))
+    contracts = types.ModuleType("hermes_cli.plugin_contracts")
+    contracts.PluginCommandSource = PluginCommandSource
+    contracts.OutboundResponse = OutboundResponse
+    contracts.GatewayInterceptResponse = GatewayInterceptResponse
+    for name in omit_contracts:
+        delattr(contracts, name)
+    plugins = types.ModuleType("hermes_cli.plugins")
+    plugins.VALID_HOOKS = set(valid_hooks)
+    plugins.GatewayInterceptResponse = GatewayInterceptResponse
+    hermes_cli = types.ModuleType("hermes_cli")
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugin_contracts", contracts)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins)
     context = FakeContext()
     register(context)
     return context, path
@@ -127,6 +199,7 @@ def save_args(
         args.update(
             {
                 "part_of_speech": "noun",
+
                 "definition": definition,
                 "example_sentence": "She visited the bank.",
             }
@@ -137,6 +210,91 @@ def save_args(
         args["matching_sense_id"] = matching_sense_id
     return args
 
+def test_review_command_is_source_aware_and_mutates_only_configured_root_dm(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    context, path = register_plugin(monkeypatch, tmp_path, chat_id=7747352551)
+    for index in range(2):
+        context.tools["vocabulary_save_card"](
+            {
+                "display_text": f"word-{index}",
+                "operation": "new_entry",
+                "part_of_speech": "noun",
+                "definition": f"Definition {index}.",
+                "example_sentence": f"Example {index}.",
+            }
+        )
+    with Database(path).connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        backfill_v5(connection)
+        connection.commit()
+    unauthorized = {
+        "cli": PluginCommandSource(
+            authenticated=True,
+            platform="cli",
+            chat_id="7747352551",
+            chat_type="dm",
+            thread_id=None,
+        ),
+        "other telegram chat": PluginCommandSource(
+            authenticated=True,
+            platform="telegram",
+            chat_id="1",
+            chat_type="dm",
+            thread_id=None,
+        ),
+        "group chat": PluginCommandSource(
+            authenticated=True,
+            platform="telegram",
+            chat_id="7747352551",
+            chat_type="group",
+            thread_id=None,
+        ),
+        "forum thread": PluginCommandSource(
+            authenticated=True,
+            platform="telegram",
+            chat_id="7747352551",
+            chat_type="dm",
+            thread_id="topic-7",
+        ),
+        "unauthenticated root dm": PluginCommandSource(
+            authenticated=False,
+            platform="telegram",
+            chat_id="7747352551",
+            chat_type="dm",
+            thread_id=None,
+        ),
+    }
+    root = root_command_source()
+
+    for label, source in unauthorized.items():
+        assert context.commands["review"]("", source=source) == SOURCE_ERROR, label
+        assert context.commands["test"]("forward", source=source) == SOURCE_ERROR, label
+    with Database(path).connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM study_sessions").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM study_prompts").fetchone()[0] == 0
+    started = context.commands["review"]("", source=root)
+
+    assert context.command_source_aware["review"] is True
+    assert context.command_source_aware["test"] is True
+    assert "post_outbound_delivery" in context.hooks
+    assert isinstance(started, OutboundResponse)
+    assert started.text.startswith("Review 1 of ")
+    assert started.correlation_id.startswith("review:")
+
+    for label, source in unauthorized.items():
+        assert context.commands["review"]("", source=source) == SOURCE_ERROR, label
+        assert context.commands["test"]("forward", source=source) == SOURCE_ERROR, label
+    resumed = context.commands["review"]("", source=root)
+
+    assert isinstance(resumed, OutboundResponse)
+    assert resumed.correlation_id == started.correlation_id
+    with Database(path).connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM study_sessions").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM study_prompts").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM answer_drafts").fetchone()[0] == 0
+
 
 def test_registration_exposes_tools_hook_skill_and_auxiliary_task(
     monkeypatch,
@@ -144,7 +302,7 @@ def test_registration_exposes_tools_hook_skill_and_auxiliary_task(
 ) -> None:
     context, _ = register_plugin(monkeypatch, tmp_path)
 
-    assert set(context.tools) == {"vocabulary_save_card", "vocabulary_complete_review"}
+    assert set(context.tools) == {"vocabulary_save_card", "vocabulary_continue_study"}
     assert context.commands == {}
     assert set(context.hooks) == {"pre_llm_call"}
     assert set(context.skills) == {"vocabulary"}
@@ -163,15 +321,15 @@ def test_registration_exposes_tools_hook_skill_and_auxiliary_task(
     assert context.skills["vocabulary"].name == "SKILL.md"
     assert context.toolsets == {
         "vocabulary_save_card": "vocabulary",
-        "vocabulary_complete_review": "vocabulary",
+        "vocabulary_continue_study": "vocabulary",
     }
     assert context.tool_is_async == {
         "vocabulary_save_card": False,
-        "vocabulary_complete_review": True,
+        "vocabulary_continue_study": True,
     }
-    assert "Do not grade" not in context.tool_schemas[
-        "vocabulary_complete_review"
-    ]["description"]
+    continue_schema = context.tool_schemas["vocabulary_continue_study"]
+    assert "currently delivered study prompt" in continue_schema["description"]
+    assert continue_schema["parameters"]["required"] == ["answer_text"]
     save_schema = context.tool_schemas["vocabulary_save_card"]["parameters"]
     assert save_schema["required"] == ["display_text", "operation"]
     assert save_schema["properties"]["operation"] == {
@@ -181,47 +339,76 @@ def test_registration_exposes_tools_hook_skill_and_auxiliary_task(
     assert save_schema["properties"]["source_context"] == {"type": "string"}
     assert save_schema["properties"]["matching_sense_id"] == {"type": "integer"}
 
+def test_generic_study_tool_uses_shared_no_active_contract(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    context, _ = register_plugin(monkeypatch, tmp_path)
 
-def test_configured_chat_registers_supported_parameterless_test_command(
+    payload = json.loads(
+        asyncio.run(
+            context.tools["vocabulary_continue_study"](
+                {"answer_text": "an answer"}
+            )
+        )
+    )
+
+    assert payload == {
+        "status": "no_active",
+        "allowed_ratings": [],
+        "text": "There isn't a delivered study prompt waiting.",
+    }
+
+
+def test_directional_test_registration_advertises_explicit_modes(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
     context, _ = register_plugin(monkeypatch, tmp_path, chat_id=7747352551)
 
-    assert set(context.commands) == {"test"}
-    assert context.command_descriptions == {
-        "test": "Start or resume a five-word vocabulary test"
-    }
-    assert context.command_args_hints == {"test": ""}
-    assert set(context.hooks) == {"pre_llm_call", "gateway_inbound_intercept"}
+    assert context.command_descriptions["test"] == (
+        "Start or resume a five-card directional vocabulary test"
+    )
+    assert context.command_args_hints["test"] == "forward|reverse"
 
 
-def test_test_command_rejects_arguments_and_insufficient_library_without_rows(
+
+def test_directional_test_command_matrix_keeps_bare_and_invalid_inputs_pure(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
     context, path = register_plugin(monkeypatch, tmp_path, chat_id=7747352551)
-    for index in range(4):
-        context.tools["vocabulary_save_card"](
-            save_args(
-                "new_entry",
-                display_text=f"word-{index}",
-                definition=f"Definition {index}.",
-            )
-        )
 
-    assert context.commands["test"]("restart") == "Usage: /test"
-    assert context.commands["test"]("") == (
-        "You have 4 saved entries. Save 1 more to start a 5-word test."
+    usage = (
+        "Usage: /test forward|reverse\n"
+        "Forward: recall each saved meaning from its word.\n"
+        "Reverse: recall the saved word from one exact definition."
     )
+    assert context.commands["test"]("", source=root_command_source()) == usage
+    assert context.commands["test"]("   ", source=root_command_source()) == usage
+    assert context.commands["test"]("sideways", source=root_command_source()) == usage
+    assert context.commands["test"]("forward now", source=root_command_source()) == usage
     with Database(path).connect() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM test_sessions").fetchone()[0] == 0
-        assert connection.execute("SELECT COUNT(*) FROM test_questions").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM study_sessions").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM study_queue").fetchone()[0] == 0
 
 
-def test_test_command_starts_resumes_and_obeys_daily_review_conflict(
+@pytest.mark.parametrize(
+    ("argument", "expected_question"),
+    [
+        ("forward", "Question 1 of 5\nWhat does 'word-0' mean?"),
+        (
+            "reverse",
+            "Question 1 of 5\nWhich saved word matches this definition?\n"
+            "Definition 0.",
+        ),
+    ],
+)
+def test_explicit_directional_test_command_starts_and_resumes_v5_queue(
     monkeypatch,
     tmp_path: Path,
+    argument: str,
+    expected_question: str,
 ) -> None:
     context, path = register_plugin(monkeypatch, tmp_path, chat_id=7747352551)
     for index in range(5):
@@ -232,38 +419,227 @@ def test_test_command_starts_resumes_and_obeys_daily_review_conflict(
                 definition=f"Definition {index}.",
             )
         )
-
-    first = context.commands["test"]("")
-    duplicate = context.commands["test"]("   ")
-
-    assert first == "Question 1 of 5\nWhat does 'word-0' mean?"
-    assert duplicate == first
     with Database(path).connect() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM test_sessions").fetchone()[0] == 1
-        assert connection.execute("SELECT COUNT(*) FROM test_questions").fetchone()[0] == 5
+        connection.execute("BEGIN IMMEDIATE")
+        backfill_v5(connection)
+        connection.commit()
 
-    other_context, other_path = register_plugin(
+    first = context.commands["test"](argument, source=root_command_source())
+    duplicate = context.commands["test"](f"  {argument}  ", source=root_command_source())
+
+    assert first.text == expected_question
+    assert duplicate.text == expected_question
+    with Database(path).connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM study_sessions").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM study_queue").fetchone()[0] == 5
+        assert connection.execute(
+            "SELECT mode FROM study_sessions"
+        ).fetchone()[0] == f"test_{argument}"
+        assert connection.execute(
+            "SELECT status FROM study_prompts"
+        ).fetchone()[0] == "prepared"
+
+@pytest.mark.parametrize(
+    ("argument", "answer", "next_question"),
+    [
+        (
+            "forward",
+            "first answer",
+            "Question 2 of 5\nWhat does 'word-1' mean?",
+        ),
+        (
+            "reverse",
+            "word-0",
+            "Question 2 of 5\nWhich saved word matches this definition?\n"
+            "Definition 1.",
+        ),
+    ],
+)
+def test_directional_rating_returns_schedule_then_prepared_next_question(
+    monkeypatch,
+    tmp_path: Path,
+    argument: str,
+    answer: str,
+    next_question: str,
+) -> None:
+    install_auxiliary_client(
         monkeypatch,
-        tmp_path / "pending",
-        chat_id=7747352551,
+        '{"grade":"correct","feedback":"Correct."}',
     )
+    context, path = register_plugin(monkeypatch, tmp_path, chat_id=7747352551)
     for index in range(5):
-        other_context.tools["vocabulary_save_card"](
+        context.tools["vocabulary_save_card"](
             save_args(
                 "new_entry",
-                display_text=f"pending-{index}",
+                display_text=f"word-{index}",
                 definition=f"Definition {index}.",
             )
         )
-    ReviewService(
-        Database(other_path),
+    database = Database(path)
+    with database.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        backfill_v5(connection)
+        connection.commit()
+    context.commands["test"](argument, source=root_command_source())
+    with database.connect() as connection:
+        prompt_id = connection.execute(
+            "SELECT id FROM study_prompts WHERE status = 'prepared'"
+        ).fetchone()[0]
+    delivered = ReviewService(
+        database,
         Settings.from_environment().timezone,
-        clock=lambda: datetime(2026, 7, 19, tzinfo=UTC),
-    ).daily_review()
-
-    assert other_context.commands["test"]("") == (
-        "Finish your daily review before starting a test."
+    ).record_delivery(
+        prompt_id,
+        delivery_id="delivery-1",
+        content_fingerprint="fingerprint-1",
     )
+    assert delivered is not None
+
+    async def continue_study(text: str) -> dict:
+        return json.loads(
+            await context.tools["vocabulary_continue_study"](
+                {"answer_text": text}
+            )
+        )
+
+    answered = asyncio.run(continue_study(answer))
+    assert answered["status"] == "awaiting_rating"
+    rated = asyncio.run(continue_study("good"))
+
+    assert rated["status"] == "finalized"
+    assert rated["text"].splitlines()[:3] == [
+        "Rated: Good",
+        rated["text"].splitlines()[1],
+        "Progress: 1 of 5 complete.",
+    ]
+    assert rated["text"].splitlines()[1].startswith("Next due: ")
+    assert rated["text"].endswith(f"\n\n{next_question}")
+    with database.connect() as connection:
+        next_prompt = connection.execute(
+            """
+            SELECT status FROM study_prompts
+            WHERE id != ? ORDER BY id DESC LIMIT 1
+            """,
+            (prompt_id,),
+        ).fetchone()
+        assert next_prompt["status"] == "prepared"
+        assert connection.execute(
+            """
+            SELECT COUNT(*) FROM prompt_delivery_attempts
+            WHERE prompt_id != ?
+            """,
+            (prompt_id,),
+        ).fetchone()[0] == 0
+
+@pytest.mark.parametrize(
+    ("argument", "answer", "provider_response", "expected_calls", "reveal"),
+    [
+        (
+            "forward",
+            "wrong meaning",
+            '{"grade":"incorrect","feedback":"Not the saved meaning."}',
+            1,
+            "Definition:\nDefinition 0.\n\nExample:\nShe visited the bank.",
+        ),
+        (
+            "forward",
+            "show answer",
+            '{"grade":"correct","feedback":"unused"}',
+            0,
+            "Definition:\nDefinition 0.\n\nExample:\nShe visited the bank.",
+        ),
+        (
+            "forward",
+            "idk",
+            '{"grade":"correct","feedback":"unused"}',
+            0,
+            "Definition:\nDefinition 0.\n\nExample:\nShe visited the bank.",
+        ),
+        (
+            "reverse",
+            "wrong word",
+            '{"grade":"correct","feedback":"unused"}',
+            0,
+            "Answer: word-0\n\nDefinition:\nDefinition 0.",
+        ),
+        (
+            "reverse",
+            "show answer",
+            '{"grade":"correct","feedback":"unused"}',
+            0,
+            "Answer: word-0\n\nDefinition:\nDefinition 0.",
+        ),
+        (
+            "reverse",
+            "idk",
+            '{"grade":"correct","feedback":"unused"}',
+            0,
+            "Answer: word-0\n\nDefinition:\nDefinition 0.",
+        ),
+    ],
+)
+def test_auto_again_response_reveals_evaluation_before_schedule_and_next_prompt(
+    monkeypatch,
+    tmp_path: Path,
+    argument: str,
+    answer: str,
+    provider_response: str,
+    expected_calls: int,
+    reveal: str,
+) -> None:
+    call_llm = install_auxiliary_client(monkeypatch, provider_response)
+    context, path = register_plugin(monkeypatch, tmp_path, chat_id=7747352551)
+    for index in range(5):
+        context.tools["vocabulary_save_card"](
+            save_args(
+                "new_entry",
+                display_text=f"word-{index}",
+                definition=f"Definition {index}.",
+            )
+        )
+    database = Database(path)
+    with database.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        backfill_v5(connection)
+        connection.commit()
+    context.commands["test"](argument, source=root_command_source())
+    with database.connect() as connection:
+        prompt_id = connection.execute(
+            "SELECT id FROM study_prompts WHERE status = 'prepared'"
+        ).fetchone()[0]
+    assert ReviewService(
+        database,
+        Settings.from_environment().timezone,
+    ).record_delivery(
+        prompt_id,
+        delivery_id="delivery",
+        content_fingerprint="fingerprint",
+    ) is not None
+
+    payload = json.loads(
+        asyncio.run(
+            context.tools["vocabulary_continue_study"](
+                {"answer_text": answer}
+            )
+        )
+    )
+
+    assert payload["status"] == "finalized"
+    assert payload["text"].startswith("Grade: Incorrect\nFeedback: ")
+    assert reveal in payload["text"]
+    assert payload["text"].index("Grade: Incorrect") < payload["text"].index(reveal)
+    assert payload["text"].index(reveal) < payload["text"].index("Rated: Again")
+    assert payload["text"].endswith("\nWhat does 'word-1' mean?") if argument == "forward" else payload["text"].endswith("\nDefinition 1.")
+    assert "Choose effort:" not in payload["text"]
+    assert call_llm.await_count == expected_calls
+
+
+
+
+
+
+
+
 
 
 def test_dedicated_chat_registers_and_handles_stored_entry_without_model_or_agent(
@@ -321,7 +697,7 @@ def test_dedicated_chat_registers_and_handles_stored_entry_without_model_or_agen
 
     entry = original_pre_llm.__self__.capture_service.get_entry("pro forma")
     assert saved["status"] == "saved"
-    assert response == GatewayInterceptResponse(format_entry(entry, "Already saved."))
+    assert response.text == format_entry(entry, "Already saved.")
     call_llm.assert_not_awaited()
     pre_llm.assert_not_called()
     with Database(path).connect() as connection:
@@ -344,19 +720,20 @@ def test_telegram_single_word_injects_capture_guidance(monkeypatch, tmp_path: Pa
     assert hook_call(callback, "obdurate", platform="cli") is None
 
 
-def test_contextual_hook_fails_open_when_review_state_is_unavailable(
+def test_capture_hook_never_reads_study_state(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
     context, _ = register_plugin(monkeypatch, tmp_path)
     callback = context.hooks["pre_llm_call"]
-    monkeypatch.setattr(
-        callback.__self__.review_service,
-        "pending_review_status",
-        lambda: PendingReviewStatus.STORAGE_ERROR,
-    )
 
-    assert hook_call(callback, "perfidy") is None
+    def fail(*args, **kwargs):
+        raise AssertionError("capture guidance must not read study state")
+
+    monkeypatch.setattr(callback.__self__.review_service, "snapshot", fail)
+    monkeypatch.setattr(callback.__self__.review_service, "answerable_prompt", fail)
+
+    assert "vocabulary_save_card" in hook_call(callback, "perfidy")
 
 
 def test_contextual_capture_injects_verbatim_json_and_empty_senses(
@@ -564,72 +941,6 @@ def test_invalid_save_arguments_do_not_write(monkeypatch, tmp_path: Path) -> Non
         ).fetchone()[0] == 0
 
 
-def test_pending_review_routes_next_message_and_completion_tool(monkeypatch, tmp_path: Path) -> None:
-    call_llm = install_auxiliary_client(
-        monkeypatch,
-        '{"grade":"correct","feedback":"Accurate paraphrase."}',
-    )
-    context, _ = register_plugin(monkeypatch, tmp_path)
-    save = context.tools["vocabulary_save_card"]
-    save(
-        save_args(
-            "new_entry",
-            display_text="laconic",
-            definition="Using very few words.",
-        )
-    )
-
-    settings = Settings.from_environment()
-    ReviewService(
-        Database(settings.database_path),
-        settings.timezone,
-        clock=lambda: datetime(2026, 7, 16, 12, tzinfo=UTC),
-    ).daily_review()
-
-    callback = context.hooks["pre_llm_call"]
-    guidance = hook_call(callback, "brief and direct")
-    result = json.loads(
-        asyncio.run(
-            context.tools["vocabulary_complete_review"](
-                {"answer_text": "brief and direct"}
-            )
-        )
-    )
-
-    assert "vocabulary_complete_review" in guidance
-    assert "do not grade" not in guidance.lower()
-    assert result["status"] == "completed"
-    assert result["text"] == (
-        "Grade: Correct\n"
-        "Feedback: Accurate paraphrase.\n\n"
-        "Definition:\nUsing very few words.\n\n"
-        "Example:\nShe visited the bank."
-    )
-    call_llm.assert_awaited_once()
-    assert hook_call(callback, "/help") is None
-
-
-def test_pending_review_precedes_contextual_capture(
-    monkeypatch, tmp_path: Path
-) -> None:
-    context, path = register_plugin(monkeypatch, tmp_path)
-    context.tools["vocabulary_save_card"](save_args("new_entry"))
-    settings = Settings.from_environment()
-    ReviewService(
-        Database(path),
-        settings.timezone,
-        clock=lambda: datetime(2026, 7, 16, 12, tzinfo=UTC),
-    ).daily_review()
-
-    guidance = hook_call(
-        context.hooks["pre_llm_call"],
-        "shore\nThey walked along the shore.",
-    )
-
-    assert "vocabulary_complete_review" in guidance
-    assert "vocabulary_save_card" not in guidance
-
-
 def test_non_telegram_multiline_message_is_not_auto_capture(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -668,7 +979,7 @@ def test_existing_senses_survive_plugin_restart(monkeypatch, tmp_path: Path) -> 
     assert '"definition": "Land alongside a river."' in guidance
 
 
-def test_multi_sense_capture_review_survives_restart(
+def test_multi_sense_capture_survives_restart(
     monkeypatch, tmp_path: Path
 ) -> None:
     context, path = register_plugin(monkeypatch, tmp_path)
@@ -727,55 +1038,8 @@ def test_multi_sense_capture_review_survives_restart(
         )
     assert len(sense_ids) == 2
 
-    review_time = datetime(2026, 7, 16, 8, tzinfo=UTC)
-    review_service = ReviewService(
-        Database(path),
-        Settings.from_environment().timezone,
-        clock=lambda: review_time,
-    )
-    assert format_daily_review(review_service.daily_review()) == (
-        "What does 'bank' mean?"
-    )
-
     restarted_context, restarted_path = register_plugin(monkeypatch, tmp_path)
     assert restarted_path == path
-    answer_text = "A place for money, or the edge of a river."
-    restarted_routing = hook_call(
-        restarted_context.hooks["pre_llm_call"],
-        answer_text,
-    )
-    assert "vocabulary_complete_review" in restarted_routing
-    assert "vocabulary_save_card" not in restarted_routing
-
-    call_llm = install_auxiliary_client(
-        monkeypatch,
-        '{"grade":"correct","feedback":"You covered both senses."}',
-    )
-    completion = json.loads(
-        asyncio.run(
-            restarted_context.tools["vocabulary_complete_review"](
-                {"answer_text": answer_text}
-            )
-        )
-    )
-    assert completion == {
-        "status": "completed",
-        "text": (
-            "Grade: Correct\n"
-            "Feedback: You covered both senses.\n\n"
-            "1. noun — A financial institution.\n"
-            "   Example: She deposited the cheque at the bank.\n\n"
-            "2. noun — Land alongside a river.\n"
-            "   Example: They rested on the grassy bank."
-        ),
-    }
-    payload = json.loads(call_llm.await_args.kwargs["messages"][1]["content"])
-    assert [sense["definition"] for sense in payload["senses"]] == [
-        "A financial institution.",
-        "Land alongside a river.",
-    ]
-    assert format_daily_review(review_service.daily_review()) == ""
-
     capture_guidance = hook_call(
         restarted_context.hooks["pre_llm_call"],
         "bank",
@@ -788,151 +1052,27 @@ def test_multi_sense_capture_review_survives_restart(
             """
             SELECT
                 (SELECT COUNT(*) FROM vocabulary_entries),
-                (SELECT COUNT(*) FROM vocabulary_senses),
-                (SELECT COUNT(*) FROM review_events WHERE status = 'answered')
+                (SELECT COUNT(*) FROM vocabulary_senses)
             """
         ).fetchone()
-        event = connection.execute(
-            "SELECT status, answer_text FROM review_events"
-        ).fetchone()
 
-    assert tuple(reopened_counts) == (1, 2, 1)
-    assert tuple(event) == ("answered", answer_text)
-
-
-def test_dedicated_review_route_awaits_shared_semantic_evaluation(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    @dataclass(frozen=True, slots=True)
-    class GatewayInterceptResponse:
-        text: str
-
-    call_llm = install_auxiliary_client(
-        monkeypatch,
-        '{"grade":"partial","feedback":"You identified the general idea."}',
-    )
-    plugins = types.ModuleType("hermes_cli.plugins")
-    plugins.GatewayInterceptResponse = GatewayInterceptResponse
-    hermes_cli = types.ModuleType("hermes_cli")
-    hermes_cli.plugins = plugins
-    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
-    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins)
-
-    context, path = register_plugin(monkeypatch, tmp_path, chat_id=7747352551)
-    context.tools["vocabulary_save_card"](
-        save_args(
-            "new_entry",
-            display_text="laconic",
-            definition="Using very few words.",
-        )
-    )
-    settings = Settings.from_environment()
-    pending = ReviewService(
-        Database(path),
-        settings.timezone,
-        clock=lambda: datetime.now(UTC),
-    ).daily_review()
-    assert pending.event is not None
-
-    response = asyncio.run(
-        context.hooks["gateway_inbound_intercept"](
-            platform="telegram",
-            sender_id="42",
-            chat_id="7747352551",
-            chat_type="dm",
-            thread_id=None,
-            user_message="It means being brief.",
-        )
-    )
-
-    assert response == GatewayInterceptResponse(
-        "Grade: Partial\n"
-        "Feedback: You identified the general idea.\n\n"
-        "Definition:\nUsing very few words.\n\n"
-        "Example:\nShe visited the bank."
-    )
-    call_llm.assert_awaited_once()
-    assert call_llm.await_args.kwargs["task"] == "vocabulary_answer_evaluation"
-    with Database(path).connect() as connection:
-        event = connection.execute(
-            "SELECT status, answer_text, grade, evaluation_feedback FROM review_events"
-        ).fetchone()
-    assert tuple(event) == (
-        "answered",
-        "It means being brief.",
-        "partial",
-        "You identified the general idea.",
-    )
-
-
-def test_async_tool_show_answer_bypasses_auxiliary_provider(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    call_llm = install_auxiliary_client(
-        monkeypatch,
-        '{"grade":"correct","feedback":"Should not be used."}',
-    )
-    context, path = register_plugin(monkeypatch, tmp_path)
-    context.tools["vocabulary_save_card"](
-        save_args(
-            "new_entry",
-            display_text="laconic",
-            definition="Using very few words.",
-        )
-    )
-    settings = Settings.from_environment()
-    ReviewService(
-        Database(path),
-        settings.timezone,
-        clock=lambda: datetime.now(UTC),
-    ).daily_review()
-
-    payload = json.loads(
-        asyncio.run(
-            context.tools["vocabulary_complete_review"](
-                {"answer_text": "show answer"}
-            )
-        )
-    )
-
-    assert payload == {
-        "status": "completed",
-        "text": (
-            "Grade: Incorrect\n"
-            "Feedback: You chose to reveal the answer.\n\n"
-            "Definition:\nUsing very few words.\n\n"
-            "Example:\nShe visited the bank."
-        ),
-    }
-    call_llm.assert_not_awaited()
+    assert tuple(reopened_counts) == (1, 2)
 
 
 def test_registered_test_cross_path_survives_restart_and_evaluator_failure(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    @dataclass(frozen=True, slots=True)
-    class GatewayInterceptResponse:
-        text: str
-
     call_llm = install_auxiliary_client(monkeypatch, "")
     call_llm.side_effect = [
         '{"grade":"correct","feedback":"Feedback 1."}',
         RuntimeError("provider unavailable"),
         '{"grade":"partial","feedback":"Feedback 2."}',
-        '{"grade":"incorrect","feedback":"Feedback 3."}',
-        '{"grade":"correct","feedback":"Feedback 4."}',
-        '{"grade":"partial","feedback":"Feedback 5."}',
+        '{"grade":"correct","feedback":"Feedback 3."}',
+        '{"grade":"partial","feedback":"Feedback 4."}',
+        '{"grade":"incorrect","feedback":"Feedback 5."}',
+        '{"grade":"incorrect","feedback":"Retry feedback."}',
     ]
-    plugins = types.ModuleType("hermes_cli.plugins")
-    plugins.GatewayInterceptResponse = GatewayInterceptResponse
-    hermes_cli = types.ModuleType("hermes_cli")
-    hermes_cli.plugins = plugins
-    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
-    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins)
-
     context, path = register_plugin(monkeypatch, tmp_path, chat_id=7747352551)
     for index in range(5):
         context.tools["vocabulary_save_card"](
@@ -942,109 +1082,258 @@ def test_registered_test_cross_path_survives_restart_and_evaluator_failure(
                 definition=f"Definition {index}.",
             )
         )
-    with Database(path).connect() as connection:
-        scheduling_before_test = [
-            tuple(row)
-            for row in connection.execute(
+    database = Database(path)
+    with database.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        backfill_v5(connection)
+        connection.commit()
+
+    def deliver_current(index: int) -> None:
+        with database.connect() as connection:
+            prompt_id = connection.execute(
                 """
-                SELECT id, last_reviewed, review_status
-                FROM vocabulary_entries
-                ORDER BY id
+                SELECT id FROM study_prompts
+                WHERE status = 'prepared' ORDER BY id DESC LIMIT 1
                 """
+            ).fetchone()[0]
+        delivered = ReviewService(
+            database,
+            Settings.from_environment().timezone,
+        ).record_delivery(
+            prompt_id,
+            delivery_id=f"delivery-{index}",
+            content_fingerprint=f"fingerprint-{index}",
+        )
+        assert delivered is not None
+
+    def continue_study(active_context: FakeContext, text: str) -> dict:
+        return json.loads(
+            asyncio.run(
+                active_context.tools["vocabulary_continue_study"](
+                    {"answer_text": text}
+                )
             )
-        ]
-    assert context.commands["test"]("") == (
+        )
+
+    assert context.commands["test"]("forward", source=root_command_source()).text == (
         "Question 1 of 5\nWhat does 'word-0' mean?"
     )
+    deliver_current(1)
+    first_answer = continue_study(context, "answer 1")
+    assert first_answer["status"] == "awaiting_rating"
+    first_rating = continue_study(context, "good")
+    assert first_rating["status"] == "finalized"
+    assert first_rating["text"].endswith(
+        "\n\nQuestion 2 of 5\nWhat does 'word-1' mean?"
+    )
+    assert context.commands["test"]("forward", source=root_command_source()).text == (
+        "Question 2 of 5\nWhat does 'word-1' mean?"
+    )
 
-    async def answer(active_context: FakeContext, text: str) -> str:
-        response = await active_context.hooks["gateway_inbound_intercept"](
-            platform="telegram",
-            sender_id="42",
-            chat_id="7747352551",
-            chat_type="dm",
-            thread_id=None,
-            user_message=text,
-        )
-        assert isinstance(response, GatewayInterceptResponse)
-        return response.text
-
-    first = asyncio.run(answer(context, "answer 1"))
-    assert first.endswith("Question 2 of 5\nWhat does 'word-1' mean?")
+    deliver_current(2)
+    failed = continue_study(context, "discarded attempt")
+    assert failed == {
+        "status": "evaluation_error",
+        "allowed_ratings": [],
+        "text": "I couldn't evaluate that answer. Please try again.",
+    }
+    with database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM answer_drafts").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM review_attempts").fetchone()[0] == 1
 
     restarted = FakeContext()
     register(restarted)
-    morning = ReviewService(
-        Database(path),
-        Settings.from_environment().timezone,
-        clock=lambda: datetime(2026, 7, 19, 8, tzinfo=UTC),
-    ).daily_review()
-    assert morning.status is ReviewPromptStatus.TEST_ACTIVE
-    assert format_daily_review(morning) == ""
-    with Database(path).connect() as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM review_events"
-        ).fetchone()[0] == 0
-    assert restarted.commands["test"]("") == (
+    assert restarted.commands["test"]("forward", source=root_command_source()).text == (
         "Question 2 of 5\nWhat does 'word-1' mean?"
     )
+    second_answer = continue_study(restarted, "answer 2")
+    assert second_answer["status"] == "awaiting_rating"
+    assert continue_study(restarted, "hard")["status"] == "finalized"
 
-    failed = asyncio.run(answer(restarted, "discarded attempt"))
-    assert failed == "I couldn't evaluate that answer. Please try again."
-    assert "Definition 1." not in failed
-    assert restarted.commands["test"]("") == (
-        "Question 2 of 5\nWhat does 'word-1' mean?"
+    deliver_current(3)
+    assert continue_study(restarted, "answer 3")["status"] == "awaiting_rating"
+    assert continue_study(restarted, "good")["status"] == "finalized"
+    deliver_current(4)
+    assert continue_study(restarted, "answer 4")["status"] == "awaiting_rating"
+    assert continue_study(restarted, "hard")["status"] == "finalized"
+    deliver_current(5)
+    fifth = continue_study(restarted, "answer 5")
+    assert fifth["status"] == "finalized"
+    assert fifth["text"].startswith(
+        "Grade: Incorrect\nFeedback: Feedback 5."
     )
-    with Database(path).connect() as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM test_questions WHERE answer_text IS NOT NULL"
-        ).fetchone()[0] == 1
+    assert fifth["text"].index("Grade: Incorrect") < fifth["text"].index(
+        "Rated: Again"
+    )
+    assert fifth["text"].endswith(
+        "\n\nQuestion 5 of 5 · retry\nWhat does 'word-4' mean?"
+    )
+    assert restarted.commands["test"]("forward", source=root_command_source()).text.startswith(
+        "Question 5 of 5 · retry\n"
+    )
+    deliver_current(6)
+    completed = continue_study(restarted, "retry answer")
 
-    second = asyncio.run(answer(restarted, "answer 2"))
-    third = asyncio.run(answer(restarted, "answer 3"))
-    fourth = asyncio.run(answer(restarted, "answer 4"))
-    fifth = asyncio.run(answer(restarted, "answer 5"))
-
-    assert second.endswith("Question 3 of 5\nWhat does 'word-2' mean?")
-    assert third.endswith("Question 4 of 5\nWhat does 'word-3' mean?")
-    assert fourth.endswith("Question 5 of 5\nWhat does 'word-4' mean?")
-    assert fifth.endswith(
-        "Test complete.\n"
+    assert completed["status"] == "finalized"
+    assert completed["allowed_ratings"] == []
+    assert completed["text"].startswith(
+        "Grade: Incorrect\nFeedback: Retry feedback."
+    )
+    assert completed["text"].endswith(
+        "Forward test complete.\n"
         "Results: 2 correct, 2 partial, 1 incorrect."
     )
+    assert completed["text"].index("Grade: Incorrect") < completed["text"].index(
+        "Forward test complete."
+    )
+    duplicate = continue_study(restarted, "retry answer")
+    assert duplicate["status"] == "no_active"
+    assert "Grade:" not in duplicate["text"]
+    assert "Feedback:" not in duplicate["text"]
     assert [call.kwargs["task"] for call in call_llm.await_args_list] == [
         "vocabulary_answer_evaluation"
-    ] * 6
-    with Database(path).connect() as connection:
-        rows = connection.execute(
+    ] * 7
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT status FROM study_sessions"
+        ).fetchone()[0] == "completed"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM answer_drafts"
+        ).fetchone()[0] == 6
+        assert connection.execute(
+            "SELECT COUNT(*) FROM review_attempts"
+        ).fetchone()[0] == 6
+        assert connection.execute(
             """
-            SELECT position, answer_text, grade
-            FROM test_questions ORDER BY position
+            SELECT COUNT(*) FROM vocabulary_cards
+            WHERE direction = 'forward' AND repetitions >= 1
             """
-        ).fetchall()
-        session = connection.execute(
-            "SELECT status FROM test_sessions"
-        ).fetchone()[0]
-        scheduling_after_test = [
+        ).fetchone()[0] == 5
+
+
+@pytest.mark.parametrize(
+    ("incompatibility", "message"),
+    [
+        (
+            {"valid_hooks": frozenset({"pre_llm_call", "gateway_inbound_intercept"})},
+            "Installed Hermes does not expose the outbound receipt hook",
+        ),
+        (
+            {"omit_contracts": ("PluginCommandSource",)},
+            "Installed Hermes does not expose delivery-safe plugin contracts",
+        ),
+        (
+            {"omit_contracts": ("GatewayInterceptResponse",)},
+            "Installed Hermes does not expose delivery-safe plugin contracts",
+        ),
+        (
+            {"omit_contracts": ("OutboundResponse",)},
+            "Installed Hermes does not expose delivery-safe plugin contracts",
+        ),
+    ],
+)
+def test_incompatible_hermes_registers_no_mutating_command_or_study_state(
+    monkeypatch,
+    tmp_path: Path,
+    incompatibility: dict,
+    message: str,
+) -> None:
+    with pytest.raises(ConfigurationError) as error:
+        register_plugin(
+            monkeypatch,
+            tmp_path,
+            chat_id=7747352551,
+            **incompatibility,
+        )
+
+    assert str(error.value) == message
+    assert not (tmp_path / "data" / "vocabulary.sqlite3").exists()
+
+
+def test_endstudy_command_ends_study_without_changing_unanswered_schedules(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """R5: shipped copy tells learners to exit, so an exit affordance must exist."""
+    context, path = register_plugin(monkeypatch, tmp_path, chat_id=7747352551)
+    for index in range(2):
+        context.tools["vocabulary_save_card"](
+            {
+                "display_text": f"word-{index}",
+                "operation": "new_entry",
+                "part_of_speech": "noun",
+                "definition": f"Definition {index}.",
+                "example_sentence": f"Example {index}.",
+            }
+        )
+    database = Database(path)
+
+    assert context.commands["endstudy"]("", source=root_command_source()) == (
+        "There is no active vocabulary study session."
+    )
+
+    context.commands["review"]("", source=root_command_source())
+    with database.connect() as connection:
+        before = [
             tuple(row)
             for row in connection.execute(
-                """
-                SELECT id, last_reviewed, review_status
-                FROM vocabulary_entries
-                ORDER BY id
-                """
+                "SELECT id, state, due_at, effective_due_at FROM vocabulary_cards"
+                " ORDER BY id"
             )
         ]
-    assert [tuple(row) for row in rows] == [
-        (1, "answer 1", "correct"),
-        (2, "answer 2", "partial"),
-        (3, "answer 3", "incorrect"),
-        (4, "answer 4", "correct"),
-        (5, "answer 5", "partial"),
-    ]
-    assert session == "completed"
-    assert scheduling_after_test == scheduling_before_test
+        assert connection.execute(
+            "SELECT COUNT(*) FROM study_sessions WHERE status = 'active'"
+        ).fetchone()[0] == 1
 
-    fallthrough = asyncio.run(answer(restarted, "word-0"))
-    assert fallthrough.endswith("Already saved.")
-    assert call_llm.await_count == 6
+    assert context.commands["endstudy"]("", source=root_command_source()) == (
+        "Review exited. Unfinished cards are still due."
+    )
+
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM study_sessions WHERE status = 'active'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM review_attempts"
+        ).fetchone()[0] == 0
+        assert [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT id, state, due_at, effective_due_at FROM vocabulary_cards"
+                " ORDER BY id"
+            )
+        ] == before
+
+    resumed = context.commands["review"]("", source=root_command_source())
+    assert "word-" in str(resumed)
+
+
+def test_endstudy_command_rejects_sources_outside_the_root_dm(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    context, path = register_plugin(monkeypatch, tmp_path, chat_id=7747352551)
+    context.tools["vocabulary_save_card"](
+        {
+            "display_text": "word-0",
+            "operation": "new_entry",
+            "part_of_speech": "noun",
+            "definition": "Definition 0.",
+            "example_sentence": "Example 0.",
+        }
+    )
+    context.commands["review"]("", source=root_command_source())
+
+    cli_source = PluginCommandSource(
+        authenticated=True,
+        platform="cli",
+        chat_id="7747352551",
+        chat_type="dm",
+        thread_id=None,
+    )
+    assert context.commands["endstudy"]("", source=cli_source) == SOURCE_ERROR
+
+    with Database(path).connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM study_sessions WHERE status = 'active'"
+        ).fetchone()[0] == 1

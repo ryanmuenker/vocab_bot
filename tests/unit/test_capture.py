@@ -21,6 +21,13 @@ from hermes_vocab.models import (
     NormalizedEntryText,
     SenseCard,
 )
+from hermes_vocab.scheduling import (
+    DESIRED_RETENTION,
+    PARAMETER_FINGERPRINT,
+    PARAMETERS_VERSION,
+    SCHEDULER_KIND,
+    SCHEDULER_VERSION,
+)
 
 
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
@@ -428,3 +435,104 @@ def test_concurrent_capture_entry_converges_on_one_complete_aggregate(
     with service.database.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM vocabulary_entries").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM vocabulary_senses").fetchone()[0] in {1, 2}
+
+
+def cards_for(service: CaptureService) -> list[tuple]:
+    with service.database.connect() as connection:
+        return [
+            tuple(row)
+            for row in connection.execute(
+                """
+                SELECT entry_id, sense_id, direction, state, repetitions, lapses
+                FROM vocabulary_cards ORDER BY id
+                """
+            )
+        ]
+
+
+def test_batch_capture_creates_one_forward_card_and_one_card_per_sense(
+    tmp_path: Path,
+) -> None:
+    """Covers R6: a saved entry must become schedulable without a migration."""
+    service = service_for(tmp_path)
+
+    result = service.capture_entry(
+        "pro forma",
+        (
+            SenseCard("adjective", "Provided as a matter of form.", "A pro forma vote."),
+            SenseCard("noun", "A projected statement.", "She read the pro forma."),
+        ),
+    )
+
+    assert result.entry is not None
+    entry_id = result.entry.id
+    sense_ids = [sense.id for sense in result.entry.senses]
+    assert cards_for(service) == [
+        (entry_id, None, "forward", "new", 0, 0),
+        (entry_id, sense_ids[0], "reverse", "new", 0, 0),
+        (entry_id, sense_ids[1], "reverse", "new", 0, 0),
+    ]
+
+
+def test_incremental_capture_adds_only_the_missing_directional_cards(
+    tmp_path: Path,
+) -> None:
+    service = service_for(tmp_path)
+
+    saved = service.capture(command(CaptureOperation.NEW_ENTRY))
+    assert saved.entry is not None
+    entry_id = saved.entry.id
+    first_sense = saved.sense.id
+    assert cards_for(service) == [
+        (entry_id, None, "forward", "new", 0, 0),
+        (entry_id, first_sense, "reverse", "new", 0, 0),
+    ]
+
+    added = service.capture(
+        command(
+            CaptureOperation.NEW_SENSE,
+            definition="Land alongside a river.",
+            example_sentence="They rested on the bank.",
+        )
+    )
+    assert added.sense is not None
+    assert cards_for(service) == [
+        (entry_id, None, "forward", "new", 0, 0),
+        (entry_id, first_sense, "reverse", "new", 0, 0),
+        (entry_id, added.sense.id, "reverse", "new", 0, 0),
+    ]
+
+    service.capture(
+        command(
+            CaptureOperation.EXISTING_SENSE,
+            matching_sense_id=first_sense,
+        )
+    )
+    assert len(cards_for(service)) == 3
+
+
+def test_capture_cards_carry_the_pinned_scheduler_metadata(tmp_path: Path) -> None:
+    service = service_for(tmp_path)
+
+    service.capture(command(CaptureOperation.NEW_ENTRY))
+
+    with service.database.connect() as connection:
+        rows = [
+            tuple(row)
+            for row in connection.execute(
+                """
+                SELECT scheduler_kind, scheduler_version, parameters_version,
+                       parameter_fingerprint, desired_retention, due_at,
+                       effective_due_at, created_at
+                FROM vocabulary_cards ORDER BY id
+                """
+            )
+        ]
+    assert rows
+    for row in rows:
+        assert row[0] == SCHEDULER_KIND
+        assert row[1] == SCHEDULER_VERSION
+        assert row[2] == PARAMETERS_VERSION
+        assert row[3] == PARAMETER_FINGERPRINT
+        assert row[4] == DESIRED_RETENTION
+        assert row[5] == row[6] == row[7]
