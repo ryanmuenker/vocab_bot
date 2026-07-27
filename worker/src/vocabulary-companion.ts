@@ -441,7 +441,10 @@ export class VocabularyCompanion extends DurableObject<Env> {
       prompt === null &&
       snapshot.mode === StudyMode.REVIEW &&
       snapshot.status === StudySessionStatus.ACTIVE;
-    if (rolloverGap || (snapshot === null && this.store.dueButNotAnswerable(now))) {
+    if (
+      rolloverGap ||
+      (snapshot === null && this.store.dueButNotAnswerable(now) && !this.store.studyWasExited())
+    ) {
       // Due work exists but no prompt is outstanding (for example the machine
       // was off, or the day rolled over). Ordinary text must surface that work
       // instead of being graded or captured.

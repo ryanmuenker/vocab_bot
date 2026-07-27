@@ -321,6 +321,49 @@ describe("VocabularyCompanion delivery gating", () => {
     expect((await stub.summary()).entries).toBe(2);
   });
 
+  it("captures the resubmitted word after /endstudy instead of re-arming the review", async () => {
+    // R4 promises resubmission works after an exit. Re-arming on the very next
+    // message made the bot's own instruction — "exit the review, then resubmit
+    // it" — impossible to follow, and no word could be saved while due work
+    // existed, which is almost always.
+    const io = transport();
+    const stub = companion("exit-then-capture");
+    const snapshot = library(2);
+    await stub.importSnapshot({
+      ...snapshot,
+      cards: [
+        {
+          ...snapshot.cards[0]!,
+          state: "review" as const,
+          stability: encodeReal(3.5),
+          difficulty: encodeReal(5),
+          dueAt: "2026-07-18T00:00:00Z",
+          effectiveDueAt: "2026-07-18T00:00:00Z",
+          lastReviewAt: "2026-07-15T00:00:00Z",
+          repetitions: 1,
+          introducedLocalDate: "2026-07-15",
+        },
+        ...snapshot.cards.slice(1),
+      ],
+    });
+
+    await stub.enqueueTelegramUpdate(message(1, "obdurate"));
+    await drain(stub);
+    expect(io.sent[0]).toContain("Review due. Answer this delivered question first:");
+    expect((await stub.summary()).entries).toBe(2);
+
+    await stub.enqueueTelegramUpdate(message(2, "/endstudy"));
+    await drain(stub);
+    expect(io.sent[1]).toBe("Review exited. Unfinished cards are still due.");
+
+    await stub.enqueueTelegramUpdate(message(3, "obdurate"));
+    await drain(stub);
+
+    expect(io.sent[2]).not.toContain("Answer this delivered question first");
+    expect(io.sent[2]).toContain("obdurate");
+    expect((await stub.summary()).entries).toBe(3);
+  });
+
   it("grades a reverse card by exact match without calling the evaluator", async () => {
     const io = transport();
     const stub = companion("reverse-test");

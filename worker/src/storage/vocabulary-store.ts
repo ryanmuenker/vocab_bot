@@ -836,6 +836,28 @@ export class VocabularyStore {
     }
   }
 
+  /**
+   * True when the learner exited and nothing has restarted study since.
+   *
+   * An explicit exit is a decision. R4 promises a message resubmitted after
+   * an exit is captured, so the branch that surfaces due work from ordinary
+   * text must respect it; otherwise "exit, then resubmit" cannot be followed
+   * and no word can be saved while anything is due. Any later session — from
+   * the ticker or /review — replaces this row and re-arms the branch.
+   */
+  studyWasExited(): boolean {
+    try {
+      const row = oneOrNull(
+        this.sql.exec<{ status: string }>(
+          "SELECT status FROM study_sessions ORDER BY id DESC LIMIT 1",
+        ),
+      );
+      return row !== null && row.status === StudySessionStatus.EXITED;
+    } catch {
+      return false;
+    }
+  }
+
   /** A prepared prompt whose latest delivery attempt has no receipt yet. */
   inFlightDelivery(): boolean {
     try {

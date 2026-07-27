@@ -31,6 +31,7 @@ from hermes_vocab.models import (
     Evaluation,
     EvaluationGrade,
     SenseCard,
+    StudyMutationStatus,
 )
 from hermes_vocab.review import ReviewService
 
@@ -934,3 +935,33 @@ def test_rollover_cancelled_prompt_still_interrupts_capture(
     assert snapshot is not None
     assert snapshot.current_prompt is not None
     assert snapshot.current_prompt.id != prepared.id
+
+
+def test_exiting_review_lets_the_resubmitted_word_be_captured(
+    tmp_path: Path,
+) -> None:
+    """R4 promises resubmission works after an exit.
+
+    Before this, exiting and resubmitting re-armed the review immediately, so
+    the bot's own instruction — 'exit the review, then resubmit it' — could
+    not be followed, and no word could be saved while anything was due.
+    """
+    router, capture, review, definition = make_router(tmp_path)
+    seed_overdue_card_without_session(capture)
+    assert review.due_but_not_answerable() is True
+
+    # Ordinary text still surfaces the due work while no exit has happened.
+    first = asyncio.run(route(router, "Xanthocroid"))
+    assert first is not None and "resubmit" in first
+    assert capture.get_entry("xanthocroid") is None
+
+    assert review.exit() is StudyMutationStatus.COMPLETED
+    assert review.study_was_exited() is True
+
+    resubmitted = asyncio.run(route(router, "Xanthocroid"))
+
+    assert resubmitted is not None
+    assert "Answer this delivered question first" not in resubmitted
+    assert capture.get_entry("xanthocroid") is not None
+    # The cards are still due; the exit suppressed the interruption, not the work.
+    assert review.due_but_not_answerable() is True
