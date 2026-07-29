@@ -71,9 +71,9 @@ class TestSessionService:
                     connection,
                     now=now,
                     maximum_count=_REQUIRED_CARDS,
-                    include_seen_non_due=True,
                     direction=direction,
                     distinct_entries=True,
+                    only_unseen=True,
                 )
                 if len(cards) != _REQUIRED_CARDS:
                     connection.commit()

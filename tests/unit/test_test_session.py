@@ -185,11 +185,11 @@ def _make_reviewed(
         connection.commit()
 
 
-def test_v5_forward_test_persists_due_weak_new_order_and_prepared_prompt(
+def test_v5_forward_test_selects_only_unseen_entries_oldest_first(
     tmp_path: Path,
 ) -> None:
     service, database, _ = _setup_v5_service(tmp_path)
-    cards = [_add_directional_cards(database, index) for index in range(6)]
+    cards = [_add_directional_cards(database, index) for index in range(10)]
     _make_reviewed(database, cards[0][2], due=NOW - timedelta(days=2), stability=3)
     _make_reviewed(database, cards[1][2], due=NOW - timedelta(days=1), stability=3)
     _make_reviewed(database, cards[2][2], due=NOW + timedelta(days=5), stability=0.2)
@@ -201,12 +201,15 @@ def test_v5_forward_test_persists_due_weak_new_order_and_prepared_prompt(
     assert result.snapshot is not None
     assert result.snapshot.mode is StudyMode.TEST_FORWARD
     assert [item.card.id for item in result.snapshot.queue] == [
-        cards[index][2] for index in range(5)
+        cards[index][2] for index in range(4, 9)
     ]
+    assert all(
+        item.card.state is CardScheduleState.NEW for item in result.snapshot.queue
+    )
     assert result.snapshot.current_prompt is not None
     assert result.snapshot.current_prompt.status is StudyPromptStatus.PREPARED
     assert result.snapshot.current_prompt.prompt_text == (
-        "Question 1 of 5\nWhat does 'term-0' mean?"
+        "Question 1 of 5\nWhat does 'term-4' mean?"
     )
 
 
@@ -326,18 +329,12 @@ def test_v5_restart_preserves_original_queue_and_answered_rating_phase(
     assert restarted.snapshot.current_prompt.status is StudyPromptStatus.ANSWERED
 
 
-def test_v5_early_seen_card_changes_only_its_own_directional_schedule(
+def test_v5_new_test_card_enters_review_schedule_without_mutating_siblings(
     tmp_path: Path,
 ) -> None:
     service, database, clock = _setup_v5_service(tmp_path)
-    cards = [_add_directional_cards(database, index) for index in range(5)]
-    for index, card in enumerate(cards):
-        _make_reviewed(
-            database,
-            card[2],
-            due=NOW + timedelta(days=5),
-            stability=float(index + 1),
-        )
+    for index in range(5):
+        _add_directional_cards(database, index)
     started = service.start(CardDirection.FORWARD)
     assert started.snapshot is not None
     first_card_id = started.snapshot.queue[0].card.id
@@ -380,24 +377,18 @@ def test_v5_early_seen_card_changes_only_its_own_directional_schedule(
     }
 
 
-def test_v5_test_selection_shares_daily_new_quota_and_fills_with_weak_seen(
+def test_v5_test_selection_bypasses_daily_new_quota_for_explicit_introduction(
     tmp_path: Path,
 ) -> None:
     service, database, _ = _setup_v5_service(tmp_path)
-    cards = [_add_directional_cards(database, index) for index in range(9)]
-    for index in range(4):
-        with database.connect() as connection:
-            connection.execute(
-                "UPDATE vocabulary_cards SET introduced_local_date = ? WHERE id = ?",
-                (NOW.date().isoformat(), cards[index][2]),
-            )
-            connection.commit()
-    for index in range(4):
+    cards = [_add_directional_cards(database, index) for index in range(10)]
+    for index in range(5):
         _make_reviewed(
             database,
             cards[index][3][0],
             due=NOW + timedelta(days=5),
             stability=float(index + 1),
+            introduced_local_date=NOW.date().isoformat(),
         )
 
     result = service.start(CardDirection.REVERSE)
@@ -405,11 +396,11 @@ def test_v5_test_selection_shares_daily_new_quota_and_fills_with_weak_seen(
     assert result.status is StudyStartStatus.STARTED
     assert result.snapshot is not None
     assert [item.card.id for item in result.snapshot.queue] == [
-        cards[index][3][0] for index in range(5)
+        cards[index][3][0] for index in range(5, 10)
     ]
-    assert sum(
+    assert all(
         item.card.state is CardScheduleState.NEW for item in result.snapshot.queue
-    ) == 1
+    )
 
 
 def test_v5_concurrent_matching_starts_create_one_original_five(

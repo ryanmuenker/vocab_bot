@@ -730,6 +730,7 @@ class ReviewService:
         include_seen_non_due: bool = False,
         direction: CardDirection | None = None,
         distinct_entries: bool = False,
+        only_unseen: bool = False,
         excluded_ids: set[int] | None = None,
     ) -> list[StudyCardSnapshot]:
         local_date = self._local_date(now).isoformat()
@@ -751,7 +752,11 @@ class ReviewService:
             "SELECT COUNT(DISTINCT entry_id) FROM vocabulary_cards WHERE introduced_local_date = ?",
             (local_date,),
         ).fetchone()[0]
-        remaining_new = max(self.new_card_limit - introduced_today, 0)
+        remaining_new = (
+            None
+            if only_unseen
+            else max(self.new_card_limit - introduced_today, 0)
+        )
         due: list[tuple[tuple[object, ...], StudyCardSnapshot]] = []
         weak: list[tuple[tuple[object, ...], StudyCardSnapshot]] = []
         unseen: list[tuple[tuple[object, ...], StudyCardSnapshot]] = []
@@ -774,15 +779,22 @@ class ReviewService:
         due.sort(key=lambda item: item[0])
         weak.sort(key=lambda item: item[0])
         unseen.sort(key=lambda item: item[0])
-        ordered = [(card, False) for _, card in due]
-        if include_seen_non_due:
-            ordered.extend((card, False) for _, card in weak)
-        ordered.extend((card, True) for _, card in unseen)
+        if only_unseen:
+            ordered = [(card, True) for _, card in unseen]
+        else:
+            ordered = [(card, False) for _, card in due]
+            if include_seen_non_due:
+                ordered.extend((card, False) for _, card in weak)
+            ordered.extend((card, True) for _, card in unseen)
         selected: list[StudyCardSnapshot] = []
         selected_new = 0
         entries: set[int] = set()
         for card, is_new in ordered:
-            if is_new and selected_new >= remaining_new:
+            if (
+                is_new
+                and remaining_new is not None
+                and selected_new >= remaining_new
+            ):
                 continue
             if distinct_entries and card.entry_id in entries:
                 continue
