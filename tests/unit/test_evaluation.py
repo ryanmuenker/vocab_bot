@@ -438,6 +438,9 @@ def test_only_exact_show_answer_bypasses_forward_provider(
     [
         (" pro   forma. ", EvaluationGrade.CORRECT),
         ("PRO FORMA!!!", EvaluationGrade.CORRECT),
+        ("pro-forma", EvaluationGrade.CORRECT),
+        ("proforma", EvaluationGrade.CORRECT),
+        ("pro/forma", EvaluationGrade.CORRECT),
         ("pro form", EvaluationGrade.INCORRECT),
         ("projected statement", EvaluationGrade.INCORRECT),
         ("obdurate", EvaluationGrade.INCORRECT),
@@ -466,7 +469,9 @@ def test_reverse_answer_is_normalized_exactly_without_model(
 
 
 def test_reverse_normalizer_and_rating_parser_are_state_deterministic() -> None:
-    assert normalize_reverse_answer("  Pro   Forma...  ") == "pro forma"
+    assert normalize_reverse_answer("  Pro-forma...  ") == "proforma"
+    assert normalize_reverse_answer("can't") == normalize_reverse_answer("cant")
+    assert normalize_reverse_answer("C++") == normalize_reverse_answer("C")
     assert parse_rating(
         " GOOD ",
         (ReviewRating.HARD, ReviewRating.GOOD, ReviewRating.EASY),

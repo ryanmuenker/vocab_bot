@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -149,8 +150,8 @@ REVERSE_INCORRECT_FEEDBACK = "That does not exactly match the saved entry."
 
 
 def normalize_reverse_answer(text: str) -> str:
-    normalized = " ".join(text.split()).casefold()
-    return normalized.rstrip(".!?").rstrip()
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return "".join(character for character in normalized if character.isalnum())
 
 
 def allowed_ratings(grade: EvaluationGrade) -> tuple[ReviewRating, ...]:
