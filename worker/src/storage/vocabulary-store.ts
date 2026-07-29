@@ -329,6 +329,7 @@ interface SelectOptions {
   readonly includeSeenNonDue?: boolean;
   readonly direction?: CardDirection;
   readonly distinctEntries?: boolean;
+  readonly onlyUnseen?: boolean;
   readonly excludedIds?: ReadonlySet<number>;
 }
 
@@ -531,7 +532,7 @@ export class VocabularyStore {
         }
         const cards = this.selectCards(now, {
           maximumCount: TEST_REQUIRED_CARDS,
-          includeSeenNonDue: true,
+          onlyUnseen: true,
           direction,
           distinctEntries: true,
         });
@@ -1317,8 +1318,9 @@ export class VocabularyStore {
 
   /**
    * Due cards first, ordered by effective due then predicted recall then age;
-   * then the weakest seen non-due cards for tests; then unseen cards within the
-   * shared five-per-local-day introduction quota.
+   * optionally the weakest seen non-due cards; then unseen cards within the
+   * shared five-per-local-day introduction quota. Explicit unseen-only
+   * selection bypasses that quota.
    */
   private selectCards(now: Date, options: SelectOptions = {}): StudyCardSnapshot[] {
     const today = localDate(now, this.timeZone);
@@ -1347,7 +1349,10 @@ export class VocabularyStore {
           today,
         ),
       )?.count ?? 0;
-    const remainingNew = Math.max(DAILY_NEW_CARD_LIMIT - introducedToday, 0);
+    const remainingNew =
+      options.onlyUnseen === true
+        ? null
+        : Math.max(DAILY_NEW_CARD_LIMIT - introducedToday, 0);
     const excluded = options.excludedIds ?? new Set<number>();
 
     const due: [readonly number[], StudyCardSnapshot][] = [];
@@ -1373,17 +1378,22 @@ export class VocabularyStore {
     weak.sort(byKey);
     unseen.sort(byKey);
 
-    const ordered: [StudyCardSnapshot, boolean][] = due.map(([, card]) => [card, false]);
-    if (options.includeSeenNonDue === true) {
-      for (const [, card] of weak) ordered.push([card, false]);
+    const ordered: [StudyCardSnapshot, boolean][] =
+      options.onlyUnseen === true
+        ? unseen.map(([, card]) => [card, true])
+        : due.map(([, card]) => [card, false]);
+    if (options.onlyUnseen !== true) {
+      if (options.includeSeenNonDue === true) {
+        for (const [, card] of weak) ordered.push([card, false]);
+      }
+      for (const [, card] of unseen) ordered.push([card, true]);
     }
-    for (const [, card] of unseen) ordered.push([card, true]);
 
     const selected: StudyCardSnapshot[] = [];
     const entries = new Set<number>();
     let selectedNew = 0;
     for (const [card, isNew] of ordered) {
-      if (isNew && selectedNew >= remainingNew) continue;
+      if (isNew && remainingNew !== null && selectedNew >= remainingNew) continue;
       if (options.distinctEntries === true && entries.has(card.entryId)) continue;
       entries.add(card.entryId);
       selected.push(card);

@@ -406,6 +406,36 @@ describe("VocabularyStore directional tests", () => {
     });
   });
 
+  it("selects only unseen entries and bypasses the daily quota for explicit tests", async () => {
+    await runInDurableObject(stub(), (_instance, state) => {
+      const store = new VocabularyStore(state.storage, "UTC");
+      seedEntries(store, 10);
+      for (const cardId of [1, 3, 5, 7, 9]) {
+        makeDue(state.storage, cardId, "2026-07-25T00:00:00Z");
+      }
+      Array.from(
+        state.storage.sql.exec(
+          `UPDATE vocabulary_cards
+           SET introduced_local_date = '2026-07-20'
+           WHERE id IN (1, 3, 5, 7, 9)`,
+        ),
+      );
+
+      const started = store.startTest(
+        CardDirection.FORWARD,
+        new Date("2026-07-20T10:00:00Z"),
+      );
+
+      expect(started.status).toBe(StudyStartStatus.STARTED);
+      expect(started.snapshot!.queue.map((item) => item.card.id)).toEqual([
+        11, 13, 15, 17, 19,
+      ]);
+      expect(
+        started.snapshot!.queue.every((item) => item.card.state === "new"),
+      ).toBe(true);
+    });
+  });
+
   it("selects one reverse card per entry and refuses a conflicting review", async () => {
     await runInDurableObject(stub(), (_instance, state) => {
       const store = new VocabularyStore(state.storage, "UTC");

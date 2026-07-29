@@ -5,9 +5,9 @@ Hermes gateway: a Telegram webhook, a `VocabularyCompanion` Durable Object
 holding the SQLite study state, and a cron alarm that acts as the review ticker.
 
 It implements the **same v5 model** as `src/hermes_vocab/`: embedded FSRS-6
-scheduling, directional forward/reverse cards, the shared five-per-local-day
-introduction quota, sibling burial, one tail retry, and `/review`,
-`/test forward|reverse`, `/endstudy`.
+scheduling, directional forward/reverse cards, `/review`'s five-per-local-day
+introduction quota, unseen-only directional tests, sibling burial, one tail
+retry, and `/review`, `/test forward|reverse`, `/endstudy`.
 
 Python under `src/hermes_vocab/` is the source of truth. When domain behavior
 changes there, mirror it in `src/domain/` and `src/storage/vocabulary-store.ts`.

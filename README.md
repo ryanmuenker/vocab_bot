@@ -126,7 +126,7 @@ Every finalized answer appends an immutable row to `review_attempts` recording t
 
 ### Daily volume and backlog
 
-- Up to **five previously unseen cards** are introduced per configured local day. The quota counts cards whose `introduced_local_date` is today, and it is shared: cards introduced by `/review` reduce what `/test` can introduce, and the reverse.
+- `/review` introduces up to **five previously unseen cards** per configured local day. The quota counts cards whose `introduced_local_date` is today. An explicit directional `/test` bypasses that quota and introduces its own five unseen entries.
 - **Due work is uncapped.** Every card whose effective due instant has passed and that is not buried today is queued, ordered by due instant, then by predicted recall, then deterministically by age and ID. Due cards always precede new introductions.
 - **Backlog accumulates.** Nothing is discarded, expired, or marked missed. If you skip several days, the next session simply contains every card that came due while you were away, and the five-new allowance still applies on top.
 - Reviews prompt as `Review 2 of 7 · 6 due`, so the queue length and the remaining due count are always visible; a retry item is marked `· retry`.
@@ -153,7 +153,7 @@ Forward: recall each saved meaning from its word.
 Reverse: recall the saved word from one exact definition.
 ```
 
-A test needs exactly five eligible cards of that direction from five distinct entries. Selection reuses the review pool and priority — due cards first, then the weakest not-yet-due cards by predicted recall, then unseen cards within the shared five-per-day quota — and never draws two cards from one entry. With fewer than five it answers, for example, `You have 3 eligible distinct reverse entries. Add or unbury 2 more to start.` and creates no session.
+A test needs exactly five unseen cards of that direction from five distinct entries. It selects the oldest unseen entries deterministically, never draws two cards from one entry, and deliberately bypasses `/review`'s daily introduction quota. Due and seen non-due cards are excluded even when their predicted recall is weak. With fewer than five unseen entries it answers, for example, `You have 3 eligible distinct reverse entries. Add or unbury 2 more to start.` and creates no session.
 
 Prompts are numbered `Question 1 of 5`, with a tail retry shown as `Question 5 of 5 · retry`. A repeated `/test <direction>` during an active session resumes the current question instead of starting another; this is also the recovery procedure after a possibly lost Telegram delivery. The active session, current question, raw answers, drafts, and ratings survive gateway and plugin restarts. An evaluator failure consumes no attempt, reveals nothing, and leaves the same question ready for retry. After the fifth original question the session reports its totals:
 
