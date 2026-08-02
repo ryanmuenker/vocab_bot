@@ -30,14 +30,19 @@ Mirror the approved Python contract in the Worker:
 
 Spacing and punctuation are intentionally insignificant: `pro forma`, `Pro-forma`, and `proforma` match. The broad contract also treats punctuation-only distinctions such as `can't`/`cant` and `C++`/`C` as equivalent during reverse review.
 
-## Runtime parity
+## Runtime authority
 
-Python remains the behavioral source of truth. Update both implementations and both test suites in the same change:
+The Cloudflare Worker is the production source of truth. Update and verify Worker storage and routing first:
 
-- `src/hermes_vocab/review.py`
-- `src/hermes_vocab/hermes_plugin/evaluation.py` only if parity has drifted (the Python matcher is already correct)
 - `worker/src/storage/vocabulary-store.ts`
 - `worker/src/domain/routing.ts`
+- `worker/test/`
+
+Update Python only to preserve deliberate parity for migration and offline tooling:
+
+- `src/hermes_vocab/review.py`
+- `src/hermes_vocab/hermes_plugin/evaluation.py`
+- `tests/`
 
 No database migration is required. Existing card state, due times, attempts, and introduction dates remain valid.
 

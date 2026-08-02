@@ -4,7 +4,7 @@
 
 **Goal:** Introduce five distinct vocabulary entries per local day, prevent duplicate entries in newly selected review work, and make the live Worker accept punctuation-equivalent reverse answers.
 
-**Architecture:** Python remains the source of truth. Its review start path will enable the selector's existing distinct-entry mode; the Worker will mirror that behavior and count introduced entries rather than card rows. Worker reverse-answer normalization will mirror Python's NFKC, case-fold, alphanumeric-only canonicalization.
+**Architecture:** The Worker is the production source of truth. Fix and verify Worker review selection and reverse matching first; update Python second only to preserve deliberate migration/offline parity.
 
 **Tech Stack:** Python 3.12, SQLite, pytest, TypeScript, Cloudflare Durable Objects, Vitest, Ruff, TypeScript compiler
 

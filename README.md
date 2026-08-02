@@ -1,10 +1,12 @@
 # Hermes Vocabulary Companion
 
-A local-first vocabulary capture and spaced-review capability for [Hermes Agent](https://hermes-agent.nousresearch.com/). Telegram and model inference stay in Hermes; vocabulary state, scheduling, and business rules stay in this package and its SQLite database.
+The production vocabulary companion runs in `worker/`: a Cloudflare Worker receives Telegram webhooks, a `VocabularyCompanion` Durable Object owns SQLite state and scheduling, and a cron trigger drives daily review delivery.
 
-Tested with Hermes Agent `0.18.2` on macOS. This release additionally requires a Hermes checkout that exposes the outbound delivery receipt contract; see [Hermes companion prerequisite](#hermes-companion-prerequisite).
+> **Production authority:** `worker/` is the primary implementation and the Durable Object database is the live source of truth. The Python/Hermes implementation under `src/hermes_vocab/` and `~/.local/share/hermes-vocab/vocabulary.sqlite3` are retained for migration, offline tooling, historical reference, and optional parity work; they do not automatically receive entries saved by the Worker.
 
-## Architecture
+See [`worker/README.md`](worker/README.md) for current deployment, operations, and migration guidance.
+
+## Legacy local architecture
 
 ```text
 configured Telegram root DM
@@ -38,7 +40,7 @@ Hermes outbound send ──> post_outbound_delivery ──> prompt_delivery_atte
           └── only a success receipt promotes a prompt to answerable
 ```
 
-SQLite is the only source of truth for saved entries, directional cards, FSRS schedules, study sessions, prompts, delivery receipts, answers, and ratings. Hermes transcripts, memory, cron metadata, and cron output may contain copies, but none decides whether an entry exists, which card is due, whether a prompt was delivered, or which question comes next.
+Within the legacy local runtime, its SQLite database is authoritative for that independent deployment. It is not synchronized with the production Durable Object and must not be used for current production counts or scheduling claims.
 
 ### Why each component exists
 

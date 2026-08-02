@@ -9,8 +9,7 @@ scheduling, directional forward/reverse cards, `/review`'s five-per-local-day
 introduction quota, unseen-only directional tests, sibling burial, one tail
 retry, and `/review`, `/test forward|reverse`, `/endstudy`.
 
-Python under `src/hermes_vocab/` is the source of truth. When domain behavior
-changes there, mirror it in `src/domain/` and `src/storage/vocabulary-store.ts`.
+The Worker implementation under `worker/src/` is the production source of truth. User-visible fixes must land here first and be covered under `worker/test/`. Python is secondary migration/reference code; update it only when snapshot compatibility, offline tooling, or deliberately maintained parity requires it.
 
 ## Delivery safety
 
