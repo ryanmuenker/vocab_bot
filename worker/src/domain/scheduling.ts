@@ -95,6 +95,8 @@ export interface ScheduleTransition {
 export interface TransitionOptions {
   /** Marks the single retry produced by a preceding Again in the same session. */
   readonly sameSessionRetry?: boolean;
+  /** Whether an Again may append one retry to the current session. */
+  readonly allowSameSessionRetry?: boolean;
   /** Next configured local-day boundary, already converted to UTC by the caller. */
   readonly dueFloorUtc?: Date | null;
 }
@@ -202,6 +204,7 @@ export function transition(
   options: TransitionOptions = {},
 ): ScheduleTransition {
   const sameSessionRetry = options.sameSessionRetry ?? false;
+  const allowSameSessionRetry = options.allowSameSessionRetry ?? true;
   const dueFloorUtc = options.dueFloorUtc ?? null;
 
   requireUtc(reviewedAt, "reviewedAt");
@@ -263,7 +266,8 @@ export function transition(
     retrievability: currentRetrievability,
     rawDue,
     effectiveDue,
-    retrySameSession: rating === ReviewRating.AGAIN && !sameSessionRetry,
+    retrySameSession:
+      allowSameSessionRetry && rating === ReviewRating.AGAIN && !sameSessionRetry,
   });
 }
 

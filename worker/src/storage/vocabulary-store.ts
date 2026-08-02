@@ -48,8 +48,8 @@ import {
 } from "../domain/scheduling";
 import type { CardSchedule, ScheduleTransition } from "../domain/scheduling";
 
-/** Unseen cards introduced per local day, shared by review and test selection. */
-const DAILY_NEW_CARD_LIMIT = 5;
+/** Previously untouched entries introduced per local day by daily review. */
+const DAILY_NEW_ENTRY_LIMIT = 15;
 /** A directional test always runs exactly five cards from five distinct entries. */
 export const TEST_REQUIRED_CARDS = 5;
 /** Position offsets that keep UNIQUE (session_id, position) satisfied mid-renumber. */
@@ -1010,6 +1010,7 @@ export class VocabularyStore {
           this.sql.exec<FinalizeRow>(
             `SELECT p.id AS prompt_id, p.status AS prompt_status, p.session_id AS session_id,
                     q.id AS queue_id, q.card_id AS card_id,
+                    s.mode AS session_mode,
                     q.retry_of_queue_item_id AS retry_of_queue_item_id,
                     original.completed_attempt_id AS retry_of_attempt_id,
                     d.id AS draft_id, d.submitted_answer AS submitted_answer,
@@ -1021,6 +1022,7 @@ export class VocabularyStore {
                     c.parameters_version, c.parameter_fingerprint, c.desired_retention,
                     c.introduced_local_date, c.buried_until_local_date, c.created_at
              FROM study_prompts p
+             JOIN study_sessions s ON s.id = p.session_id
              JOIN study_queue q ON q.id = p.queue_item_id
              LEFT JOIN study_queue original ON original.id = q.retry_of_queue_item_id
              JOIN vocabulary_cards c ON c.id = q.card_id
@@ -1041,6 +1043,7 @@ export class VocabularyStore {
         const result = transition(before, rating, now, {
           sameSessionRetry: retryAgain,
           dueFloorUtc: retryAgain ? this.nextLocalMidnight(now) : null,
+          allowSameSessionRetry: row.session_mode !== StudyMode.REVIEW,
         });
         const attemptId = this.insertAttempt(row, result, rating, retryAgain);
         const updated = this.sql.exec(
@@ -1321,9 +1324,10 @@ export class VocabularyStore {
 
   /**
    * Due cards first, ordered by effective due then predicted recall then age;
-   * optionally the weakest seen non-due cards; then unseen cards within the
-   * shared five-per-local-day introduction quota. Explicit unseen-only
-   * selection bypasses that quota.
+   * optionally the weakest seen non-due cards; then new cards from untouched
+   * entries before unseen siblings of previously attempted entries, within the
+   * daily review introduction quota. Explicit unseen-only selection bypasses
+   * that quota and retains creation order.
    */
   private selectCards(now: Date, options: SelectOptions = {}): StudyCardSnapshot[] {
     const today = localDate(now, this.timeZone);
@@ -1345,18 +1349,34 @@ export class VocabularyStore {
               options.direction,
             ),
           );
-    const introducedToday =
+    const introducedByReviewToday =
       oneOrNull(
         this.sql.exec<{ count: number }>(
-          "SELECT COUNT(DISTINCT entry_id) AS count FROM vocabulary_cards WHERE introduced_local_date = ?",
+          `SELECT COUNT(DISTINCT c.entry_id) AS count
+           FROM study_queue q
+           JOIN study_sessions s ON s.id = q.session_id
+           JOIN vocabulary_cards c ON c.id = q.card_id
+           WHERE s.mode = 'review' AND q.introduced_local_date = ?`,
           today,
         ),
       )?.count ?? 0;
     const remainingNew =
       options.onlyUnseen === true
         ? null
-        : Math.max(DAILY_NEW_CARD_LIMIT - introducedToday, 0);
+        : Math.max(DAILY_NEW_ENTRY_LIMIT - introducedByReviewToday, 0);
     const excluded = options.excludedIds ?? new Set<number>();
+    const attemptedEntries =
+      options.onlyUnseen === true
+        ? null
+        : new Set(
+            all(
+              this.sql.exec<{ entry_id: number }>(
+                `SELECT DISTINCT card.entry_id
+                 FROM review_attempts attempt
+                 JOIN vocabulary_cards card ON card.id = attempt.card_id`,
+              ),
+            ).map(({ entry_id }) => entry_id),
+          );
 
     const due: [readonly number[], StudyCardSnapshot][] = [];
     const weak: [readonly number[], StudyCardSnapshot][] = [];
@@ -1366,7 +1386,10 @@ export class VocabularyStore {
       const card = cardSnapshot(row);
       if (card.state === CardScheduleState.NEW) {
         if (row.introduced_local_date === null) {
-          unseen.push([[card.createdAt.getTime(), card.id], card]);
+          unseen.push([
+            [attemptedEntries?.has(card.entryId) === true ? 1 : 0, card.createdAt.getTime(), card.id],
+            card,
+          ]);
         }
         continue;
       }
@@ -1754,6 +1777,7 @@ type FinalizeRow = CardRow & {
   prompt_id: number;
   prompt_status: StudyPromptStatus;
   session_id: number;
+  session_mode: StudyMode;
   queue_id: number;
   card_id: number;
   retry_of_queue_item_id: number | null;

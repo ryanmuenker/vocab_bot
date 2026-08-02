@@ -4,10 +4,10 @@ An event-driven deployment of the same vocabulary companion that runs under the
 Hermes gateway: a Telegram webhook, a `VocabularyCompanion` Durable Object
 holding the SQLite study state, and a cron alarm that acts as the review ticker.
 
-It implements the **same v5 model** as `src/hermes_vocab/`: embedded FSRS-6
-scheduling, directional forward/reverse cards, `/review`'s five-per-local-day
-introduction quota, unseen-only directional tests, sibling burial, one tail
-retry, and `/review`, `/test forward|reverse`, `/endstudy`.
+It implements the production **v5 model**: embedded FSRS-6
+scheduling, directional forward/reverse cards, `/review`'s 15-untouched-entry
+per-local-day introduction quota, unseen-only directional tests, sibling burial,
+test-only tail retries, and `/review`, `/test forward|reverse`, `/endstudy`.
 
 The Worker implementation under `worker/src/` is the production source of truth. User-visible fixes must land here first and be covered under `worker/test/`. Python is secondary migration/reference code; update it only when snapshot compatibility, offline tooling, or deliberately maintained parity requires it.
 

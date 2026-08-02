@@ -122,16 +122,16 @@ Next due: 2026-08-01 03:11 UTC
 Progress: 1 of 4 complete.
 ```
 
-**One tail retry.** The first `Again` on a card in a session also requeues that card once at the end of the current queue, and the reply adds `Retry added at the end.`. A second `Again` on that retry does not requeue again; its due instant is floored to the next local midnight, so the card returns the next local day at the earliest. Either way the FSRS schedule is already at least one day out; the tail retry is extra practice, not a shortcut.
+**Retries are test-only.** In `/review`, `Again` applies the FSRS transition, reports a next due instant at least one day out, and continues without requeueing the card. In a directional `/test`, the first `Again` requeues the card once at the end and adds `Retry added at the end.`; an `Again` on that retry cannot loop again and is floored to the next local midnight.
 
 Every finalized answer appends an immutable row to `review_attempts` recording the answer, grade, rating, before/after schedule, retrievability, and the scheduler identity that produced it. Attempt and delivery rows cannot be updated or deleted; SQLite triggers abort the attempt.
 
 ### Daily volume and backlog
 
-- `/review` introduces up to **five previously unseen cards** per configured local day. The quota counts cards whose `introduced_local_date` is today. An explicit directional `/test` bypasses that quota and introduces its own five unseen entries.
+- `/review` introduces up to **15 previously untouched entries** per configured local day. Entries with no recorded attempts are selected before unseen forward/reverse siblings of entries already practiced. The quota counts only distinct entries introduced by `/review` that day; an explicit directional `/test` has its own five unseen entries and does not reduce the review allowance.
 - **Due work is uncapped.** Every card whose effective due instant has passed and that is not buried today is queued, ordered by due instant, then by predicted recall, then deterministically by age and ID. Due cards always precede new introductions.
-- **Backlog accumulates.** Nothing is discarded, expired, or marked missed. If you skip several days, the next session simply contains every card that came due while you were away, and the five-new allowance still applies on top.
-- Reviews prompt as `Review 2 of 7 · 6 due`, so the queue length and the remaining due count are always visible; a retry item is marked `· retry`.
+- **Backlog accumulates.** Nothing is discarded, expired, or marked missed. If you skip several days, the next session simply contains every card that came due while you were away, and the 15-entry allowance still applies on top.
+- Reviews prompt as `Review 2 of 7 · 6 due`, so the queue length and remaining due count are always visible. Directional test retries are marked `· retry`.
 
 ### `/review`
 
@@ -357,8 +357,8 @@ In the bot's configured, allowlisted private root DM:
 6. Send `/review`. On a database with eligible cards, confirm a prompt shaped `Review 1 of N · N due` followed by `What does '<entry>' mean?`. On an empty card pool, confirm `There are no eligible vocabulary cards to review.`
 7. Send `give me a hint?`. Confirm the response is `Hint: ` followed exactly by that card's first stored example sentence, with the term visible, no grade, and no advance.
 8. Answer the question with a deliberately partial answer. Confirm `Grade: Partial`, `Feedback: …`, the canonical reveal, then `Choose effort: Again or Hard.`
-9. Reply `again`. Confirm `Rated: Again`, a `Next due:` at least one day out, `Progress: …`, `Retry added at the end.`, and that the next prompt follows.
-10. Answer the remaining cards. When the retry returns at the tail, answer it and reply `again` a second time; confirm no third copy is queued.
+9. Reply `again`. Confirm `Rated: Again`, a `Next due:` at least one day out, `Progress: …`, no `Retry added at the end.`, and that the next distinct entry follows.
+10. Answer the remaining review cards; confirm the failed card does not return during the same daily review.
 11. Answer one question correctly and reply `easy`; confirm the next due instant moves further out than a `hard` rating on a comparable card.
 12. Restart the foreground gateway mid-session — once while a prompt is unanswered and once while a prompt is awaiting its rating — and confirm the next ordinary message resumes exactly where you left off with no duplicate evaluator call.
 13. With at least five eligible distinct entries, send `/test reverse`. Confirm `Question 1 of 5` and a definition-first prompt. Answer one question with the exact saved entry text in different case; confirm `Grade: Correct`. Finish the test and confirm `Reverse test complete.` with exact totals.

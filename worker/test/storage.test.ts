@@ -172,34 +172,80 @@ describe("VocabularyStore selection", () => {
     });
   });
 
-  it("introduces five distinct unseen entries per local day across sessions", async () => {
+  it("introduces fifteen distinct unseen entries per local day across sessions", async () => {
     await runInDurableObject(stub(), (_instance, state) => {
       const store = new VocabularyStore(state.storage, "UTC");
-      seedEntries(store, 6);
+      seedEntries(store, 16);
+      const expectedCardIds = Array.from({ length: 15 }, (_, index) => index * 2 + 1);
 
       const started = store.startReview(new Date("2026-07-20T10:00:00Z"));
-      expect(started.snapshot!.queue.map((item) => item.card.id)).toEqual([1, 3, 5, 7, 9]);
-      expect(new Set(started.snapshot!.queue.map((item) => item.card.entryId)).size).toBe(5);
+      expect(started.snapshot!.queue.map((item) => item.card.id)).toEqual(expectedCardIds);
+      expect(new Set(started.snapshot!.queue.map((item) => item.card.entryId)).size).toBe(15);
       expect(
         rows<{ count: number }>(
           state.storage,
           "SELECT COUNT(DISTINCT entry_id) AS count FROM vocabulary_cards " +
             "WHERE introduced_local_date = '2026-07-20'",
         )[0]!.count,
-      ).toBe(5);
+      ).toBe(15);
       expect(
         rows<{ count: number }>(
           state.storage,
           "SELECT COUNT(*) AS count FROM vocabulary_cards " +
             "WHERE introduced_local_date = '2026-07-20'",
         )[0]!.count,
-      ).toBe(10);
+      ).toBe(30);
 
       expect(store.exitStudy(new Date("2026-07-20T10:05:00Z"))).toBe(
         StudyMutationStatus.COMPLETED,
       );
       const second = store.startReview(new Date("2026-07-20T11:00:00Z"));
-      expect(second.snapshot!.queue.map((item) => item.card.id)).toEqual([1, 3, 5, 7, 9]);
+      expect(second.snapshot!.queue.map((item) => item.card.id)).toEqual(expectedCardIds);
+    });
+  });
+
+  it("prioritizes entries with no historical attempts before unseen siblings", async () => {
+    await runInDurableObject(stub(), (_instance, state) => {
+      const store = new VocabularyStore(state.storage, "UTC");
+      store.captureEntry("attempted", [CARD], new Date("2026-05-01T00:00:00Z"));
+      const firstDay = new Date("2026-07-20T10:00:00Z");
+      store.startReview(firstDay);
+      answerCurrent(store, ReviewRating.GOOD, firstDay);
+
+      // Reproduce a legacy/prod entry whose reviewed forward card predates an
+      // unintroduced reverse sibling.
+      Array.from(
+        state.storage.sql.exec(
+          `UPDATE vocabulary_cards
+           SET introduced_local_date = NULL, buried_until_local_date = NULL
+           WHERE entry_id = 1 AND direction = 'reverse'`,
+        ),
+      );
+      seedEntries(store, 15, "untouched");
+
+      const started = store.startReview(new Date("2026-07-21T10:00:00Z"));
+      expect(started.status).toBe(StudyStartStatus.STARTED);
+      expect(started.snapshot!.queue.map((item) => item.card.entryId)).toEqual(
+        Array.from({ length: 15 }, (_, index) => index + 2),
+      );
+      expect(started.snapshot!.queue.some((item) => item.card.entryId === 1)).toBe(false);
+    });
+  });
+
+  it("does not let directional tests consume daily review introductions", async () => {
+    await runInDurableObject(stub(), (_instance, state) => {
+      const store = new VocabularyStore(state.storage, "UTC");
+      seedEntries(store, 20);
+      const now = new Date("2026-07-20T10:00:00Z");
+
+      const test = store.startTest(CardDirection.FORWARD, now);
+      expect(test.snapshot!.queue.map((item) => item.card.entryId)).toEqual([1, 2, 3, 4, 5]);
+      expect(store.exitStudy(now)).toBe(StudyMutationStatus.COMPLETED);
+
+      const review = store.startReview(now);
+      expect(review.snapshot!.queue.map((item) => item.card.entryId)).toEqual(
+        Array.from({ length: 15 }, (_, index) => index + 6),
+      );
     });
   });
 
@@ -361,38 +407,33 @@ describe("VocabularyStore finalization", () => {
     });
   });
 
-  it("appends exactly one tail retry and pushes it past the current local day", async () => {
+  it("does not append a same-session retry in a daily review", async () => {
     await runInDurableObject(stub(), (_instance, state) => {
       const store = new VocabularyStore(state.storage, "UTC");
       store.captureEntry("obdurate", [CARD], new Date("2026-06-01T00:00:00Z"));
       const now = new Date("2026-07-20T10:00:00Z");
       store.startReview(now);
 
-      const first = answerCurrent(store, ReviewRating.AGAIN, now);
-      expect(first.result.transition!.retrySameSession).toBe(true);
-      const retryItems = first.result.snapshot!.queue.filter(
-        (item) => item.retryOfQueueItemId !== null,
-      );
-      expect(retryItems).toHaveLength(1);
-      expect(retryItems[0]!.status).toBe(StudyQueueStatus.CURRENT);
+      const outcome = answerCurrent(store, ReviewRating.AGAIN, now, {
+        grade: EvaluationGrade.INCORRECT,
+        feedback: "Wrong.",
+      });
 
-      const second = answerCurrent(store, ReviewRating.AGAIN, now);
-      expect(second.result.transition!.retrySameSession).toBe(false);
-      expect(second.result.snapshot!.queue.filter((item) => item.retryOfQueueItemId !== null))
-        .toHaveLength(1);
-      // The floor is `dueFloorUtc`; FSRS never schedules inside 24 hours, so the
-      // raw due already clears the next local midnight and no clamp is applied.
-      expect(second.result.transition!.effectiveDue.getTime())
-        .toBeGreaterThanOrEqual(Date.parse("2026-07-21T00:00:00Z"));
-      expect(second.result.transition!.effectiveDue.getTime())
-        .toBe(second.result.transition!.rawDue.getTime());
-      expect(second.result.snapshot!.status).toBe("completed");
+      expect(outcome.result.transition!.retrySameSession).toBe(false);
+      expect(outcome.result.transition!.effectiveDue.getTime())
+        .toBe(outcome.result.transition!.rawDue.getTime());
+      expect(outcome.result.transition!.effectiveDue.getTime())
+        .toBeGreaterThanOrEqual(Date.parse("2026-07-21T10:00:00Z"));
+      expect(outcome.result.snapshot!.queue.filter(
+        (item) => item.retryOfQueueItemId !== null,
+      )).toHaveLength(0);
+      expect(outcome.result.snapshot!.status).toBe("completed");
       expect(
         rows<{ is_same_session_retry: number }>(
           state.storage,
-          "SELECT is_same_session_retry FROM review_attempts ORDER BY id",
-        ).map(({ is_same_session_retry }) => is_same_session_retry),
-      ).toEqual([0, 1]);
+          "SELECT is_same_session_retry FROM review_attempts",
+        ),
+      ).toEqual([{ is_same_session_retry: 0 }]);
     });
   });
 });
