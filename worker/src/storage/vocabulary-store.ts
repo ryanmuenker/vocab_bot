@@ -496,7 +496,10 @@ export class VocabularyStore {
         }
         const carryover = this.carryoverCards(today);
         const excludedIds = new Set(carryover.cards.map((card) => card.id));
-        const cards = [...carryover.cards, ...this.selectCards(now, { excludedIds })];
+        const cards = [
+          ...carryover.cards,
+          ...this.selectCards(now, { excludedIds, distinctEntries: true }),
+        ];
         if (cards.length === 0) {
           return { status: StudyStartStatus.EMPTY, snapshot: null, availableCount: 0 };
         }
@@ -1345,7 +1348,7 @@ export class VocabularyStore {
     const introducedToday =
       oneOrNull(
         this.sql.exec<{ count: number }>(
-          "SELECT COUNT(*) AS count FROM vocabulary_cards WHERE introduced_local_date = ?",
+          "SELECT COUNT(DISTINCT entry_id) AS count FROM vocabulary_cards WHERE introduced_local_date = ?",
           today,
         ),
       )?.count ?? 0;
@@ -1478,9 +1481,9 @@ export class VocabularyStore {
           this.sql.exec(
             `UPDATE vocabulary_cards
              SET introduced_local_date = COALESCE(introduced_local_date, ?)
-             WHERE id = ?`,
+             WHERE entry_id = ?`,
             introduced,
-            card.id,
+            card.entryId,
           ),
         );
       }
@@ -1626,9 +1629,9 @@ export class VocabularyStore {
           this.sql.exec(
             `UPDATE vocabulary_cards
              SET introduced_local_date = COALESCE(introduced_local_date, ?)
-             WHERE id = ?`,
+             WHERE entry_id = ?`,
             introduced,
-            placement.card.id,
+            placement.card.entryId,
           ),
         );
       }

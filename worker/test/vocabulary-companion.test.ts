@@ -10,6 +10,7 @@ import {
   SCHEDULER_VERSION,
 } from "../src/domain/scheduling";
 import { encodeReal } from "../src/domain/snapshot";
+import { normalizeReverseAnswer } from "../src/domain/routing";
 import type { SnapshotCard, SnapshotV2 } from "../src/domain/snapshot";
 
 function message(updateId: number, text: string, receivedAt = "2026-07-23T04:00:00Z") {
@@ -246,7 +247,7 @@ describe("VocabularyCompanion delivery gating", () => {
 
     await stub.enqueueTelegramUpdate(message(1, "/review"));
     await drain(stub);
-    expect(io.sent[0]).toContain("Review 1 of 5 · 5 due");
+    expect(io.sent[0]).toContain("Review 1 of 3 · 3 due");
     expect(io.sent[0]).toContain("What does 'word-1' mean?");
 
     await stub.enqueueTelegramUpdate(message(2, "hint"));
@@ -269,7 +270,7 @@ describe("VocabularyCompanion delivery gating", () => {
     await drain(stub);
     expect(io.sent[4]).toContain("Rated: Good");
     expect(io.sent[4]).toContain("Next due: ");
-    expect(io.sent[4]).toContain("Progress: 1 of 4 complete.");
+    expect(io.sent[4]).toContain("Progress: 1 of 3 complete.");
     // The next prompt rides along and is itself only answerable once delivered.
     expect(io.sent[4]).toContain("What does 'word-2' mean?");
 
@@ -364,10 +365,22 @@ describe("VocabularyCompanion delivery gating", () => {
     expect((await stub.summary()).entries).toBe(3);
   });
 
-  it("grades a reverse card by exact match without calling the evaluator", async () => {
+  it("grades punctuation-equivalent reverse answers without calling the evaluator", async () => {
+    expect(normalizeReverseAnswer("  Pro-forma...  ")).toBe("proforma");
+    expect(normalizeReverseAnswer("can't")).toBe(normalizeReverseAnswer("cant"));
+    expect(normalizeReverseAnswer("C++")).toBe(normalizeReverseAnswer("C"));
+
     const io = transport();
     const stub = companion("reverse-test");
-    await stub.importSnapshot(library(5));
+    const snapshot = library(5);
+    await stub.importSnapshot({
+      ...snapshot,
+      entries: snapshot.entries.map((entry, index) =>
+        index === 0
+          ? { ...entry, displayText: "Pro-forma", normalizedText: "pro-forma" }
+          : entry,
+      ),
+    });
 
     await stub.enqueueTelegramUpdate(message(1, "/test reverse"));
     await drain(stub);
@@ -375,11 +388,11 @@ describe("VocabularyCompanion delivery gating", () => {
       "Question 1 of 5\nWhich saved word matches this definition?\ndefinition 1",
     );
 
-    await stub.enqueueTelegramUpdate(message(2, "  Word-1. "));
+    await stub.enqueueTelegramUpdate(message(2, "pro forma"));
     await drain(stub);
     expect(io.modelCalls()).toBe(0);
     expect(io.sent[1]).toContain("Grade: Correct\nFeedback: Exact match to the saved entry.");
-    expect(io.sent[1]).toContain("Answer: word-1");
+    expect(io.sent[1]).toContain("Answer: Pro-forma");
 
     await stub.enqueueTelegramUpdate(message(3, "easy"));
     await drain(stub);
@@ -393,7 +406,6 @@ describe("VocabularyCompanion delivery gating", () => {
     expect(io.sent[3]).toContain("Grade: Incorrect");
     expect(io.sent[3]).toContain("That does not exactly match the saved entry.");
     expect(io.sent[3]).toContain("Retry added at the end.");
-    expect(io.sent[3]).not.toContain("Choose effort");
   });
 });
 

@@ -10,6 +10,7 @@ const HINT_REQUESTS: Record<string, true> = {
   "example sentence": true,
 };
 const PYTHON_WHITESPACE_RUN = /[\p{White_Space}\u001c-\u001f]+/gu;
+const REVERSE_ANSWER_ALPHANUMERIC = /[\p{Letter}\p{Number}]/u;
 
 export function isHintRequest(message: string): boolean {
   const collapsed = caseFold(trimPythonWhitespace(message).replace(PYTHON_WHITESPACE_RUN, " "));
@@ -70,8 +71,12 @@ export function parseRating(
   return allowed.find((rating) => rating === token) ?? null;
 }
 
-/** Reverse cards are graded by exact match on the saved entry text. */
+/** Reverse cards are graded by canonical identity with punctuation and spacing ignored. */
 export function normalizeReverseAnswer(text: string): string {
-  const collapsed = caseFold(trimPythonWhitespace(text).replace(PYTHON_WHITESPACE_RUN, " "));
-  return trimPythonWhitespace(collapsed.replace(/[.!?]+$/u, ""));
+  const folded = caseFold(text.normalize("NFKC"));
+  let normalized = "";
+  for (const character of folded) {
+    if (REVERSE_ANSWER_ALPHANUMERIC.test(character)) normalized += character;
+  }
+  return normalized;
 }

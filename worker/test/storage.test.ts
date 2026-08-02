@@ -172,20 +172,34 @@ describe("VocabularyStore selection", () => {
     });
   });
 
-  it("introduces at most five unseen cards per local day across sessions", async () => {
+  it("introduces five distinct unseen entries per local day across sessions", async () => {
     await runInDurableObject(stub(), (_instance, state) => {
       const store = new VocabularyStore(state.storage, "UTC");
       seedEntries(store, 6);
 
       const started = store.startReview(new Date("2026-07-20T10:00:00Z"));
-      expect(started.snapshot!.queue).toHaveLength(5);
-      expect(store.exitStudy(new Date("2026-07-20T10:05:00Z"))).toBe(StudyMutationStatus.COMPLETED);
+      expect(started.snapshot!.queue.map((item) => item.card.id)).toEqual([1, 3, 5, 7, 9]);
+      expect(new Set(started.snapshot!.queue.map((item) => item.card.entryId)).size).toBe(5);
+      expect(
+        rows<{ count: number }>(
+          state.storage,
+          "SELECT COUNT(DISTINCT entry_id) AS count FROM vocabulary_cards " +
+            "WHERE introduced_local_date = '2026-07-20'",
+        )[0]!.count,
+      ).toBe(5);
+      expect(
+        rows<{ count: number }>(
+          state.storage,
+          "SELECT COUNT(*) AS count FROM vocabulary_cards " +
+            "WHERE introduced_local_date = '2026-07-20'",
+        )[0]!.count,
+      ).toBe(10);
 
-      // The quota is per local day, so a second same-day session introduces none
-      // beyond the five already carried over.
+      expect(store.exitStudy(new Date("2026-07-20T10:05:00Z"))).toBe(
+        StudyMutationStatus.COMPLETED,
+      );
       const second = store.startReview(new Date("2026-07-20T11:00:00Z"));
-      expect(second.snapshot!.queue).toHaveLength(5);
-      expect(second.snapshot!.queue.map((item) => item.card.id)).toEqual([1, 2, 3, 4, 5]);
+      expect(second.snapshot!.queue.map((item) => item.card.id)).toEqual([1, 3, 5, 7, 9]);
     });
   });
 
@@ -311,8 +325,8 @@ describe("VocabularyStore finalization", () => {
       expect(new Date(card.effective_due_at).getTime())
         .toBe(result.transition!.effectiveDue.getTime());
 
-      // The reverse sibling of the same entry is buried for the local day and
-      // dropped from the queue without moving its due time.
+      // The reverse sibling of the same entry was not selected into this
+      // distinct-entry queue, and finalization still buries it for the day.
       const sibling = rows<{ buried_until_local_date: string | null; effective_due_at: string }>(
         state.storage,
         "SELECT * FROM vocabulary_cards WHERE id = 2",
@@ -320,7 +334,6 @@ describe("VocabularyStore finalization", () => {
       expect(sibling.buried_until_local_date).toBe("2026-07-20");
       expect(sibling.effective_due_at).toBe("2026-06-01T00:00:00Z");
       const queue = result.snapshot!.queue;
-      expect(queue.find((item) => item.card.id === 2)!.status).toBe(StudyQueueStatus.SKIPPED);
       expect(queue.find((item) => item.card.id === 3)!.status).toBe(StudyQueueStatus.CURRENT);
       expect(
         rows<{ status: string }>(state.storage, "SELECT status FROM study_prompts WHERE id = ?", prompt.id)[0],

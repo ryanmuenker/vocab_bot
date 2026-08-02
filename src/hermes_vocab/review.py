@@ -109,6 +109,7 @@ class ReviewService:
                 cards = carryover + self._select_cards(
                     connection,
                     now=now,
+                    distinct_entries=True,
                     excluded_ids={card.id for card in carryover},
                 )
                 if not cards:

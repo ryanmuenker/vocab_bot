@@ -192,21 +192,54 @@ def test_start_snapshots_all_due_plus_five_unseen_and_restart_resumes(
         add_seen(database, index, due=NOW - timedelta(days=8 - index))
         for index in range(8)
     ]
-    new_ids = [add_new(database, index) for index in range(7)]
+    new_entry_cards: list[tuple[int, int]] = []
+    for index in range(6):
+        entry_id = 300 + index
+        forward_id = add_card(
+            database,
+            entry_id=entry_id,
+            card_id=3000 + index * 2,
+            state=CardScheduleState.NEW,
+            due=NOW - timedelta(days=30),
+            direction=CardDirection.FORWARD,
+            created_at=NOW + timedelta(seconds=index),
+        )
+        reverse_id = add_card(
+            database,
+            entry_id=entry_id,
+            card_id=3001 + index * 2,
+            state=CardScheduleState.NEW,
+            due=NOW - timedelta(days=30),
+            direction=CardDirection.REVERSE,
+            sense_id=4000 + index,
+            created_at=NOW + timedelta(seconds=index, microseconds=1),
+        )
+        new_entry_cards.append((forward_id, reverse_id))
 
     started = service.start()
     restarted = ReviewService(database, TIMEZONE, lambda: NOW).start()
 
     assert started.status is StudyStartStatus.STARTED
     assert started.snapshot is not None
-    assert [item.card.id for item in started.snapshot.queue] == due_ids + new_ids[:5]
+    expected_unseen = [forward for forward, _ in new_entry_cards[:5]]
+    assert [item.card.id for item in started.snapshot.queue] == (
+        due_ids + expected_unseen
+    )
+    assert len({item.card.entry_id for item in started.snapshot.queue}) == len(
+        started.snapshot.queue
+    )
     assert restarted.status is StudyStartStatus.RESUMED
     assert restarted.snapshot == started.snapshot
     assert started.snapshot.progress.total == 13
     with database.connect() as connection:
         assert connection.execute(
-            "SELECT COUNT(*) FROM vocabulary_cards WHERE introduced_local_date = '2026-07-20'"
+            "SELECT COUNT(DISTINCT entry_id) FROM vocabulary_cards "
+            "WHERE introduced_local_date = '2026-07-20'"
         ).fetchone()[0] == 5
+        assert connection.execute(
+            "SELECT COUNT(*) FROM vocabulary_cards "
+            "WHERE introduced_local_date = '2026-07-20'"
+        ).fetchone()[0] == 10
 
 
 def test_ordinary_review_excludes_seen_non_due_and_exit_preserves_due(
@@ -493,11 +526,11 @@ def test_selector_supports_direction_distinct_entries_and_shared_daily_quota(
     assert third in [card.id for card in service.select_cards(maximum_count=5)]
 
 
-def test_finalization_does_not_bury_siblings_and_completes_only_current_card(
+def test_distinct_review_defers_sibling_without_burying_or_rescheduling(
     tmp_path: Path,
 ) -> None:
     service, clock, database = setup_service(tmp_path)
-    add_seen(database, 1, due=NOW - timedelta(days=1))
+    first = add_seen(database, 1, due=NOW - timedelta(days=1))
     sibling = add_card(
         database,
         entry_id=201,
@@ -511,7 +544,9 @@ def test_finalization_does_not_bury_siblings_and_completes_only_current_card(
         direction=CardDirection.REVERSE,
         sense_id=90010,
     )
-    service.start()
+    started = service.start()
+    assert started.snapshot is not None
+    assert [item.card.id for item in started.snapshot.queue] == [first]
     prompt = deliver_current(service)
     assert service.record_answer(prompt.id, "answer", EVALUATION) is not None
     with database.connect() as connection:
@@ -523,30 +558,24 @@ def test_finalization_does_not_bury_siblings_and_completes_only_current_card(
 
     assert finalized.status is FinalizeStatus.COMPLETED
     assert finalized.snapshot is not None
-    # Without burial, the sibling remains queued and becomes the current card.
-    assert finalized.snapshot.status is StudySessionStatus.ACTIVE
+    assert finalized.snapshot.status is StudySessionStatus.COMPLETED
     assert finalized.snapshot.progress.completed == 1
-    assert finalized.snapshot.progress.total == 2
-    # Siblings are not buried — they remain immediately eligible.
+    assert finalized.snapshot.progress.total == 1
     with database.connect() as connection:
         assert connection.execute(
             "SELECT buried_until_local_date FROM vocabulary_cards WHERE id = ?",
             (sibling,),
         ).fetchone()[0] is None
-        # ...and finalize left the sibling's schedule untouched.
         assert connection.execute(
             "SELECT effective_due_at FROM vocabulary_cards WHERE id = ?",
             (sibling,),
         ).fetchone()[0] == sibling_due
     assert sibling in [card.id for card in service.select_cards()]
-    # The queue advances to the sibling card (no prompt prepared yet).
-    assert finalized.snapshot.current_prompt is None
-    with database.connect() as connection:
-        next_queue = connection.execute(
-            "SELECT status, card_id FROM study_queue WHERE id != ? AND session_id = ?",
-            (prompt.queue_item_id, finalized.snapshot.session_id),
-        ).fetchone()
-        assert next_queue is not None and next_queue["status"] == "current"
+
+    next_review = service.start()
+    assert next_review.status is StudyStartStatus.STARTED
+    assert next_review.snapshot is not None
+    assert [item.card.id for item in next_review.snapshot.queue] == [sibling]
 
 @pytest.mark.parametrize("prepare_prompt", [False, True])
 def test_rollover_without_answerable_prompt_reorders_newly_due_before_unseen_current(
