@@ -1039,13 +1039,14 @@ export class VocabularyStore {
         }
 
         const before = scheduleFromRow(row);
-        const retryAgain = rating === "again" && row.retry_of_queue_item_id !== null;
+        const isSameSessionRetry = row.retry_of_attempt_id !== null;
+        const retryAgain = rating === "again" && isSameSessionRetry;
         const result = transition(before, rating, now, {
           sameSessionRetry: retryAgain,
           dueFloorUtc: retryAgain ? this.nextLocalMidnight(now) : null,
           allowSameSessionRetry: row.session_mode !== StudyMode.REVIEW,
         });
-        const attemptId = this.insertAttempt(row, result, rating, retryAgain);
+        const attemptId = this.insertAttempt(row, result, rating, isSameSessionRetry);
         const updated = this.sql.exec(
           `UPDATE vocabulary_cards
            SET state = ?, stability = ?, difficulty = ?, due_at = ?, effective_due_at = ?,

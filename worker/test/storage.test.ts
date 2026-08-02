@@ -540,6 +540,22 @@ describe("VocabularyStore directional tests", () => {
         rows<{ count: number }>(state.storage, "SELECT COUNT(*) AS count FROM review_attempts")[0]!
           .count,
       ).toBe(6);
+      expect(
+        rows<{
+          rating: string;
+          is_same_session_retry: number;
+          retry_of_attempt_id: number | null;
+        }>(
+          state.storage,
+          `SELECT rating, is_same_session_retry, retry_of_attempt_id
+           FROM review_attempts
+           WHERE retry_of_attempt_id IS NOT NULL`,
+        ),
+      ).toEqual([{
+        rating: ReviewRating.GOOD,
+        is_same_session_retry: 1,
+        retry_of_attempt_id: 1,
+      }]);
     });
   });
 });
