@@ -287,6 +287,51 @@ export class VocabularyCompanion extends DurableObject<Env> {
     return { status: "error" };
   }
 
+  /**
+   * Admin repair for a mis-entered entry: replace its display and normalized
+   * text with the canonical normalization of the corrected text, without
+   * touching senses, cards, or any audit history.
+   */
+  async fixEntry(input: {
+    readonly id: number;
+    readonly displayText: string;
+  }): Promise<
+    | { readonly status: "updated"; readonly displayText: string; readonly normalizedText: string }
+    | { readonly status: "not_found" }
+    | { readonly status: "conflict" }
+  > {
+    const normalized = normalizeEntryText(input.displayText);
+    if (normalized.status !== EntryTextStatus.VALID) {
+      throw new TypeError("invalid display text");
+    }
+    const existing = rows(
+      this.ctx.storage.sql.exec<{ id: number }>(
+        "SELECT id FROM vocabulary_entries WHERE id = ?",
+        input.id,
+      ),
+    )[0];
+    if (existing === undefined) return { status: "not_found" };
+    const taken = rows(
+      this.ctx.storage.sql.exec<{ id: number }>(
+        "SELECT id FROM vocabulary_entries WHERE normalized_text = ? AND id != ?",
+        normalized.normalizedText,
+        input.id,
+      ),
+    )[0];
+    if (taken !== undefined) return { status: "conflict" };
+    this.ctx.storage.sql.exec(
+      "UPDATE vocabulary_entries SET display_text = ?, normalized_text = ? WHERE id = ?",
+      normalized.displayText,
+      normalized.normalizedText,
+      input.id,
+    );
+    return {
+      status: "updated",
+      displayText: normalized.displayText,
+      normalizedText: normalized.normalizedText,
+    };
+  }
+
   async alarm(): Promise<void> {
     const event = rows(
       this.ctx.storage.sql.exec<InboxRow>(

@@ -144,6 +144,28 @@ async function admin(request: Request, env: AdminEnv, pathname: string): Promise
       }
       return json(await owner(env).providerSmoke(body.displayText));
     }
+    if (request.method === "POST" && pathname === "/admin/fix-entry") {
+      const body = object(await readJson(request));
+      if (
+        body === null ||
+        !exactKeys(body, ["id", "displayText"]) ||
+        !Number.isSafeInteger(body.id) ||
+        (body.id as number) <= 0 ||
+        typeof body.displayText !== "string" ||
+        body.displayText.trim().length === 0
+      ) {
+        return json({ error: "invalid request" }, 400);
+      }
+      const result = await owner(env).fixEntry({
+        id: body.id as number,
+        displayText: body.displayText,
+      });
+      if (result.status === "not_found") return json({ error: "entry not found" }, 404);
+      if (result.status === "conflict") {
+        return json({ error: "another entry already uses that text" }, 409);
+      }
+      return json(result);
+    }
     if (request.method === "POST" && pathname === "/admin/send-smoke") {
       const contentLength = request.headers.get("Content-Length");
       if (contentLength !== null && Number(contentLength) > 0) return json({ error: "invalid request" }, 400);

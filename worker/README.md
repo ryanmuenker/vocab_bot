@@ -63,6 +63,19 @@ confirm `/admin/summary` returns JSON before trusting an import.
 The same shape bites in production: forget `wrangler secret put ADMIN_TOKEN` and
 the admin surface is not broken, it is absent.
 
+To repair one mis-entered word without a full snapshot replace:
+
+```bash
+curl -X POST https://<worker-host>/admin/fix-entry \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"id": 45, "displayText": "Abscond"}'
+```
+
+The entry's display and normalized text are replaced with the canonical
+normalization of the corrected text; senses, cards, and audit history are
+untouched. Unknown ids answer `404`; a normalized-text collision answers `409`.
+
 ## Migrating an existing library
 
 `scripts/export_cloudflare.py` and `scripts/import_cloudflare.py` move a v5

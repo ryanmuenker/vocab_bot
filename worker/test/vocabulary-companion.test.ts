@@ -566,3 +566,49 @@ describe("VocabularyCompanion concurrency", () => {
     expect(await stub.summary()).toMatchObject({ pendingInbox: 0, failedInbox: 1 });
   });
 });
+
+describe("VocabularyCompanion admin entry repair", () => {
+  it("replaces a mis-entered display and normalized text in place", async () => {
+    const stub = companion("fix-entry");
+    await stub.importSnapshot({
+      ...library(1),
+      entries: [
+        {
+          id: 1,
+          displayText: "Abscond\nAbscond",
+          normalizedText: "abscond abscond",
+          dateAdded: "2026-07-19T12:45:48.055085Z",
+          lastReviewed: null,
+          reviewStatus: "new",
+        },
+      ],
+    });
+
+    expect(await stub.fixEntry({ id: 1, displayText: "Abscond" })).toEqual({
+      status: "updated",
+      displayText: "Abscond",
+      normalizedText: "abscond",
+    });
+
+    const exported = (await stub.exportSnapshot())!;
+    expect(exported.entries).toEqual([
+      expect.objectContaining({ id: 1, displayText: "Abscond", normalizedText: "abscond" }),
+    ]);
+    // Senses, cards, and every audit row survive untouched.
+    expect(exported.senses).toHaveLength(1);
+    expect(exported.cards).toHaveLength(2);
+  });
+
+  it("rejects an unknown id and a normalized-text collision", async () => {
+    const stub = companion("fix-entry-miss");
+    await stub.importSnapshot(library(2));
+
+    expect(await stub.fixEntry({ id: 99, displayText: "word-9" })).toEqual({
+      status: "not_found",
+    });
+    // "word-2" normalizes to entry 2's normalized text, which is taken.
+    expect(await stub.fixEntry({ id: 1, displayText: "word-2" })).toEqual({
+      status: "conflict",
+    });
+  });
+});
