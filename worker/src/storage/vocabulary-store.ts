@@ -49,11 +49,10 @@ import {
 import type { CardSchedule, ScheduleTransition } from "../domain/scheduling";
 
 /** Previously untouched entries introduced per local day by daily review. */
-const DAILY_NEW_ENTRY_LIMIT = 15;
+const DAILY_NEW_ENTRY_LIMIT = 10;
 /** A directional test always runs exactly five cards from five distinct entries. */
 export const TEST_REQUIRED_CARDS = 5;
-/** Position offsets that keep UNIQUE (session_id, position) satisfied mid-renumber. */
-const ROLLOVER_OFFSET = 100_000;
+/** Temporary retirement offset used before rollover compacts queue positions. */
 const RETIRED_OFFSET = 200_000;
 
 const VALID_GRADES: Record<EvaluationGradeValue, true> = {
@@ -331,6 +330,7 @@ interface SelectOptions {
   readonly distinctEntries?: boolean;
   readonly onlyUnseen?: boolean;
   readonly excludedIds?: ReadonlySet<number>;
+  readonly excludedEntryIds?: ReadonlySet<number>;
 }
 
 interface DeliveryRecord {
@@ -1365,7 +1365,8 @@ export class VocabularyStore {
       options.onlyUnseen === true
         ? null
         : Math.max(DAILY_NEW_ENTRY_LIMIT - introducedByReviewToday, 0);
-    const excluded = options.excludedIds ?? new Set<number>();
+    const excludedCardIds = options.excludedIds ?? new Set<number>();
+    const excludedEntryIds = options.excludedEntryIds ?? new Set<number>();
     const attemptedEntries =
       options.onlyUnseen === true
         ? null
@@ -1383,7 +1384,7 @@ export class VocabularyStore {
     const weak: [readonly number[], StudyCardSnapshot][] = [];
     const unseen: [readonly number[], StudyCardSnapshot][] = [];
     for (const row of rows) {
-      if (excluded.has(row.id)) continue;
+      if (excludedCardIds.has(row.id) || excludedEntryIds.has(row.entry_id)) continue;
       const card = cardSnapshot(row);
       if (card.state === CardScheduleState.NEW) {
         if (row.introduced_local_date === null) {
@@ -1570,7 +1571,13 @@ export class VocabularyStore {
         : null;
 
     const activeCardIds = new Set(activeRows.map((row) => row.id));
-    const selected = this.selectCards(now, { excludedIds: activeCardIds });
+    const activeEntryIds = new Set(activeRows.map((row) => row.entry_id));
+    if (replacement !== null) activeEntryIds.add(replacement.entryId);
+    const selected = this.selectCards(now, {
+      excludedIds: activeCardIds,
+      excludedEntryIds: activeEntryIds,
+      distinctEntries: true,
+    });
     if (replacement !== null && !selected.some((card) => card.id === replacement!.id)) {
       selected.push(replacement);
     }
@@ -1613,18 +1620,50 @@ export class VocabularyStore {
     for (const [, placement] of dueItems) ordered.push(placement);
     for (const [, placement] of newItems) ordered.push(placement);
 
+    const completedQueueIds = all(
+      this.sql.exec<{ id: number }>(
+        `SELECT id FROM study_queue
+         WHERE session_id = ? AND status = 'completed'
+         ORDER BY position, id`,
+        session.id,
+      ),
+    ).map(({ id }) => id);
+    const skippedQueueIds = all(
+      this.sql.exec<{ id: number }>(
+        `SELECT id FROM study_queue
+         WHERE session_id = ? AND status = 'skipped'
+         ORDER BY position, id`,
+        session.id,
+      ),
+    ).map(({ id }) => id);
+    const maxPosition =
+      oneOrNull(
+        this.sql.exec<{ position: number }>(
+          "SELECT COALESCE(MAX(position), 0) AS position FROM study_queue WHERE session_id = ?",
+          session.id,
+        ),
+      )?.position ?? 0;
+    const finalQueueLength = completedQueueIds.length + ordered.length + skippedQueueIds.length;
+    const temporaryOffset = maxPosition + finalQueueLength;
     all(
       this.sql.exec(
         `UPDATE study_queue
-         SET position = position + ${ROLLOVER_OFFSET},
+         SET position = position + ?,
              status = CASE WHEN status = 'current' THEN 'queued' ELSE status END
-         WHERE session_id = ? AND status IN ('current', 'queued')`,
+         WHERE session_id = ?`,
+        temporaryOffset,
         session.id,
       ),
     );
+
+    let nextPosition = 1;
+    for (const queueId of completedQueueIds) {
+      all(this.sql.exec("UPDATE study_queue SET position = ? WHERE id = ?", nextPosition, queueId));
+      nextPosition += 1;
+    }
     ordered.forEach((placement, index) => {
-      const position = index + 1;
-      const status = position === 1 ? StudyQueueStatus.CURRENT : StudyQueueStatus.QUEUED;
+      const position = nextPosition + index;
+      const status = index === 0 ? StudyQueueStatus.CURRENT : StudyQueueStatus.QUEUED;
       if ("queueId" in placement) {
         all(
           this.sql.exec(
@@ -1660,6 +1699,11 @@ export class VocabularyStore {
         );
       }
     });
+    nextPosition += ordered.length;
+    for (const queueId of skippedQueueIds) {
+      all(this.sql.exec("UPDATE study_queue SET position = ? WHERE id = ?", nextPosition, queueId));
+      nextPosition += 1;
+    }
     all(
       this.sql.exec(
         "UPDATE study_sessions SET local_date = ? WHERE id = ? AND local_date != ?",

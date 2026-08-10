@@ -172,29 +172,29 @@ describe("VocabularyStore selection", () => {
     });
   });
 
-  it("introduces fifteen distinct unseen entries per local day across sessions", async () => {
+  it("introduces ten distinct unseen entries per local day across sessions", async () => {
     await runInDurableObject(stub(), (_instance, state) => {
       const store = new VocabularyStore(state.storage, "UTC");
       seedEntries(store, 16);
-      const expectedCardIds = Array.from({ length: 15 }, (_, index) => index * 2 + 1);
+      const expectedCardIds = Array.from({ length: 10 }, (_, index) => index * 2 + 1);
 
       const started = store.startReview(new Date("2026-07-20T10:00:00Z"));
       expect(started.snapshot!.queue.map((item) => item.card.id)).toEqual(expectedCardIds);
-      expect(new Set(started.snapshot!.queue.map((item) => item.card.entryId)).size).toBe(15);
+      expect(new Set(started.snapshot!.queue.map((item) => item.card.entryId)).size).toBe(10);
       expect(
         rows<{ count: number }>(
           state.storage,
           "SELECT COUNT(DISTINCT entry_id) AS count FROM vocabulary_cards " +
             "WHERE introduced_local_date = '2026-07-20'",
         )[0]!.count,
-      ).toBe(15);
+      ).toBe(10);
       expect(
         rows<{ count: number }>(
           state.storage,
           "SELECT COUNT(*) AS count FROM vocabulary_cards " +
             "WHERE introduced_local_date = '2026-07-20'",
         )[0]!.count,
-      ).toBe(30);
+      ).toBe(20);
 
       expect(store.exitStudy(new Date("2026-07-20T10:05:00Z"))).toBe(
         StudyMutationStatus.COMPLETED,
@@ -221,12 +221,12 @@ describe("VocabularyStore selection", () => {
            WHERE entry_id = 1 AND direction = 'reverse'`,
         ),
       );
-      seedEntries(store, 15, "untouched");
+      seedEntries(store, 10, "untouched");
 
       const started = store.startReview(new Date("2026-07-21T10:00:00Z"));
       expect(started.status).toBe(StudyStartStatus.STARTED);
       expect(started.snapshot!.queue.map((item) => item.card.entryId)).toEqual(
-        Array.from({ length: 15 }, (_, index) => index + 2),
+        Array.from({ length: 10 }, (_, index) => index + 2),
       );
       expect(started.snapshot!.queue.some((item) => item.card.entryId === 1)).toBe(false);
     });
@@ -244,7 +244,7 @@ describe("VocabularyStore selection", () => {
 
       const review = store.startReview(now);
       expect(review.snapshot!.queue.map((item) => item.card.entryId)).toEqual(
-        Array.from({ length: 15 }, (_, index) => index + 6),
+        Array.from({ length: 10 }, (_, index) => index + 6),
       );
     });
   });
@@ -626,6 +626,55 @@ describe("VocabularyStore session boundaries", () => {
       expect(again.queue.map((item) => item.position)).toEqual(
         rolled.queue.map((item) => item.position),
       );
+    });
+  });
+
+  it("keeps rollover queues distinct by vocabulary entry", async () => {
+    await runInDurableObject(stub(), (_instance, state) => {
+      const store = new VocabularyStore(state.storage, "Asia/Kuala_Lumpur");
+      store.captureEntry("polyseme", [CARD, SECOND_CARD], new Date("2026-06-01T00:00:00Z"));
+      store.captureEntry("other", [CARD], new Date("2026-06-02T00:00:00Z"));
+      for (const cardId of [1, 2, 3, 4, 5]) {
+        makeDue(state.storage, cardId, "2026-07-19T00:00:00Z");
+      }
+
+      const started = store.startReview(new Date("2026-07-20T02:00:00Z"));
+      expect(started.snapshot!.queue.map((item) => item.card.entryId)).toEqual([1, 2]);
+
+      const rolled = store.snapshot(new Date("2026-07-20T17:00:00Z"))!;
+      expect(
+        rolled.queue
+          .filter((item) => item.status !== StudyQueueStatus.SKIPPED)
+          .map((item) => item.card.entryId),
+      ).toEqual([1, 2]);
+    });
+  });
+
+  it("continues a review when the first rating lands after local midnight", async () => {
+    await runInDurableObject(stub(), (_instance, state) => {
+      const store = new VocabularyStore(state.storage, "Asia/Kuala_Lumpur");
+      seedEntries(store, 3);
+      const beforeMidnight = new Date("2026-07-20T15:55:00Z");
+      const afterMidnight = new Date("2026-07-20T16:05:00Z");
+      const started = store.startReview(beforeMidnight);
+      const plan = store.currentPromptPlan(beforeMidnight)!;
+      const prompt = store.prepareCurrentPrompt(plan.promptKey, "Question?", beforeMidnight)!;
+      store.recordDelivery(prompt.id, {
+        deliveryId: "midnight-1",
+        contentFingerprint: "a".repeat(64),
+        now: beforeMidnight,
+      });
+      store.recordAnswer(prompt.id, "an answer", CORRECT, beforeMidnight);
+
+      const finalized = store.finalize(prompt.id, ReviewRating.EASY, afterMidnight);
+      const continued = store.currentPromptPlan(afterMidnight);
+
+      expect(finalized.status).toBe(FinalizeStatus.COMPLETED);
+      expect(finalized.snapshot?.progress).toEqual({ completed: 1, total: 3 });
+      expect(continued).not.toBeNull();
+      expect(continued?.snapshot.localDate).toBe("2026-07-21");
+      expect(continued?.snapshot.progress).toEqual({ completed: 1, total: 3 });
+      expect(continued?.context.queueItem.card.id).not.toBe(plan.context.queueItem.card.id);
     });
   });
 
