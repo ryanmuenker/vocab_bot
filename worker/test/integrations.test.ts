@@ -36,7 +36,11 @@ function response(body: unknown, status = 200): Response {
   });
 }
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
 
 describe("OpenCodeAdapter", () => {
   it("strictly parses definitions after validating every sense and deduplicates in order", () => {
@@ -67,6 +71,113 @@ describe("OpenCodeAdapter", () => {
       temperature: 0,
       tools: [],
     });
+  });
+
+  it("retries two transient definition failures before succeeding", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({}, 500))
+      .mockResolvedValueOnce(response({}, 503))
+      .mockResolvedValueOnce(response({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              senses: [{
+                part_of_speech: "noun",
+                definition: "The act of lying face downward.",
+                example_sentence: "The worshippers performed prostration.",
+              }],
+            }),
+          },
+        }],
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const adapter = new OpenCodeAdapter({
+      apiKey: "key",
+      baseUrl: "https://example.test/v1",
+      model: "model",
+    });
+
+    const definition = await adapter.defineEntry("Prostration");
+
+    expect(definition).toMatchObject({ status: DefinitionStatus.FOUND });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("logs retry metadata without the submitted vocabulary text", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({}, 500));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", fetchMock);
+    const adapter = new OpenCodeAdapter({
+      apiKey: "key",
+      baseUrl: "https://example.test/v1",
+      model: "model",
+    });
+
+    const definition = await adapter.defineEntry("Prostration");
+
+    expect(definition).toEqual({
+      status: DefinitionStatus.PROVIDER_ERROR,
+      cards: [],
+    });
+    expect(warn).toHaveBeenCalledTimes(3);
+    expect(warn).toHaveBeenLastCalledWith({
+      event: "opencode_chat_failure",
+      kind: "http",
+      status: 500,
+      attempt: 3,
+      maxAttempts: 3,
+    });
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("Prostration");
+  });
+
+  it("classifies a persistent evaluation rate limit after exhausting retries", async () => {
+    const answerText = "It means stubbornly refusing to change one's opinion.";
+    const fetchMock = vi.fn().mockResolvedValue(response({}, 429));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", fetchMock);
+    const adapter = new OpenCodeAdapter({
+      apiKey: "key",
+      baseUrl: "https://example.test/v1",
+      model: "model",
+    });
+
+    expect(await adapter.evaluateAnswer(ENTRY, answerText)).toEqual({
+      status: EvaluationStatus.RATE_LIMITED,
+      evaluation: null,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(warn).toHaveBeenLastCalledWith({
+      event: "opencode_chat_failure",
+      kind: "http",
+      status: 429,
+      attempt: 3,
+      maxAttempts: 3,
+    });
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(answerText);
+  });
+
+  it("classifies invalid definition JSON without logging the submitted text", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({
+      choices: [{ message: { content: "not json" } }],
+    }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", fetchMock);
+    const adapter = new OpenCodeAdapter({
+      apiKey: "key",
+      baseUrl: "https://example.test/v1",
+      model: "model",
+    });
+
+    expect(await adapter.defineEntry("Prostration")).toEqual({
+      status: DefinitionStatus.INVALID_RESPONSE,
+      cards: [],
+    });
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledWith({
+      event: "opencode_definition_failure",
+      kind: "invalid_response",
+    });
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("Prostration");
   });
 
   it("uses exact-only show answer without a provider call and strictly grades other answers", async () => {

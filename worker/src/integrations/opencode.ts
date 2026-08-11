@@ -23,6 +23,7 @@ export const EvaluationStatus = {
   VALID: "valid",
   INVALID_RESPONSE: "invalid_response",
   PROVIDER_ERROR: "provider_error",
+  RATE_LIMITED: "rate_limited",
 } as const;
 export type EvaluationStatus = (typeof EvaluationStatus)[keyof typeof EvaluationStatus];
 export interface EvaluationResult {
@@ -33,6 +34,8 @@ export interface EvaluationResult {
 export const SHOW_ANSWER_FEEDBACK = "You chose to reveal the answer.";
 const MAX_EVALUATION_FEEDBACK_LENGTH = 500;
 const MAX_SENSES = 20;
+const CHAT_RETRY_DELAYS_MS = [250, 1_000] as const;
+const CHAT_MAX_ATTEMPTS = CHAT_RETRY_DELAYS_MS.length + 1;
 const VALID_GRADE: Record<string, EvaluationGrade> = {
   [EvaluationGrade.CORRECT]: EvaluationGrade.CORRECT,
   [EvaluationGrade.PARTIAL]: EvaluationGrade.PARTIAL,
@@ -158,6 +161,11 @@ interface OpenCodeConfig {
   readonly model: string;
 }
 
+type ChatResult =
+  | { readonly kind: "content"; readonly content: string }
+  | { readonly kind: "rate_limited" }
+  | { readonly kind: "provider_error" };
+
 export class OpenCodeAdapter {
   constructor(private readonly config: OpenCodeConfig) {}
 
@@ -169,9 +177,17 @@ export class OpenCodeAdapter {
       ],
       4_000,
     );
-    return content === null
-      ? { status: DefinitionStatus.PROVIDER_ERROR, cards: [] }
-      : parseDefinitionResponse(content);
+    if (content.kind !== "content") {
+      return { status: DefinitionStatus.PROVIDER_ERROR, cards: [] };
+    }
+    const result = parseDefinitionResponse(content.content);
+    if (result.status === DefinitionStatus.INVALID_RESPONSE) {
+      console.warn({
+        event: "opencode_definition_failure",
+        kind: "invalid_response",
+      });
+    }
+    return result;
   }
 
   async evaluateAnswer(entry: VocabularyEntry, answerText: string): Promise<EvaluationResult> {
@@ -208,43 +224,77 @@ export class OpenCodeAdapter {
       // pass. Budget for the reasoning, not just the two short fields.
       4_000,
     );
-    return content === null
+    if (content.kind === "rate_limited") {
+      return { status: EvaluationStatus.RATE_LIMITED, evaluation: null };
+    }
+    return content.kind === "provider_error"
       ? { status: EvaluationStatus.PROVIDER_ERROR, evaluation: null }
-      : parseEvaluationResponse(content);
+      : parseEvaluationResponse(content.content);
   }
 
   private async chat(
     messages: readonly { readonly role: "system" | "user"; readonly content: string }[],
     maxTokens: number,
-  ): Promise<string | null> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 60_000);
-    try {
-      const response = await fetch(`${this.config.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.config.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: this.config.model,
-          messages,
-          max_tokens: maxTokens,
-          temperature: 0,
-          tools: [],
-        }),
-        signal: controller.signal,
-      });
-      if (!response.ok) return null;
-      const payload = object(await response.json());
-      if (payload === null || !Array.isArray(payload.choices)) return null;
-      const choice = object(payload.choices[0]);
-      const message = choice === null ? null : object(choice.message);
-      return message !== null && typeof message.content === "string" ? message.content : null;
-    } catch {
-      return null;
-    } finally {
-      clearTimeout(timeout);
+  ): Promise<ChatResult> {
+    for (let attempt = 0; attempt < CHAT_MAX_ATTEMPTS; attempt += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 60_000);
+      try {
+        const response = await fetch(`${this.config.baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this.config.apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: this.config.model,
+            messages,
+            max_tokens: maxTokens,
+            temperature: 0,
+            tools: [],
+          }),
+          signal: controller.signal,
+        });
+        if (response.ok) {
+          const payload = object(await response.json());
+          if (payload === null || !Array.isArray(payload.choices)) {
+            return { kind: "provider_error" };
+          }
+          const choice = object(payload.choices[0]);
+          const message = choice === null ? null : object(choice.message);
+          return message !== null && typeof message.content === "string"
+            ? { kind: "content", content: message.content }
+            : { kind: "provider_error" };
+        }
+        console.warn({
+          event: "opencode_chat_failure",
+          kind: "http",
+          status: response.status,
+          attempt: attempt + 1,
+          maxAttempts: CHAT_MAX_ATTEMPTS,
+        });
+        if (response.status !== 429 && response.status < 500) {
+          return { kind: "provider_error" };
+        }
+        if (attempt === CHAT_MAX_ATTEMPTS - 1) {
+          return response.status === 429
+            ? { kind: "rate_limited" }
+            : { kind: "provider_error" };
+        }
+      } catch {
+        console.warn({
+          event: "opencode_chat_failure",
+          kind: "network",
+          attempt: attempt + 1,
+          maxAttempts: CHAT_MAX_ATTEMPTS,
+        });
+        if (attempt === CHAT_MAX_ATTEMPTS - 1) return { kind: "provider_error" };
+      } finally {
+        clearTimeout(timeout);
+      }
+      const delay = CHAT_RETRY_DELAYS_MS[attempt];
+      if (delay !== undefined) await scheduler.wait(delay);
     }
+    return { kind: "provider_error" };
   }
 }
