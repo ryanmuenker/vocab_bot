@@ -259,8 +259,9 @@ export class OpenCodeAdapter {
           let responseBody: unknown;
           try {
             responseBody = await response.json();
-          } catch {
-            return { kind: "provider_error" };
+          } catch (error) {
+            if (error instanceof SyntaxError) return { kind: "provider_error" };
+            throw error;
           }
           const payload = object(responseBody);
           if (payload === null || !Array.isArray(payload.choices)) {

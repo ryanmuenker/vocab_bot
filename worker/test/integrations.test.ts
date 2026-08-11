@@ -179,6 +179,43 @@ describe("OpenCodeAdapter", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
+  it("retries a successful response read failure before evaluating later content", async () => {
+    const answerText = "It means stubbornly refusing to change one's opinion.";
+    const unreadableResponse = response({});
+    vi.spyOn(unreadableResponse, "json").mockRejectedValue(
+      new TypeError("response body stream failed"),
+    );
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(unreadableResponse)
+      .mockResolvedValueOnce(response({
+        choices: [{
+          message: {
+            content: JSON.stringify({ grade: "correct", feedback: "Good." }),
+          },
+        }],
+      }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", fetchMock);
+    const adapter = new OpenCodeAdapter({
+      apiKey: "key",
+      baseUrl: "https://example.test/v1",
+      model: "model",
+    });
+
+    expect(await adapter.evaluateAnswer(ENTRY, answerText)).toEqual({
+      status: EvaluationStatus.VALID,
+      evaluation: { grade: EvaluationGrade.CORRECT, feedback: "Good." },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenCalledWith({
+      event: "opencode_chat_failure",
+      kind: "network",
+      attempt: 1,
+      maxAttempts: 3,
+    });
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(answerText);
+  });
+
   it("classifies invalid definition JSON without logging the submitted text", async () => {
     const fetchMock = vi.fn().mockResolvedValue(response({
       choices: [{ message: { content: "not json" } }],
