@@ -22,7 +22,6 @@ import {
   StudyStartStatus,
 } from "./domain/models";
 import type {
-  Evaluation,
   ReviewRating,
   StudyAnswerContext,
   StudyPromptSnapshot,
@@ -43,6 +42,7 @@ import {
   EvaluationStatus,
   OpenCodeAdapter,
 } from "./integrations/opencode";
+import type { EvaluationResult } from "./integrations/opencode";
 import { splitTelegramMessage, TelegramAdapter } from "./integrations/telegram";
 import { initializeSchema } from "./storage/schema";
 import { TEST_REQUIRED_CARDS, VocabularyStore } from "./storage/vocabulary-store";
@@ -64,6 +64,9 @@ const INVALID_RATING_REPLY = "Send one of the listed effort ratings.";
 const EVALUATION_ERROR_REPLY =
   "I couldn't evaluate that answer, and nothing was recorded. " +
   "Send your answer again — the next message you send is graded as your answer.";
+const EVALUATION_RATE_LIMIT_REPLY =
+  "OpenCode's rate or usage limit was reached. Nothing was recorded. " +
+  "Try again after the limit resets or usage is restored — the next message you send is graded as your answer.";
 const REVIEW_USAGE = "Usage: /review";
 const ENDSTUDY_USAGE = "Usage: /endstudy";
 const TEST_USAGE =
@@ -683,9 +686,14 @@ export class VocabularyCompanion extends DurableObject<Env> {
       return { text: INVALID_ANSWER_REPLY, promptId: null };
     }
 
-    const evaluation = await this.evaluateAnswer(context, answerText);
-    if (evaluation === null) return { text: EVALUATION_ERROR_REPLY, promptId: null };
-    if (this.store.recordAnswer(context.prompt.id, answerText, evaluation, now) === null) {
+    const evaluated = await this.evaluateAnswer(context, answerText);
+    if (evaluated.status === EvaluationStatus.RATE_LIMITED) {
+      return { text: EVALUATION_RATE_LIMIT_REPLY, promptId: null };
+    }
+    if (evaluated.status !== EvaluationStatus.VALID || evaluated.evaluation === null) {
+      return { text: EVALUATION_ERROR_REPLY, promptId: null };
+    }
+    if (this.store.recordAnswer(context.prompt.id, answerText, evaluated.evaluation, now) === null) {
       return { text: STUDY_STORAGE_ERROR_REPLY, promptId: null };
     }
     const persisted = this.store.currentAnswerContext();
@@ -702,9 +710,12 @@ export class VocabularyCompanion extends DurableObject<Env> {
   private async evaluateAnswer(
     context: StudyAnswerContext,
     answerText: string,
-  ): Promise<Evaluation | null> {
+  ): Promise<EvaluationResult> {
     if (answerText !== SHOW_ANSWER && caseFold(trimPythonWhitespace(answerText)) === "idk") {
-      return { grade: EvaluationGrade.INCORRECT, feedback: IDK_FEEDBACK };
+      return {
+        status: EvaluationStatus.VALID,
+        evaluation: { grade: EvaluationGrade.INCORRECT, feedback: IDK_FEEDBACK },
+      };
     }
     if (
       answerText !== SHOW_ANSWER &&
@@ -712,12 +723,15 @@ export class VocabularyCompanion extends DurableObject<Env> {
     ) {
       // A reverse card asks for the saved entry itself, so it is graded by exact
       // match rather than by the evaluator.
-      return normalizeReverseAnswer(answerText) === normalizeReverseAnswer(context.entry.displayText)
-        ? { grade: EvaluationGrade.CORRECT, feedback: REVERSE_CORRECT_FEEDBACK }
-        : { grade: EvaluationGrade.INCORRECT, feedback: REVERSE_INCORRECT_FEEDBACK };
+      return {
+        status: EvaluationStatus.VALID,
+        evaluation:
+          normalizeReverseAnswer(answerText) === normalizeReverseAnswer(context.entry.displayText)
+            ? { grade: EvaluationGrade.CORRECT, feedback: REVERSE_CORRECT_FEEDBACK }
+            : { grade: EvaluationGrade.INCORRECT, feedback: REVERSE_INCORRECT_FEEDBACK },
+      };
     }
-    const evaluated = await this.provider.evaluateAnswer(context.entry, answerText);
-    return evaluated.status === EvaluationStatus.VALID ? evaluated.evaluation : null;
+    return this.provider.evaluateAnswer(context.entry, answerText);
   }
 
   /** Finalize the rated step and hand back the next prompt, if any. */

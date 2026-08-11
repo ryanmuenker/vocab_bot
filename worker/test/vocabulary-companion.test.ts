@@ -110,6 +110,7 @@ interface Transport {
   readonly sent: string[];
   readonly modelCalls: () => number;
   telegramFails: boolean;
+  modelStatus: number;
   evaluation: { grade: string; feedback: string };
 }
 
@@ -122,6 +123,7 @@ function transport(): Transport {
     sent,
     modelCalls: () => modelCalls,
     telegramFails: false,
+    modelStatus: 200,
     evaluation: { grade: "correct", feedback: "Accurate." },
   };
   vi.stubGlobal(
@@ -130,6 +132,7 @@ function transport(): Transport {
       const url = String(input);
       if (url.includes("/chat/completions")) {
         modelCalls += 1;
+        if (state.modelStatus !== 200) return jsonResponse({}, state.modelStatus);
         const body = JSON.parse(init!.body as string) as { messages: { content: string }[] };
         const content = body.messages[0]!.content.includes("dictionary")
           ? JSON.stringify({
@@ -288,6 +291,34 @@ describe("VocabularyCompanion delivery gating", () => {
     const delivered = exported.deliveryAttempts.filter((attempt) => attempt.status === "delivered");
     expect(delivered).toHaveLength(2);
     expect(delivered[0]!.contentFingerprint).toMatch(/^[0-9a-f]{64}$/u);
+  });
+
+  it("explains a provider limit and grades the resubmission after recovery", async () => {
+    const io = transport();
+    const stub = companion("provider-limit");
+    await stub.importSnapshot(library(1));
+
+    await stub.enqueueTelegramUpdate(message(1, "/review"));
+    await drain(stub);
+
+    io.modelStatus = 429;
+    await stub.enqueueTelegramUpdate(message(2, "definition one"));
+    await drain(stub);
+
+    expect(io.modelCalls()).toBe(3);
+    expect(io.sent[1]).toBe(
+      "OpenCode's rate or usage limit was reached. Nothing was recorded. " +
+        "Try again after the limit resets or usage is restored — the next message you send is graded as your answer.",
+    );
+    expect((await stub.exportSnapshot())!.answerDrafts).toHaveLength(0);
+
+    io.modelStatus = 200;
+    await stub.enqueueTelegramUpdate(message(3, "definition one"));
+    await drain(stub);
+
+    expect(io.modelCalls()).toBe(4);
+    expect(io.sent[2]).toContain("Grade: Correct");
+    expect((await stub.exportSnapshot())!.answerDrafts).toHaveLength(1);
   });
 
   it("surfaces due work as an interruption when no tick ever prepared a prompt", async () => {
