@@ -256,7 +256,13 @@ export class OpenCodeAdapter {
           signal: controller.signal,
         });
         if (response.ok) {
-          const payload = object(await response.json());
+          let responseBody: unknown;
+          try {
+            responseBody = await response.json();
+          } catch {
+            return { kind: "provider_error" };
+          }
+          const payload = object(responseBody);
           if (payload === null || !Array.isArray(payload.choices)) {
             return { kind: "provider_error" };
           }

@@ -156,6 +156,29 @@ describe("OpenCodeAdapter", () => {
     expect(JSON.stringify(warn.mock.calls)).not.toContain(answerText);
   });
 
+  it("classifies malformed successful chat JSON without retrying it as a network failure", async () => {
+    const fetchMock = vi.fn().mockImplementation(
+      () => Promise.resolve(new Response("{", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })),
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", fetchMock);
+    const adapter = new OpenCodeAdapter({
+      apiKey: "key",
+      baseUrl: "https://example.test/v1",
+      model: "model",
+    });
+
+    expect(await adapter.evaluateAnswer(ENTRY, "A substantive learner answer.")).toEqual({
+      status: EvaluationStatus.PROVIDER_ERROR,
+      evaluation: null,
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it("classifies invalid definition JSON without logging the submitted text", async () => {
     const fetchMock = vi.fn().mockResolvedValue(response({
       choices: [{ message: { content: "not json" } }],
