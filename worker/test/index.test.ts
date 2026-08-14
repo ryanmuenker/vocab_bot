@@ -2,6 +2,7 @@ import { env, exports } from "cloudflare:workers";
 import { createScheduledController } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import worker from "../src/index";
+import type { AdminEnv } from "../src/index";
 
 function update(overrides: Record<string, unknown> = {}) {
   return {
@@ -132,5 +133,51 @@ describe("Worker HTTP and cron surface", () => {
     // An empty library has nothing to ask about, so the tick enqueues nothing.
     expect((await env.VOCABULARY.getByName("123456").summary()).pendingInbox)
       .toBe(before.pendingInbox);
+  });
+
+  it("serves the vocabulary inspector and protects its live data", async () => {
+    const shell = await exports.default.fetch(new Request("https://example.test/inspector"));
+    expect(shell.status).toBe(200);
+    expect(shell.headers.get("Content-Type")).toBe("text/html; charset=utf-8");
+    expect(shell.headers.get("Cache-Control")).toBe("no-store");
+    expect(shell.headers.get("Content-Security-Policy")).toContain("default-src 'none'");
+    const html = await shell.text();
+    expect(html).toContain('data-inspector');
+    expect(html).toContain('id="token-form"');
+    expect(html).toContain('id="atlas-view"');
+    expect(html).toContain('id="table-view"');
+    expect(html).not.toMatch(/<script[^>]+src=/u);
+    expect(html).not.toMatch(/<link[^>]+href=/u);
+
+    const missingAdminEnv = new Proxy(env, {
+      get(target, property, receiver) {
+        return property === "ADMIN_TOKEN" ? undefined : Reflect.get(target, property, receiver);
+      },
+    }) as AdminEnv;
+    expect((await worker.fetch(
+      new Request("https://example.test/inspector"),
+      missingAdminEnv,
+    )).status).toBe(404);
+    expect((await exports.default.fetch(new Request("https://example.test/inspector", {
+      method: "POST",
+    }))).status).toBe(404);
+
+    expect((await exports.default.fetch(
+      new Request("https://example.test/admin/inspector-data"),
+    )).status).toBe(401);
+    const dataResponse = await exports.default.fetch(
+      new Request("https://example.test/admin/inspector-data", {
+        headers: { Authorization: "Bearer test-admin-token" },
+      }),
+    );
+    expect(dataResponse.status).toBe(200);
+    expect(dataResponse.headers.get("Content-Type")).toBe("application/json; charset=utf-8");
+    expect(dataResponse.headers.get("Cache-Control")).toBe("no-store");
+    expect(await dataResponse.json()).toMatchObject({
+      generatedAt: expect.any(String),
+      memorizedStabilityDays: 30,
+      summary: { total: 0, unseen: 0, learning: 0, memorized: 0, due: 0 },
+      entries: [],
+    });
   });
 });

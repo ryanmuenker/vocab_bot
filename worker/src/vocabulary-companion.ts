@@ -9,6 +9,8 @@ import {
   formatStudyPrompt,
   formatStudySchedule,
 } from "./domain/formatting";
+import { readInspectorData } from "./domain/inspector";
+import type { InspectorData } from "./domain/inspector";
 import {
   CaptureStatus,
   CardDirection,
@@ -266,6 +268,10 @@ export class VocabularyCompanion extends DurableObject<Env> {
       "SELECT COUNT(*) AS count FROM inbox_events WHERE status <> 'completed'",
     ).one().count;
     return unfinished === 0 ? readSnapshot(this.ctx.storage) : null;
+  }
+
+  async inspectorData(): Promise<InspectorData> {
+    return readInspectorData(this.ctx.storage, new Date().toISOString());
   }
 
   async summary(): Promise<SnapshotSummary & { pendingInbox: number; failedInbox: number }> {

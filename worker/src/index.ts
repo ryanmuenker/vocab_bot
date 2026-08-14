@@ -1,6 +1,7 @@
 import { parseStudyCommand, slashCommandName } from "./domain/routing";
 import { parseVerifiedEnvelope, sha256Snapshot } from "./domain/snapshot";
 import { TelegramAdapter } from "./integrations/telegram";
+import { INSPECTOR_HTML } from "./inspector-page";
 
 export { VocabularyCompanion } from "./vocabulary-companion";
 
@@ -9,6 +10,19 @@ export type AdminEnv = Env & { ADMIN_TOKEN?: string };
 const MAX_BODY_BYTES = 65_536;
 const MAX_IMPORT_BYTES = 1_048_576;
 const JSON_HEADERS = { "Content-Type": "application/json; charset=utf-8" } as const;
+const INSPECTOR_JSON_HEADERS = {
+  ...JSON_HEADERS,
+  "Cache-Control": "no-store",
+} as const;
+const INSPECTOR_HEADERS = {
+  "Content-Type": "text/html; charset=utf-8",
+  "Cache-Control": "no-store",
+  "Content-Security-Policy":
+    "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; " +
+    "connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+  "Referrer-Policy": "no-referrer",
+  "X-Content-Type-Options": "nosniff",
+} as const;
 
 function json(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), { status, headers: JSON_HEADERS });
@@ -136,6 +150,11 @@ async function admin(request: Request, env: AdminEnv, pathname: string): Promise
     if (request.method === "GET" && pathname === "/admin/summary") {
       return json(await owner(env).summary());
     }
+    if (request.method === "GET" && pathname === "/admin/inspector-data") {
+      return new Response(JSON.stringify(await owner(env).inspectorData()), {
+        headers: INSPECTOR_JSON_HEADERS,
+      });
+    }
     if (request.method === "POST" && pathname === "/admin/provider-smoke") {
       const body = object(await readJson(request));
       if (body === null || !exactKeys(body, ["displayText"]) ||
@@ -201,6 +220,10 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/healthz") return json({ ok: true });
+    if (request.method === "GET" && url.pathname === "/inspector") {
+      if ((env as AdminEnv).ADMIN_TOKEN === undefined) return new Response(null, { status: 404 });
+      return new Response(INSPECTOR_HTML, { headers: INSPECTOR_HEADERS });
+    }
     if (request.method === "POST" && url.pathname === "/telegram/webhook") {
       return webhook(request, env);
     }
