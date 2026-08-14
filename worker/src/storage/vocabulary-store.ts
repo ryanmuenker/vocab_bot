@@ -48,7 +48,7 @@ import {
 } from "../domain/scheduling";
 import type { CardSchedule, ScheduleTransition } from "../domain/scheduling";
 
-/** Previously untouched entries introduced per local day by daily review. */
+/** Unseen cards from distinct entries admitted per local day by daily review. */
 const DAILY_NEW_ENTRY_LIMIT = 10;
 /** A directional test always runs exactly five cards from five distinct entries. */
 export const TEST_REQUIRED_CARDS = 5;
@@ -496,9 +496,10 @@ export class VocabularyStore {
         }
         const carryover = this.carryoverCards(today);
         const excludedIds = new Set(carryover.cards.map((card) => card.id));
+        const excludedEntryIds = new Set(carryover.cards.map((card) => card.entryId));
         const cards = [
           ...carryover.cards,
-          ...this.selectCards(now, { excludedIds, distinctEntries: true }),
+          ...this.selectCards(now, { excludedIds, excludedEntryIds, distinctEntries: true }),
         ];
         if (cards.length === 0) {
           return { status: StudyStartStatus.EMPTY, snapshot: null, availableCount: 0 };
@@ -1325,9 +1326,9 @@ export class VocabularyStore {
 
   /**
    * Due cards first, ordered by effective due then predicted recall then age;
-   * optionally the weakest seen non-due cards; then new cards from untouched
-   * entries before unseen siblings of previously attempted entries, within the
-   * daily review introduction quota. Explicit unseen-only selection bypasses
+   * optionally the weakest seen non-due cards; then unseen siblings of attempted
+   * entries before cards from untouched entries, within the daily review
+   * introduction quota. Explicit unseen-only selection bypasses
    * that quota and retains creation order.
    */
   private selectCards(now: Date, options: SelectOptions = {}): StudyCardSnapshot[] {
@@ -1389,7 +1390,7 @@ export class VocabularyStore {
       if (card.state === CardScheduleState.NEW) {
         if (row.introduced_local_date === null) {
           unseen.push([
-            [attemptedEntries?.has(card.entryId) === true ? 1 : 0, card.createdAt.getTime(), card.id],
+            [attemptedEntries?.has(card.entryId) === true ? 0 : 1, card.createdAt.getTime(), card.id],
             card,
           ]);
         }
@@ -1506,9 +1507,9 @@ export class VocabularyStore {
           this.sql.exec(
             `UPDATE vocabulary_cards
              SET introduced_local_date = COALESCE(introduced_local_date, ?)
-             WHERE entry_id = ?`,
+             WHERE id = ?`,
             introduced,
-            card.entryId,
+            card.id,
           ),
         );
       }
@@ -1692,9 +1693,9 @@ export class VocabularyStore {
           this.sql.exec(
             `UPDATE vocabulary_cards
              SET introduced_local_date = COALESCE(introduced_local_date, ?)
-             WHERE entry_id = ?`,
+             WHERE id = ?`,
             introduced,
-            placement.card.entryId,
+            placement.card.id,
           ),
         );
       }

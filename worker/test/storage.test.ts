@@ -15,6 +15,7 @@ import {
   StudyStartStatus,
 } from "../src/domain/models";
 import type { Evaluation, FinalizeResult, SenseCard, StudyPromptSnapshot } from "../src/domain/models";
+import { initializeSchema } from "../src/storage/schema";
 import { VocabularyStore, localMidnightUtc } from "../src/storage/vocabulary-store";
 
 const CARD: SenseCard = {
@@ -189,12 +190,12 @@ describe("VocabularyStore selection", () => {
         )[0]!.count,
       ).toBe(10);
       expect(
-        rows<{ count: number }>(
+        rows<{ id: number }>(
           state.storage,
-          "SELECT COUNT(*) AS count FROM vocabulary_cards " +
-            "WHERE introduced_local_date = '2026-07-20'",
-        )[0]!.count,
-      ).toBe(20);
+          "SELECT id FROM vocabulary_cards " +
+            "WHERE introduced_local_date = '2026-07-20' ORDER BY id",
+        ).map(({ id }) => id),
+      ).toEqual(expectedCardIds);
 
       expect(store.exitStudy(new Date("2026-07-20T10:05:00Z"))).toBe(
         StudyMutationStatus.COMPLETED,
@@ -204,7 +205,67 @@ describe("VocabularyStore selection", () => {
     });
   });
 
-  it("prioritizes entries with no historical attempts before unseen siblings", async () => {
+  it("repairs unqueued siblings incorrectly marked as introduced", async () => {
+    await runInDurableObject(stub(), (_instance, state) => {
+      const store = new VocabularyStore(state.storage, "UTC");
+      store.captureEntry("polyseme", [CARD, SECOND_CARD], new Date("2026-07-20T09:00:00Z"));
+      const started = store.startReview(new Date("2026-07-20T10:00:00Z"));
+      expect(started.snapshot!.queue.map((item) => item.card.id)).toEqual([1]);
+
+      Array.from(
+        state.storage.sql.exec(
+          `UPDATE vocabulary_cards
+           SET introduced_local_date = '2026-07-20'
+           WHERE entry_id = 1`,
+        ),
+      );
+
+      initializeSchema(state.storage.sql);
+
+      expect(
+        rows<{ id: number; introduced_local_date: string | null }>(
+          state.storage,
+          `SELECT id, introduced_local_date
+           FROM vocabulary_cards
+           WHERE entry_id = 1
+           ORDER BY id`,
+        ),
+      ).toEqual([
+        { id: 1, introduced_local_date: "2026-07-20" },
+        { id: 2, introduced_local_date: null },
+        { id: 3, introduced_local_date: null },
+      ]);
+    });
+  });
+
+  it("introduces every sense card on later days after sibling burial", async () => {
+    await runInDurableObject(stub(), (_instance, _state) => {
+      const store = new VocabularyStore(_state.storage, "UTC");
+      store.captureEntry("polyseme", [CARD, SECOND_CARD], new Date("2026-07-19T09:00:00Z"));
+
+      const firstDay = new Date("2026-07-20T10:00:00Z");
+      const first = store.startReview(firstDay);
+      expect(first.snapshot!.queue.map((item) => item.card.id)).toEqual([1]);
+      answerCurrent(store, ReviewRating.GOOD, firstDay);
+
+      const secondDay = new Date("2026-07-21T10:00:00Z");
+      const second = store.startReview(secondDay);
+      expect(second.snapshot!.queue.map((item) => item.card.id)).toEqual([2]);
+      answerCurrent(store, ReviewRating.GOOD, secondDay);
+
+      const seen = new Set([1, 2]);
+      for (let day = 22; day <= 31 && !seen.has(3); day += 1) {
+        const now = new Date(`2026-07-${day}T10:00:00Z`);
+        const started = store.startReview(now);
+        const cardId = started.snapshot!.queue[0]!.card.id;
+        seen.add(cardId);
+        if (cardId !== 3) answerCurrent(store, ReviewRating.GOOD, now);
+      }
+      expect(seen).toEqual(new Set([1, 2, 3]));
+    });
+  });
+
+  it("prioritizes unseen siblings before untouched entries", async () => {
     await runInDurableObject(stub(), (_instance, state) => {
       const store = new VocabularyStore(state.storage, "UTC");
       store.captureEntry("attempted", [CARD], new Date("2026-05-01T00:00:00Z"));
@@ -226,9 +287,8 @@ describe("VocabularyStore selection", () => {
       const started = store.startReview(new Date("2026-07-21T10:00:00Z"));
       expect(started.status).toBe(StudyStartStatus.STARTED);
       expect(started.snapshot!.queue.map((item) => item.card.entryId)).toEqual(
-        Array.from({ length: 10 }, (_, index) => index + 2),
+        Array.from({ length: 10 }, (_, index) => index + 1),
       );
-      expect(started.snapshot!.queue.some((item) => item.card.entryId === 1)).toBe(false);
     });
   });
 
@@ -244,7 +304,7 @@ describe("VocabularyStore selection", () => {
 
       const review = store.startReview(now);
       expect(review.snapshot!.queue.map((item) => item.card.entryId)).toEqual(
-        Array.from({ length: 10 }, (_, index) => index + 6),
+        Array.from({ length: 10 }, (_, index) => index + 1),
       );
     });
   });

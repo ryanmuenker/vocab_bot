@@ -128,9 +128,9 @@ Every finalized answer appends an immutable row to `review_attempts` recording t
 
 ### Daily volume and backlog
 
-- `/review` introduces up to **15 previously untouched entries** per configured local day. Entries with no recorded attempts are selected before unseen forward/reverse siblings of entries already practiced. The quota counts only distinct entries introduced by `/review` that day; an explicit directional `/test` has its own five unseen entries and does not reduce the review allowance.
+- `/review` introduces up to **10 unseen cards from distinct entries** per configured local day. Unseen siblings of practiced entries are selected before cards from untouched entries, so stored senses gain review coverage before the library expands further. The quota counts distinct entries with a new card admitted by `/review` that day; an explicit directional `/test` has its own five unseen entries and does not reduce the review allowance.
 - **Due work is uncapped.** Every card whose effective due instant has passed and that is not buried today is queued, ordered by due instant, then by predicted recall, then deterministically by age and ID. Due cards always precede new introductions.
-- **Backlog accumulates.** Nothing is discarded, expired, or marked missed. If you skip several days, the next session simply contains every card that came due while you were away, and the 15-entry allowance still applies on top.
+- **Backlog accumulates.** Nothing is discarded, expired, or marked missed. If you skip several days, the next session simply contains every card that came due while you were away, and the 10-card introduction allowance still applies on top.
 - Reviews prompt as `Review 2 of 7 · 6 due`, so the queue length and remaining due count are always visible. Directional test retries are marked `· retry`.
 
 ### `/review`
