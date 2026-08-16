@@ -58,6 +58,7 @@ const RETIRED_OFFSET = 200_000;
 const MAX_REVERSE_CARDS_PER_ENTRY = 3;
 const SEMANTIC_TOKEN_PATTERN = /[\p{Letter}\p{Number}]+/gu;
 const NO_PROTECTED_REVERSE_SENSES: ReadonlySet<number> = new Set();
+const REVERSE_CARD_CAP_MIGRATION = "reverse-card-cap-v1";
 
 const VALID_GRADES: Record<EvaluationGradeValue, true> = {
   [EvaluationGrade.CORRECT]: true,
@@ -516,6 +517,64 @@ export class VocabularyStore {
   /** Project the missing forward card and at most three diverse reverse cards. */
   createCards(entryId: number, now = new Date()): void {
     this.storage.transactionSync(() => this.insertCards(entryId, now));
+  }
+
+  /** Repair the historical sibling-introduction bug only during explicit maintenance. */
+  repairUnqueuedIntroductions(): number {
+    return this.storage.transactionSync(() => {
+      all(
+        this.sql.exec(
+          `UPDATE vocabulary_cards
+           SET introduced_local_date = NULL
+           WHERE state = 'new'
+             AND repetitions = 0
+             AND introduced_local_date IS NOT NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM study_queue
+               WHERE study_queue.card_id = vocabulary_cards.id
+             )`,
+        ),
+      );
+      return oneOrNull(
+        this.sql.exec<{ count: number }>("SELECT changes() AS count"),
+      )?.count ?? 0;
+    });
+  }
+
+  /** Run the reverse-card migration once for a populated Durable Object. */
+  runReverseCardCapMaintenance(): number {
+    const applied = oneOrNull(
+      this.sql.exec<{ present: number }>(
+        "SELECT 1 AS present FROM maintenance_migrations WHERE name = ?",
+        REVERSE_CARD_CAP_MIGRATION,
+      ),
+    );
+    if (applied !== null) return 0;
+    const hasCards = oneOrNull(
+      this.sql.exec<{ id: number }>("SELECT id FROM vocabulary_cards LIMIT 1"),
+    );
+    if (hasCards === null) return 0;
+    const deleted = this.pruneUntouchedReverseCards();
+    this.recordReverseCardCapMaintenance();
+    return deleted;
+  }
+
+  /** Normalize imported card state even when this database was migrated before. */
+  normalizeImportedCards(): void {
+    this.repairUnqueuedIntroductions();
+    this.pruneUntouchedReverseCards();
+    this.recordReverseCardCapMaintenance();
+  }
+
+  private recordReverseCardCapMaintenance(): void {
+    all(
+      this.sql.exec(
+        `INSERT OR IGNORE INTO maintenance_migrations (name, applied_at)
+         VALUES (?, ?)`,
+        REVERSE_CARD_CAP_MIGRATION,
+        isoTimestamp(new Date()),
+      ),
+    );
   }
 
   /**

@@ -19,6 +19,11 @@ CREATE TABLE IF NOT EXISTS vocabulary_senses (
   date_added TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS maintenance_migrations (
+  name TEXT PRIMARY KEY,
+  applied_at TEXT NOT NULL
+);
+
 -- review_events, test_sessions and test_questions are audit carriers for
 -- history imported from the pre-card era. Nothing schedules from them.
 CREATE TABLE IF NOT EXISTS review_events (
@@ -374,6 +379,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_current_queue_item_idx
   ON study_queue(session_id) WHERE status = 'current';
 CREATE INDEX IF NOT EXISTS study_queue_order_idx
   ON study_queue(session_id, position);
+CREATE INDEX IF NOT EXISTS study_queue_card_idx
+  ON study_queue(card_id);
 
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_study_prompt_idx
   ON study_prompts((1)) WHERE status IN ('prepared', 'delivered', 'answered');
@@ -392,17 +399,6 @@ CREATE INDEX IF NOT EXISTS inbox_events_actionable_idx
 CREATE INDEX IF NOT EXISTS inbox_events_capture_key_idx
   ON inbox_events(normalized_key, id);
 
--- Repair v5 rows where introducing one card incorrectly marked every sibling
--- as introduced even though those siblings never entered a study queue.
-UPDATE vocabulary_cards
-SET introduced_local_date = NULL
-WHERE state = 'new'
-  AND repetitions = 0
-  AND introduced_local_date IS NOT NULL
-  AND NOT EXISTS (
-    SELECT 1 FROM study_queue
-    WHERE study_queue.card_id = vocabulary_cards.id
-  );
 `;
 
 export function initializeSchema(sql: SqlStorage): void {

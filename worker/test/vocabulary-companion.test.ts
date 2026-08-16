@@ -268,6 +268,7 @@ describe("VocabularyCompanion capture", () => {
           ),
         );
       }
+      Array.from(state.storage.sql.exec("DELETE FROM maintenance_migrations"));
       expect(
         state.storage.sql.exec<{ count: number }>(
           "SELECT COUNT(*) AS count FROM vocabulary_cards WHERE direction = 'reverse'",

@@ -183,7 +183,7 @@ describe("VocabularyStore capture", () => {
     });
   });
 
-  it("prunes untouched legacy reverse cards without deleting a queued extra", async () => {
+  it("runs legacy reverse pruning once without deleting a queued extra", async () => {
     await runInDurableObject(stub(), (_instance, state) => {
       const store = new VocabularyStore(state.storage, "UTC");
       const result = store.captureEntry(
@@ -245,7 +245,8 @@ describe("VocabularyStore capture", () => {
         ),
       );
 
-      expect(store.pruneUntouchedReverseCards()).toBe(2);
+      expect(store.runReverseCardCapMaintenance()).toBe(2);
+      expect(store.runReverseCardCapMaintenance()).toBe(0);
 
       expect(
         rows<{ sense_id: number }>(
@@ -348,7 +349,19 @@ describe("VocabularyStore selection", () => {
       );
 
       initializeSchema(state.storage.sql);
+      expect(
+        rows<{ introduced_local_date: string | null }>(
+          state.storage,
+          `SELECT introduced_local_date FROM vocabulary_cards
+           WHERE entry_id = 1 ORDER BY id`,
+        ),
+      ).toEqual([
+        { introduced_local_date: "2026-07-20" },
+        { introduced_local_date: "2026-07-20" },
+        { introduced_local_date: "2026-07-20" },
+      ]);
 
+      expect(store.repairUnqueuedIntroductions()).toBe(2);
       expect(
         rows<{ id: number; introduced_local_date: string | null }>(
           state.storage,

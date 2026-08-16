@@ -184,7 +184,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
       Number.isSafeInteger(hour) && hour >= 0 && hour <= 23 ? hour : DEFAULT_REVIEW_HOUR;
     void this.ctx.blockConcurrencyWhile(async () => {
       initializeSchema(this.ctx.storage.sql);
-      this.store.pruneUntouchedReverseCards();
+      this.store.runReverseCardCapMaintenance();
     });
   }
 
@@ -262,7 +262,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
     ).one().count;
     if (inboxCount !== 0) throw new Error("snapshot import requires empty inbox");
     writeSnapshot(this.ctx.storage, parsed);
-    this.store.pruneUntouchedReverseCards();
+    this.store.normalizeImportedCards();
     const imported = readSnapshot(this.ctx.storage);
     return summarizeSnapshot(imported, await sha256Snapshot(imported));
   }
