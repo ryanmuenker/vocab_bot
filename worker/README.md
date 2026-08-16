@@ -5,10 +5,12 @@ Hermes gateway: a Telegram webhook, a `VocabularyCompanion` Durable Object
 holding the SQLite study state, and a cron alarm that acts as the review ticker.
 
 It implements the production **v5 model**: embedded FSRS-6
-scheduling, directional forward/reverse cards, `/review`'s 10-card
-per-local-day introduction quota with practiced-sense coverage first,
-unseen-only directional tests, sibling burial, test-only tail retries, and
-`/review`, `/test forward|reverse`, `/endstudy`.
+scheduling, one forward and up to three diverse reverse cards per entry,
+`/review`'s 10-card per-local-day introduction quota with practiced-sense
+coverage first, unseen-only directional tests, sibling burial, test-only tail
+retries, and `/review`, `/test forward|reverse`, `/endstudy`. Every definition
+remains stored; startup and snapshot import remove only surplus reverse cards
+that have never been queued or reviewed.
 
 The Worker implementation under `worker/src/` is the production source of truth. User-visible fixes must land here first and be covered under `worker/test/`. Python is secondary migration/reference code; update it only when snapshot compatibility, offline tooling, or deliberately maintained parity requires it.
 

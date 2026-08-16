@@ -50,7 +50,10 @@ export class TelegramAdapter {
       };
       if (payload.ok !== true) throw new Error("Telegram send rejected");
       const messageId = payload.result?.message_id;
-      if (Number.isSafeInteger(messageId)) messageIds.push(messageId as number);
+      if (!Number.isSafeInteger(messageId)) {
+        throw new Error("Telegram response missing message id");
+      }
+      messageIds.push(messageId as number);
     }
     return messageIds;
   }

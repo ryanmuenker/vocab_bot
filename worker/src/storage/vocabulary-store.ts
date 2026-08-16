@@ -32,6 +32,7 @@ import type {
   VocabularySense,
 } from "../domain/models";
 import {
+  caseFold,
   normalizeEntryText,
   trimPythonWhitespace,
   validateSenseCards,
@@ -54,6 +55,9 @@ const DAILY_NEW_ENTRY_LIMIT = 10;
 export const TEST_REQUIRED_CARDS = 5;
 /** Temporary retirement offset used before rollover compacts queue positions. */
 const RETIRED_OFFSET = 200_000;
+const MAX_REVERSE_CARDS_PER_ENTRY = 3;
+const SEMANTIC_TOKEN_PATTERN = /[\p{Letter}\p{Number}]+/gu;
+const NO_PROTECTED_REVERSE_SENSES: ReadonlySet<number> = new Set();
 
 const VALID_GRADES: Record<EvaluationGradeValue, true> = {
   [EvaluationGrade.CORRECT]: true,
@@ -167,6 +171,90 @@ interface SenseRow extends SqlRow {
   example_sentence: string;
   source_context: string | null;
   date_added: string;
+}
+
+interface ReverseCardRetentionRow extends SqlRow {
+  id: number;
+  sense_id: number;
+  untouched: number;
+}
+
+function addSemanticTokens(target: Set<string>, value: string, prefix: string): void {
+  const tokens = caseFold(value.normalize("NFKC")).match(SEMANTIC_TOKEN_PATTERN);
+  if (tokens === null) return;
+  for (const token of tokens) target.add(`${prefix}${token}`);
+}
+
+function semanticTokens(sense: SenseRow): ReadonlySet<string> {
+  const tokens = new Set<string>();
+  addSemanticTokens(tokens, sense.definition, "");
+  addSemanticTokens(tokens, sense.part_of_speech, "pos:");
+  return tokens;
+}
+
+function semanticSimilarity(left: ReadonlySet<string>, right: ReadonlySet<string>): number {
+  let smaller = left;
+  let larger = right;
+  if (left.size > right.size) {
+    smaller = right;
+    larger = left;
+  }
+  let intersection = 0;
+  for (const token of smaller) {
+    if (larger.has(token)) intersection += 1;
+  }
+  const union = left.size + right.size - intersection;
+  return union === 0 ? 1 : intersection / union;
+}
+
+/**
+ * Retain protected senses, then the primary sense, then greedily choose the
+ * meanings least similar to anything already selected. Input order breaks ties.
+ */
+function selectReverseSenseIds(
+  senses: readonly SenseRow[],
+  protectedIds: ReadonlySet<number> = NO_PROTECTED_REVERSE_SENSES,
+): ReadonlySet<number> {
+  const selectedIds = new Set<number>();
+  const selected: SenseRow[] = [];
+  for (const sense of senses) {
+    if (protectedIds.has(sense.id)) {
+      selectedIds.add(sense.id);
+      selected.push(sense);
+    }
+  }
+  if (selected.length >= MAX_REVERSE_CARDS_PER_ENTRY) return selectedIds;
+
+  const primary = senses[0];
+  if (primary !== undefined && !selectedIds.has(primary.id)) {
+    selectedIds.add(primary.id);
+    selected.push(primary);
+  }
+
+  const tokens = new Map<number, ReadonlySet<string>>();
+  for (const sense of senses) tokens.set(sense.id, semanticTokens(sense));
+  while (selected.length < MAX_REVERSE_CARDS_PER_ENTRY && selected.length < senses.length) {
+    let best: SenseRow | null = null;
+    let bestMaximumSimilarity = Number.POSITIVE_INFINITY;
+    for (const candidate of senses) {
+      if (selectedIds.has(candidate.id)) continue;
+      let maximumSimilarity = 0;
+      for (const current of selected) {
+        maximumSimilarity = Math.max(
+          maximumSimilarity,
+          semanticSimilarity(tokens.get(candidate.id)!, tokens.get(current.id)!),
+        );
+      }
+      if (maximumSimilarity < bestMaximumSimilarity) {
+        best = candidate;
+        bestMaximumSimilarity = maximumSimilarity;
+      }
+    }
+    if (best === null) break;
+    selectedIds.add(best.id);
+    selected.push(best);
+  }
+  return selectedIds;
 }
 
 interface CardRow extends SqlRow {
@@ -425,9 +513,67 @@ export class VocabularyStore {
     }
   }
 
-  /** Project the missing forward and reverse cards of one entry. */
+  /** Project the missing forward card and at most three diverse reverse cards. */
   createCards(entryId: number, now = new Date()): void {
     this.storage.transactionSync(() => this.insertCards(entryId, now));
+  }
+
+  /**
+   * Remove only surplus reverse cards that have never entered the learning
+   * lifecycle. Queue membership or review history always wins over the cap.
+   */
+  pruneUntouchedReverseCards(): number {
+    return this.storage.transactionSync(() => {
+      const entryIds = all(
+        this.sql.exec<{ entry_id: number }>(
+          `SELECT entry_id
+           FROM vocabulary_cards
+           WHERE direction = 'reverse'
+           GROUP BY entry_id
+           HAVING COUNT(*) > ?`,
+          MAX_REVERSE_CARDS_PER_ENTRY,
+        ),
+      );
+      let deleted = 0;
+      for (const { entry_id: entryId } of entryIds) {
+        const senses = all(
+          this.sql.exec<SenseRow>(
+            "SELECT * FROM vocabulary_senses WHERE entry_id = ? ORDER BY id",
+            entryId,
+          ),
+        );
+        const reverseCards = all(
+          this.sql.exec<ReverseCardRetentionRow>(
+            `SELECT c.id, c.sense_id,
+                    CASE WHEN c.state = 'new'
+                              AND c.repetitions = 0
+                              AND c.introduced_local_date IS NULL
+                              AND NOT EXISTS (
+                                SELECT 1 FROM study_queue q WHERE q.card_id = c.id
+                              )
+                              AND NOT EXISTS (
+                                SELECT 1 FROM review_attempts a WHERE a.card_id = c.id
+                              )
+                         THEN 1 ELSE 0 END AS untouched
+             FROM vocabulary_cards c
+             WHERE c.entry_id = ? AND c.direction = 'reverse'
+             ORDER BY c.id`,
+            entryId,
+          ),
+        );
+        const protectedIds = new Set<number>();
+        for (const card of reverseCards) {
+          if (card.untouched !== 1) protectedIds.add(card.sense_id);
+        }
+        const retainedIds = selectReverseSenseIds(senses, protectedIds);
+        for (const card of reverseCards) {
+          if (card.untouched !== 1 || retainedIds.has(card.sense_id)) continue;
+          all(this.sql.exec("DELETE FROM vocabulary_cards WHERE id = ?", card.id));
+          deleted += 1;
+        }
+      }
+      return deleted;
+    });
   }
 
   private insertCards(entryId: number, now: Date): void {
@@ -461,19 +607,29 @@ export class VocabularyStore {
       ),
     );
     if (forward === null) insert(null, CardDirection.FORWARD);
+
     const senses = all(
-      this.sql.exec<{ id: number }>(
-        `SELECT s.id FROM vocabulary_senses s
-         WHERE s.entry_id = ?
-           AND NOT EXISTS (
-             SELECT 1 FROM vocabulary_cards c
-             WHERE c.sense_id = s.id AND c.direction = 'reverse'
-           )
-         ORDER BY s.id`,
+      this.sql.exec<SenseRow>(
+        "SELECT * FROM vocabulary_senses WHERE entry_id = ? ORDER BY id",
         entryId,
       ),
     );
-    for (const sense of senses) insert(sense.id, CardDirection.REVERSE);
+    const existingReverseIds = new Set(
+      all(
+        this.sql.exec<{ sense_id: number }>(
+          `SELECT sense_id FROM vocabulary_cards
+           WHERE entry_id = ? AND direction = 'reverse'
+           ORDER BY id`,
+          entryId,
+        ),
+      ).map(({ sense_id }) => sense_id),
+    );
+    const selectedIds = selectReverseSenseIds(senses, existingReverseIds);
+    for (const sense of senses) {
+      if (selectedIds.has(sense.id) && !existingReverseIds.has(sense.id)) {
+        insert(sense.id, CardDirection.REVERSE);
+      }
+    }
   }
 
   // ------------------------------------------------------- session lifecycle

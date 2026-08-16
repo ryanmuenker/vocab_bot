@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { runDurableObjectAlarm } from "cloudflare:test";
+import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -188,6 +188,99 @@ describe("VocabularyCompanion capture", () => {
     ]);
     expect(await stub.summary()).toMatchObject({ entries: 1, senses: 1, pendingInbox: 0, failedInbox: 0 });
   });
+
+  it("keeps imported senses while pruning untouched reverse cards to three diverse meanings", async () => {
+    const stub = companion("reverse-cap-import");
+    const snapshot = library(1);
+    const dateAdded = snapshot.entries[0]!.dateAdded;
+    const definitions = [
+      ["noun", "a place that stores money for customers", "She deposited her pay at the bank."],
+      ["noun", "a business that stores money for customers", "The bank approved the loan."],
+      ["noun", "the sloping land beside a river", "They picnicked on the river bank."],
+      ["verb", "to tilt an aircraft during a turn", "The pilot banked left."],
+      ["noun", "an organization that stores money for customers", "The bank safeguards deposits."],
+    ] as const;
+    const senses: SnapshotV2["senses"] = definitions.map(
+      ([partOfSpeech, definition, exampleSentence], index) => ({
+        id: index + 1,
+        entryId: 1,
+        definition,
+        partOfSpeech,
+        exampleSentence,
+        sourceContext: null,
+        dateAdded,
+      }),
+    );
+    const cards = [
+      newCard(1, 1, null, "forward", dateAdded),
+      ...senses.map((sense, index) => newCard(index + 2, 1, sense.id, "reverse", dateAdded)),
+    ];
+
+    const summary = await stub.importSnapshot({ ...snapshot, senses, cards });
+    const exported = (await stub.exportSnapshot())!;
+
+    expect(summary).toMatchObject({ entries: 1, senses: 5, cards: 4 });
+    expect(exported.senses).toHaveLength(5);
+    expect(
+      exported.cards
+        .filter((card) => card.direction === "reverse")
+        .map((card) => card.senseId),
+    ).toEqual([1, 3, 4]);
+  });
+
+  it("prunes existing untouched reverse cards when the Durable Object restarts", async () => {
+    const stub = companion("reverse-cap-restart");
+    const snapshot = library(1);
+    const dateAdded = snapshot.entries[0]!.dateAdded;
+    await stub.importSnapshot(snapshot);
+    await runInDurableObject(stub, (_instance, state) => {
+      for (let senseId = 2; senseId <= 5; senseId += 1) {
+        Array.from(
+          state.storage.sql.exec(
+            `INSERT INTO vocabulary_senses
+               (id, entry_id, definition, part_of_speech, example_sentence,
+                source_context, date_added)
+             VALUES (?, 1, ?, 'noun', ?, NULL, ?)`,
+            senseId,
+            `legacy definition ${senseId}`,
+            `Legacy example ${senseId}.`,
+            dateAdded,
+          ),
+        );
+        Array.from(
+          state.storage.sql.exec(
+            `INSERT INTO vocabulary_cards (
+               id, entry_id, sense_id, direction, state, stability, difficulty,
+               due_at, effective_due_at, last_review_at, repetitions, lapses,
+               scheduler_kind, scheduler_version, parameters_version,
+               parameter_fingerprint, desired_retention,
+               introduced_local_date, buried_until_local_date, created_at
+             )
+             SELECT ?, entry_id, ?, 'reverse', state, stability, difficulty,
+                    due_at, effective_due_at, last_review_at, repetitions, lapses,
+                    scheduler_kind, scheduler_version, parameters_version,
+                    parameter_fingerprint, desired_retention,
+                    introduced_local_date, buried_until_local_date, created_at
+             FROM vocabulary_cards
+             WHERE id = 1`,
+            senseId + 1,
+            senseId,
+          ),
+        );
+      }
+      expect(
+        state.storage.sql.exec<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM vocabulary_cards WHERE direction = 'reverse'",
+        ).one().count,
+      ).toBe(5);
+    });
+
+    await evictDurableObject(stub);
+    const exported = (await stub.exportSnapshot())!;
+
+    expect(exported.senses).toHaveLength(5);
+    expect(exported.cards.filter((card) => card.direction === "reverse")).toHaveLength(3);
+  });
 });
 
 describe("VocabularyCompanion delivery gating", () => {
@@ -241,6 +334,46 @@ describe("VocabularyCompanion delivery gating", () => {
     expect(io.sent[0]).toContain("Review due. Answer this delivered question first:");
     expect(io.sent[0]).toContain("Your original message was:\nobdurate");
     expect((await stub.summary()).entries).toBe(2);
+  });
+
+  it("replays undelivered evaluation feedback before accepting a rating", async () => {
+    const io = transport();
+    const stub = companion("evaluation-delivery");
+    await stub.importSnapshot(library(2));
+
+    await stub.enqueueTelegramUpdate(message(1, "/review"));
+    await drain(stub);
+
+    io.telegramFails = true;
+    await stub.enqueueTelegramUpdate(message(2, "a street of some kind"));
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+    }
+
+    io.telegramFails = false;
+    await stub.enqueueTelegramUpdate(message(3, "not a rating"));
+    await drain(stub);
+
+    expect(io.sent[1]).toContain("Your previous evaluation was not delivered");
+    expect(io.sent[1]).toContain("Grade: Correct");
+    expect(io.sent[1]).toContain("Choose effort: Hard or Good or Easy.");
+    expect(io.sent[1]).toContain("Your original message was:\nnot a rating");
+
+    await stub.enqueueTelegramUpdate(message(4, "good"));
+    await drain(stub);
+    expect(io.sent[2]).toContain("Rated: Good");
+  });
+
+  it("does not send a prompt that was cancelled before delivery", async () => {
+    const io = transport();
+    const stub = companion("cancelled-before-delivery");
+    await stub.importSnapshot(library(2));
+
+    await stub.enqueueTelegramUpdate(message(1, "/review"));
+    await stub.enqueueTelegramUpdate(message(2, "/endstudy"));
+    await drain(stub);
+
+    expect(io.sent).toEqual(["Review exited. Unfinished cards are still due."]);
   });
 
   it("delivers, grades an answer, applies the rating, and buries the entry's siblings", async () => {
@@ -582,6 +715,42 @@ describe("VocabularyCompanion concurrency", () => {
     expect(io.modelCalls()).toBe(1);
     expect(io.sent[1]).toContain("Choose effort:");
     expect(io.sent[2]).toBe("Send one of the listed effort ratings.");
+  });
+
+  it("does not shorten a delivery retry when a duplicate update arrives", async () => {
+    const io = transport();
+    io.telegramFails = true;
+    const stub = companion("retry-deadline");
+    await stub.importSnapshot(library(1));
+
+    await stub.enqueueTelegramUpdate(message(1, "/review"));
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    const retryAt = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.getAlarm()
+    );
+
+    expect(await stub.enqueueTelegramUpdate(message(1, "/review"))).toBe("duplicate");
+    const afterDuplicate = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.getAlarm()
+    );
+
+    expect(retryAt).not.toBeNull();
+    expect(afterDuplicate).toBe(retryAt);
+  });
+
+  it("allows snapshot export after a terminal inbox delivery failure", async () => {
+    const io = transport();
+    io.telegramFails = true;
+    const stub = companion("failed-export");
+    await stub.importSnapshot(library(1));
+
+    await stub.enqueueTelegramUpdate(message(1, "/review"));
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+    }
+
+    expect(await stub.summary()).toMatchObject({ pendingInbox: 0, failedInbox: 1 });
+    expect(await stub.exportSnapshot()).not.toBeNull();
   });
 
   it("marks a prepared response failed after ten Telegram send failures", async () => {

@@ -48,7 +48,10 @@ const DEFINITION_SYSTEM_PROMPT =
   "top-level key, senses, containing 1 to 20 senses. " +
   "List every credible distinct English sense for the supplied " +
   "entry, including common, literary, archaic, regional, and " +
-  "major technical senses. Exclude hyper-specialized jargon and " +
+  "major technical senses. Order senses with the most common " +
+  "meaning first. When there are more than three senses, make the " +
+  "first three semantically distinct from one another while still " +
+  "prioritizing common meanings. Exclude hyper-specialized jargon and " +
   "do not split mere wording variants into separate senses. " +
   "Each sense must contain exactly part_of_speech, definition, " +
   "and example_sentence. Definitions must be concise and examples " +

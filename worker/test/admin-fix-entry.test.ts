@@ -77,6 +77,7 @@ describe("admin fix-entry surface", () => {
       { id: "45", displayText: "Abscond" },
       { id: 45, displayText: "   " },
       { id: 45, displayText: "Abscond", extra: true },
+      { id: 45, displayText: "x".repeat(501) },
     ]) {
       expect((await fixEntry(body)).status).toBe(400);
     }

@@ -65,12 +65,18 @@ describe("OpenCodeAdapter", () => {
     expect((await adapter.defineEntry("word")).status).toBe(DefinitionStatus.FOUND);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const request = fetchMock.mock.calls[0]![1] as RequestInit;
-    expect(JSON.parse(request.body as string)).toMatchObject({
+    const body = JSON.parse(request.body as string) as {
+      messages: { role: string; content: string }[];
+    } & Record<string, unknown>;
+    expect(body).toMatchObject({
       model: "model",
       max_tokens: 4_000,
       temperature: 0,
       tools: [],
     });
+    expect(body.messages[0]!.content).toContain("most common");
+    expect(body.messages[0]!.content).toContain("first three");
+    expect(body.messages[0]!.content).toContain("semantically distinct");
   });
 
   it("retries two transient definition failures before succeeding", async () => {
@@ -277,5 +283,14 @@ describe("TelegramAdapter", () => {
     const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
     expect(body).toEqual({ chat_id: "123", text: "one\n\ntwo" });
     await expect(adapter.sendText("again")).rejects.toThrow(/rejected/u);
+  });
+
+  it("rejects a successful Telegram response without a message id", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      response({ ok: true, result: {} }),
+    ));
+    const adapter = new TelegramAdapter({ botToken: "token", chatId: "123" });
+
+    await expect(adapter.sendText("hello")).rejects.toThrow(/message id/u);
   });
 });

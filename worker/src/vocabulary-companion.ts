@@ -156,6 +156,7 @@ function interruption(label: string, promptText: string, userText: string, exit:
   );
 }
 
+
 export class VocabularyCompanion extends DurableObject<Env> {
   private readonly store: VocabularyStore;
   private readonly provider: OpenCodeAdapter;
@@ -183,13 +184,14 @@ export class VocabularyCompanion extends DurableObject<Env> {
       Number.isSafeInteger(hour) && hour >= 0 && hour <= 23 ? hour : DEFAULT_REVIEW_HOUR;
     void this.ctx.blockConcurrencyWhile(async () => {
       initializeSchema(this.ctx.storage.sql);
+      this.store.pruneUntouchedReverseCards();
     });
   }
 
   async enqueueTelegramUpdate(input: AdmittedTelegramMessage): Promise<Routed> {
     const dedupeKey = `telegram:${input.updateId}`;
     if (this.findByDedupeKey(dedupeKey) !== null) {
-      await this.ctx.storage.setAlarm(Date.now() + ACTIONABLE_ALARM_DELAY_MS);
+      await this.rescheduleIfActionable();
       return "duplicate";
     }
     const now = new Date(input.receivedAt);
@@ -201,7 +203,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
         ? this.routeText(dedupeKey, input, now)
         : this.routeCommand(dedupeKey, command, input.receivedAt, now);
     await this.recordDeliveryIntent(dedupeKey, now);
-    await this.ctx.storage.setAlarm(Date.now() + ACTIONABLE_ALARM_DELAY_MS);
+    await this.rescheduleIfActionable();
     return routed;
   }
 
@@ -214,7 +216,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
     readonly nowUtc: string;
   }): Promise<Routed | "silent"> {
     if (this.findByDedupeKey(input.dedupeKey) !== null) {
-      await this.ctx.storage.setAlarm(Date.now() + ACTIONABLE_ALARM_DELAY_MS);
+      await this.rescheduleIfActionable();
       return "duplicate";
     }
     const now = new Date(input.nowUtc);
@@ -248,7 +250,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
       prompt.id,
     );
     await this.recordDeliveryIntent(input.dedupeKey, now);
-    await this.ctx.storage.setAlarm(Date.now() + ACTIONABLE_ALARM_DELAY_MS);
+    await this.rescheduleIfActionable();
     return routed;
   }
 
@@ -260,12 +262,14 @@ export class VocabularyCompanion extends DurableObject<Env> {
     ).one().count;
     if (inboxCount !== 0) throw new Error("snapshot import requires empty inbox");
     writeSnapshot(this.ctx.storage, parsed);
-    return summarizeSnapshot(parsed, await sha256Snapshot(parsed));
+    this.store.pruneUntouchedReverseCards();
+    const imported = readSnapshot(this.ctx.storage);
+    return summarizeSnapshot(imported, await sha256Snapshot(imported));
   }
 
   async exportSnapshot(): Promise<SnapshotV2 | null> {
     const unfinished = this.ctx.storage.sql.exec<{ count: number }>(
-      "SELECT COUNT(*) AS count FROM inbox_events WHERE status <> 'completed'",
+      "SELECT COUNT(*) AS count FROM inbox_events WHERE status IN ('pending', 'waiting', 'ready')",
     ).one().count;
     return unfinished === 0 ? readSnapshot(this.ctx.storage) : null;
   }
@@ -458,7 +462,36 @@ export class VocabularyCompanion extends DurableObject<Env> {
   private routeText(dedupeKey: string, input: AdmittedTelegramMessage, now: Date): Routed {
     const awaiting = this.store.awaitingRating();
     if (awaiting !== null) {
-      return this.insertStudyAnswer(dedupeKey, awaiting.id, input);
+      if (this.latestTargetWasDelivered(awaiting.id)) {
+        return this.insertStudyAnswer(dedupeKey, awaiting.id, input);
+      }
+      const context = this.store.currentAnswerContext();
+      if (context === null || context.draft === null) {
+        return this.insertReadyEvent(
+          dedupeKey,
+          "telegram",
+          REVIEW_ERROR_REPLY,
+          input.receivedAt,
+          null,
+        );
+      }
+      const evaluation = formatStudyEvaluation(
+        context,
+        allowedRatings(context.draft.evaluation.grade),
+      );
+      const response =
+        "Your previous evaluation was not delivered, so this message was not used as a rating.\n\n" +
+        `${evaluation}\n\n` +
+        "Your original message was:\n" +
+        `${input.text}\n\n` +
+        "Choose one of the listed effort ratings, or /endstudy, then resubmit it.";
+      return this.insertReadyEvent(
+        dedupeKey,
+        "telegram",
+        response,
+        input.receivedAt,
+        awaiting.id,
+      );
     }
     const answerable = this.store.answerablePrompt();
     if (answerable !== null) {
@@ -710,7 +743,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
     if (persisted.draft.evaluation.grade === EvaluationGrade.INCORRECT) {
       return this.settleStudyStep(persisted, "again", now);
     }
-    return { text: formatStudyEvaluation(persisted, choices), promptId: null };
+    return { text: formatStudyEvaluation(persisted, choices), promptId: persisted.prompt.id };
   }
 
   private async evaluateAnswer(
@@ -817,6 +850,13 @@ export class VocabularyCompanion extends DurableObject<Env> {
   private async deliverEvent(eventId: number): Promise<boolean> {
     const event = this.inboxById(eventId);
     if (event === null || event.status !== "ready" || event.response_text === null) return false;
+    if (
+      event.prepared_target_id !== null &&
+      !this.deliveryTargetActive(event.prepared_target_id)
+    ) {
+      this.completeDelivery(event.id);
+      return false;
+    }
     const chunks = splitTelegramMessage(event.response_text);
     if (event.response_text === "" || event.next_chunk_index >= chunks.length) {
       this.completeDelivery(event.id);
@@ -840,7 +880,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
         timestamp(),
         event.id,
       ));
-      await this.ctx.storage.setAlarm(Date.now() + ACTIONABLE_ALARM_DELAY_MS);
+      await this.rescheduleIfActionable();
       return false;
     } catch {
       const attempts = event.attempt_count + 1;
@@ -853,9 +893,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
           timestamp(),
           event.id,
         ));
-        await this.ctx.storage.setAlarm(
-          Date.now() + SEND_RETRY_DELAYS_SECONDS[attempts - 1]! * 1_000,
-        );
+        await this.rescheduleIfActionable();
         return true;
       }
       // Terminal failure: the prompt stays prepared, so it is never answerable
@@ -898,8 +936,9 @@ export class VocabularyCompanion extends DurableObject<Env> {
   /** Every chunk landed, so the prompt this response carried is now answerable. */
   private async confirmDelivery(event: InboxRow, messageIds: readonly number[]): Promise<void> {
     if (event.prepared_target_id === null || event.response_text === null) return;
+    if (messageIds.length === 0) throw new Error("Telegram delivery returned no message ids");
     this.store.recordDelivery(event.prepared_target_id, {
-      deliveryId: messageIds.length > 0 ? messageIds.join(",") : event.dedupe_key,
+      deliveryId: messageIds.join(","),
       contentFingerprint: await sha256Hex(event.response_text),
     });
   }
@@ -1002,12 +1041,48 @@ export class VocabularyCompanion extends DurableObject<Env> {
     )[0] ?? null;
   }
 
+  private latestTargetWasDelivered(promptId: number): boolean {
+    const latest = rows(
+      this.ctx.storage.sql.exec<{ status: InboxStatus }>(
+        `SELECT status FROM inbox_events
+         WHERE prepared_target_id = ?
+         ORDER BY id DESC LIMIT 1`,
+        promptId,
+      ),
+    )[0];
+    return latest?.status === "completed";
+  }
+
+  private deliveryTargetActive(promptId: number): boolean {
+    const target = rows(
+      this.ctx.storage.sql.exec<{ status: StudyPromptStatus }>(
+        "SELECT status FROM study_prompts WHERE id = ?",
+        promptId,
+      ),
+    )[0];
+    return (
+      target?.status === StudyPromptStatus.PREPARED ||
+      target?.status === StudyPromptStatus.DELIVERED ||
+      target?.status === StudyPromptStatus.ANSWERED
+    );
+  }
+
   private async rescheduleIfActionable(): Promise<void> {
-    const actionable = this.ctx.storage.sql.exec<{ count: number }>(
-      "SELECT COUNT(*) AS count FROM inbox_events WHERE status IN ('pending', 'ready')",
-    ).one().count;
-    if (actionable > 0) {
-      await this.ctx.storage.setAlarm(Date.now() + ACTIONABLE_ALARM_DELAY_MS);
+    const event = rows(
+      this.ctx.storage.sql.exec<Pick<InboxRow, "status" | "attempt_count" | "updated_at">>(
+        `SELECT status, attempt_count, updated_at FROM inbox_events
+         WHERE status IN ('pending', 'ready')
+         ORDER BY id LIMIT 1`,
+      ),
+    )[0];
+    if (event === undefined) return;
+
+    let scheduledAt = Date.now() + ACTIONABLE_ALARM_DELAY_MS;
+    if (event.status === "ready" && event.attempt_count > 0) {
+      const delay = SEND_RETRY_DELAYS_SECONDS[event.attempt_count - 1];
+      const retryAt = Date.parse(event.updated_at) + (delay ?? 0) * 1_000;
+      if (Number.isFinite(retryAt) && retryAt > Date.now()) scheduledAt = retryAt;
     }
+    await this.ctx.storage.setAlarm(scheduledAt);
   }
 }

@@ -28,6 +28,34 @@ const SECOND_CARD: SenseCard = {
   definition: "to define",
   exampleSentence: "I define it.",
 };
+
+const DIVERSE_CARDS: readonly SenseCard[] = [
+  {
+    partOfSpeech: "noun",
+    definition: "a place that stores money for customers",
+    exampleSentence: "She deposited her pay at the bank.",
+  },
+  {
+    partOfSpeech: "noun",
+    definition: "a business that stores money for customers",
+    exampleSentence: "The bank approved the loan.",
+  },
+  {
+    partOfSpeech: "noun",
+    definition: "the sloping land beside a river",
+    exampleSentence: "They picnicked on the river bank.",
+  },
+  {
+    partOfSpeech: "verb",
+    definition: "to tilt an aircraft during a turn",
+    exampleSentence: "The pilot banked left.",
+  },
+  {
+    partOfSpeech: "noun",
+    definition: "an organization that stores money for customers",
+    exampleSentence: "The bank safeguards deposits.",
+  },
+];
 const CORRECT: Evaluation = { grade: EvaluationGrade.CORRECT, feedback: "Accurate." };
 
 function stub() {
@@ -94,17 +122,18 @@ function answerCurrent(
 }
 
 describe("VocabularyStore capture", () => {
-  it("projects one forward card per entry and one reverse card per sense atomically", async () => {
+  it("keeps every sense but projects one forward and at most three diverse reverse cards atomically", async () => {
     await runInDurableObject(stub(), (_instance, state) => {
       const store = new VocabularyStore(state.storage, "UTC");
       const result = store.captureEntry(
-        "  Straße  ",
-        [CARD, SECOND_CARD],
+        "  Bank  ",
+        DIVERSE_CARDS,
         new Date("2026-07-20T00:00:00Z"),
       );
 
       expect(result.status).toBe(CaptureStatus.SAVED);
-      expect(result.entry?.normalizedText).toBe("strasse");
+      expect(result.entry?.normalizedText).toBe("bank");
+      expect(result.entry?.senses).toHaveLength(5);
       const cards = rows<{
         direction: string;
         sense_id: number | null;
@@ -121,7 +150,8 @@ describe("VocabularyStore capture", () => {
       expect(cards.map(({ direction, sense_id }) => [direction, sense_id])).toEqual([
         ["forward", null],
         ["reverse", result.entry!.senses[0]!.id],
-        ["reverse", result.entry!.senses[1]!.id],
+        ["reverse", result.entry!.senses[2]!.id],
+        ["reverse", result.entry!.senses[3]!.id],
       ]);
       for (const card of cards) {
         expect(card.state).toBe("new");
@@ -130,6 +160,103 @@ describe("VocabularyStore capture", () => {
         expect(card.created_at).toBe("2026-07-20T00:00:00Z");
         expect(card.scheduler_kind).toBe("fsrs-6");
       }
+    });
+  });
+
+  it("introduces a new word through its forward card before reverse siblings", async () => {
+    await runInDurableObject(stub(), (_instance, state) => {
+      const store = new VocabularyStore(state.storage, "UTC");
+      const result = store.captureEntry(
+        "bank",
+        DIVERSE_CARDS,
+        new Date("2026-07-20T09:00:00Z"),
+      );
+
+      const started = store.startReview(new Date("2026-07-20T10:00:00Z"));
+
+      expect(started.status).toBe(StudyStartStatus.STARTED);
+      expect(started.snapshot!.queue.map((item) => [
+        item.card.direction,
+        item.card.senseId,
+      ])).toEqual([["forward", null]]);
+      expect(result.entry?.senses).toHaveLength(5);
+    });
+  });
+
+  it("prunes untouched legacy reverse cards without deleting a queued extra", async () => {
+    await runInDurableObject(stub(), (_instance, state) => {
+      const store = new VocabularyStore(state.storage, "UTC");
+      const result = store.captureEntry(
+        "bank",
+        DIVERSE_CARDS,
+        new Date("2026-07-20T00:00:00Z"),
+      );
+      const senses = result.entry!.senses;
+      const legacySenseIds = [senses[1]!.id, senses[4]!.id];
+      Array.from(
+        state.storage.sql.exec(
+          `DELETE FROM vocabulary_cards
+           WHERE direction = 'reverse' AND sense_id IN (?, ?)`,
+          ...legacySenseIds,
+        ),
+      );
+      for (const senseId of legacySenseIds) {
+        Array.from(
+          state.storage.sql.exec(
+            `INSERT INTO vocabulary_cards (
+               entry_id, sense_id, direction, state, stability, difficulty,
+               due_at, effective_due_at, last_review_at, repetitions, lapses,
+               scheduler_kind, scheduler_version, parameters_version,
+               parameter_fingerprint, desired_retention,
+               introduced_local_date, buried_until_local_date, created_at
+             )
+             SELECT entry_id, ?, 'reverse', state, stability, difficulty,
+                    due_at, effective_due_at, last_review_at, repetitions, lapses,
+                    scheduler_kind, scheduler_version, parameters_version,
+                    parameter_fingerprint, desired_retention,
+                    introduced_local_date, buried_until_local_date, created_at
+             FROM vocabulary_cards
+             WHERE entry_id = ? AND direction = 'forward'`,
+            senseId,
+            result.entry!.id,
+          ),
+        );
+      }
+      const queuedCardId = rows<{ id: number }>(
+        state.storage,
+        "SELECT id FROM vocabulary_cards WHERE sense_id = ?",
+        senses[4]!.id,
+      )[0]!.id;
+      Array.from(
+        state.storage.sql.exec(
+          `INSERT INTO study_sessions
+             (mode, status, started_at, completed_at, local_date)
+           VALUES ('review', 'exited', ?, ?, '2026-07-20')`,
+          "2026-07-20T01:00:00Z",
+          "2026-07-20T02:00:00Z",
+        ),
+      );
+      Array.from(
+        state.storage.sql.exec(
+          `INSERT INTO study_queue
+             (session_id, card_id, position, status, introduced_local_date)
+           VALUES (last_insert_rowid(), ?, 1, 'skipped', '2026-07-20')`,
+          queuedCardId,
+        ),
+      );
+
+      expect(store.pruneUntouchedReverseCards()).toBe(2);
+
+      expect(
+        rows<{ sense_id: number }>(
+          state.storage,
+          `SELECT sense_id FROM vocabulary_cards
+           WHERE entry_id = ? AND direction = 'reverse'
+           ORDER BY sense_id`,
+          result.entry!.id,
+        ).map(({ sense_id }) => sense_id),
+      ).toEqual([senses[0]!.id, senses[3]!.id, senses[4]!.id]);
+      expect(result.entry!.senses).toHaveLength(5);
     });
   });
 
