@@ -190,6 +190,25 @@ describe("pinned py-fsrs 6.3.1 golden vectors", () => {
   });
 });
 
+describe("rating-independent interval floor", () => {
+  it("keeps low-stability Easy on the universal one-day minimum", () => {
+    const card = createCardSchedule({
+      state: CardScheduleState.REVIEW,
+      stability: 0.15,
+      difficulty: 9.92,
+      due: NOW,
+      lastReview: plusDays(NOW, -1),
+      repetitions: 6,
+      lapses: 5,
+    });
+
+    const result = transition(card, ReviewRating.EASY, NOW);
+
+    expect(result.rawDue).toEqual(plusDays(NOW, 1));
+    expect(result.effectiveDue).toEqual(result.rawDue);
+  });
+});
+
 describe("retrievability", () => {
   it("is lower when overdue and lengthens the next interval", () => {
     const card = transition(newCard(), ReviewRating.GOOD, NOW).after;

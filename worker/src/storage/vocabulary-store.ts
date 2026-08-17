@@ -49,8 +49,12 @@ import {
 } from "../domain/scheduling";
 import type { CardSchedule, ScheduleTransition } from "../domain/scheduling";
 
-/** Unseen cards from distinct entries admitted per local day by daily review. */
-const DAILY_NEW_ENTRY_LIMIT = 10;
+/** Unseen cards admitted per local day by daily review. */
+const DAILY_INTRODUCTION_LIMIT = 10;
+/** Preferred share of introductions reserved for genuinely untouched entries. */
+const DAILY_UNTOUCHED_ENTRY_LIMIT = 7;
+/** Preferred share reserved for unseen cards of entries with review history. */
+const DAILY_SIBLING_CARD_LIMIT = 3;
 /** A directional test always runs exactly five cards from five distinct entries. */
 export const TEST_REQUIRED_CARDS = 5;
 /** Temporary retirement offset used before rollover compacts queue positions. */
@@ -763,7 +767,7 @@ export class VocabularyStore {
           };
         }
         const sessionId = this.insertSession(mode, now, today);
-        this.enqueueCards(sessionId, cards, today);
+        this.enqueueCards(sessionId, cards, today, undefined, false);
         this.promoteFirstQueued(sessionId);
         return {
           status: StudyStartStatus.STARTED,
@@ -1260,7 +1264,6 @@ export class VocabularyStore {
         const result = transition(before, rating, now, {
           sameSessionRetry: retryAgain,
           dueFloorUtc: retryAgain ? this.nextLocalMidnight(now) : null,
-          allowSameSessionRetry: row.session_mode !== StudyMode.REVIEW,
         });
         const attemptId = this.insertAttempt(row, result, rating, isSameSessionRetry);
         const updated = this.sql.exec(
@@ -1541,10 +1544,10 @@ export class VocabularyStore {
 
   /**
    * Due cards first, ordered by effective due then predicted recall then age;
-   * optionally the weakest seen non-due cards; then unseen siblings of attempted
-   * entries before cards from untouched entries, within the daily review
-   * introduction quota. Explicit unseen-only selection bypasses
-   * that quota and retains creation order.
+   * optionally the weakest seen non-due cards; then a preferred 7/3 split
+   * between untouched forward cards and unseen siblings of attempted entries.
+   * Either introduction lane borrows capacity the other cannot use. Explicit
+   * unseen-only selection bypasses daily accounting and retains creation order.
    */
   private selectCards(now: Date, options: SelectOptions = {}): StudyCardSnapshot[] {
     const today = localDate(now, this.timeZone);
@@ -1566,21 +1569,34 @@ export class VocabularyStore {
               options.direction,
             ),
           );
-    const introducedByReviewToday =
-      oneOrNull(
-        this.sql.exec<{ count: number }>(
-          `SELECT COUNT(DISTINCT c.entry_id) AS count
-           FROM study_queue q
-           JOIN study_sessions s ON s.id = q.session_id
-           JOIN vocabulary_cards c ON c.id = q.card_id
-           WHERE s.mode = 'review' AND q.introduced_local_date = ?`,
-          today,
-        ),
-      )?.count ?? 0;
-    const remainingNew =
+    const introducedToday =
       options.onlyUnseen === true
         ? null
-        : Math.max(DAILY_NEW_ENTRY_LIMIT - introducedByReviewToday, 0);
+        : oneOrNull(
+            this.sql.exec<{ total: number; untouched: number; siblings: number }>(
+              `SELECT
+                 COUNT(DISTINCT c.entry_id) AS total,
+                 COUNT(DISTINCT CASE WHEN NOT EXISTS (
+                   SELECT 1
+                   FROM review_attempts prior
+                   JOIN vocabulary_cards prior_card ON prior_card.id = prior.card_id
+                   WHERE prior_card.entry_id = c.entry_id
+                     AND prior.reviewed_at < s.started_at
+                 ) THEN c.entry_id END) AS untouched,
+                 COUNT(DISTINCT CASE WHEN EXISTS (
+                   SELECT 1
+                   FROM review_attempts prior
+                   JOIN vocabulary_cards prior_card ON prior_card.id = prior.card_id
+                   WHERE prior_card.entry_id = c.entry_id
+                     AND prior.reviewed_at < s.started_at
+                 ) THEN c.entry_id END) AS siblings
+               FROM study_queue q
+               JOIN study_sessions s ON s.id = q.session_id
+               JOIN vocabulary_cards c ON c.id = q.card_id
+               WHERE s.mode = 'review' AND q.introduced_local_date = ?`,
+              today,
+            ),
+          );
     const excludedCardIds = options.excludedIds ?? new Set<number>();
     const excludedEntryIds = options.excludedEntryIds ?? new Set<number>();
     const attemptedEntries =
@@ -1599,15 +1615,24 @@ export class VocabularyStore {
     const due: [readonly number[], StudyCardSnapshot][] = [];
     const weak: [readonly number[], StudyCardSnapshot][] = [];
     const unseen: [readonly number[], StudyCardSnapshot][] = [];
+    const untouched: [readonly number[], StudyCardSnapshot][] = [];
+    const siblings: [readonly number[], StudyCardSnapshot][] = [];
     for (const row of rows) {
       if (excludedCardIds.has(row.id) || excludedEntryIds.has(row.entry_id)) continue;
       const card = cardSnapshot(row);
       if (card.state === CardScheduleState.NEW) {
         if (row.introduced_local_date === null) {
-          unseen.push([
-            [attemptedEntries?.has(card.entryId) === true ? 0 : 1, card.createdAt.getTime(), card.id],
+          const candidate: [readonly number[], StudyCardSnapshot] = [
+            [card.createdAt.getTime(), card.id],
             card,
-          ]);
+          ];
+          if (attemptedEntries === null) {
+            unseen.push(candidate);
+          } else if (attemptedEntries.has(card.entryId)) {
+            siblings.push(candidate);
+          } else if (card.direction === CardDirection.FORWARD) {
+            untouched.push(candidate);
+          }
         }
         continue;
       }
@@ -1620,30 +1645,54 @@ export class VocabularyStore {
     }
     due.sort(byKey);
     weak.sort(byKey);
-    unseen.sort(byKey);
-
-    const ordered: [StudyCardSnapshot, boolean][] =
-      options.onlyUnseen === true
-        ? unseen.map(([, card]) => [card, true])
-        : due.map(([, card]) => [card, false]);
-    if (options.onlyUnseen !== true) {
-      if (options.includeSeenNonDue === true) {
-        for (const [, card] of weak) ordered.push([card, false]);
-      }
-      for (const [, card] of unseen) ordered.push([card, true]);
+    if (attemptedEntries === null) unseen.sort(byKey);
+    else {
+      untouched.sort(byKey);
+      siblings.sort(byKey);
     }
 
     const selected: StudyCardSnapshot[] = [];
     const entries = new Set<number>();
-    let selectedNew = 0;
-    for (const [card, isNew] of ordered) {
-      if (isNew && remainingNew !== null && selectedNew >= remainingNew) continue;
-      if (options.distinctEntries === true && entries.has(card.entryId)) continue;
-      entries.add(card.entryId);
-      selected.push(card);
-      if (isNew) selectedNew += 1;
-      if (options.maximumCount !== undefined && selected.length >= options.maximumCount) break;
+    const atMaximum = (): boolean =>
+      options.maximumCount !== undefined && selected.length >= options.maximumCount;
+    const append = (
+      candidates: readonly [readonly number[], StudyCardSnapshot][],
+      limit: number,
+    ): number => {
+      let added = 0;
+      for (const [, card] of candidates) {
+        if (added >= limit || atMaximum()) break;
+        if (options.distinctEntries === true && entries.has(card.entryId)) continue;
+        entries.add(card.entryId);
+        selected.push(card);
+        added += 1;
+      }
+      return added;
+    };
+
+    if (options.onlyUnseen === true) {
+      append(unseen, options.maximumCount ?? unseen.length);
+      return selected;
     }
+
+    append(due, due.length);
+    if (options.includeSeenNonDue === true) append(weak, weak.length);
+    let remaining = Math.max(
+      DAILY_INTRODUCTION_LIMIT - (introducedToday?.total ?? 0),
+      0,
+    );
+    const untouchedAllocation = Math.min(
+      Math.max(DAILY_UNTOUCHED_ENTRY_LIMIT - (introducedToday?.untouched ?? 0), 0),
+      remaining,
+    );
+    remaining -= append(untouched, untouchedAllocation);
+    const siblingAllocation = Math.min(
+      Math.max(DAILY_SIBLING_CARD_LIMIT - (introducedToday?.siblings ?? 0), 0),
+      remaining,
+    );
+    remaining -= append(siblings, siblingAllocation);
+    if (remaining > 0) remaining -= append(untouched, remaining);
+    if (remaining > 0) append(siblings, remaining);
     return selected;
   }
 
@@ -1703,6 +1752,7 @@ export class VocabularyStore {
     cards: readonly StudyCardSnapshot[],
     today: string,
     introductionDates: ReadonlyMap<number, string> = new Map(),
+    recordCardIntroduction = true,
   ): void {
     cards.forEach((card, index) => {
       const introduced =
@@ -1717,7 +1767,7 @@ export class VocabularyStore {
           introduced,
         ),
       );
-      if (introduced !== null) {
+      if (introduced !== null && recordCardIntroduction) {
         all(
           this.sql.exec(
             `UPDATE vocabulary_cards

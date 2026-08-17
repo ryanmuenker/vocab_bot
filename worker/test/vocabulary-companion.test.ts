@@ -427,6 +427,31 @@ describe("VocabularyCompanion delivery gating", () => {
     expect(delivered[0]!.contentFingerprint).toMatch(/^[0-9a-f]{64}$/u);
   });
 
+  it("adds an incorrect daily-review card once at the queue tail", async () => {
+    const io = transport();
+    const stub = companion("daily-review-tail-retry");
+    await stub.importSnapshot(library(2));
+
+    await stub.enqueueTelegramUpdate(message(1, "/review"));
+    await drain(stub);
+    expect(io.sent[0]).toContain("What does 'word-1' mean?");
+
+    io.evaluation = { grade: "incorrect", feedback: "Wrong." };
+    await stub.enqueueTelegramUpdate(message(2, "wrong"));
+    await drain(stub);
+    expect(io.sent[1]).toContain("Rated: Again");
+    expect(io.sent[1]).toContain("Retry added at the end.");
+    expect(io.sent[1]).toContain("What does 'word-2' mean?");
+
+    io.evaluation = { grade: "correct", feedback: "Accurate." };
+    await stub.enqueueTelegramUpdate(message(3, "definition two"));
+    await drain(stub);
+    await stub.enqueueTelegramUpdate(message(4, "good"));
+    await drain(stub);
+    expect(io.sent[3]).toContain("Review 3 of 3 · 1 due · retry");
+    expect(io.sent[3]).toContain("What does 'word-1' mean?");
+  });
+
   it("explains a provider limit and grades the resubmission after recovery", async () => {
     const io = transport();
     const stub = companion("provider-limit");

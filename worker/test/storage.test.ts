@@ -405,30 +405,69 @@ describe("VocabularyStore selection", () => {
     });
   });
 
-  it("prioritizes unseen siblings before untouched entries", async () => {
+  it("reserves seven introductions for untouched entries and three for practiced siblings", async () => {
     await runInDurableObject(stub(), (_instance, state) => {
       const store = new VocabularyStore(state.storage, "UTC");
-      store.captureEntry("attempted", [CARD], new Date("2026-05-01T00:00:00Z"));
+      for (let index = 1; index <= 3; index += 1) {
+        store.captureEntry(
+          `practiced-${index}`,
+          [CARD, SECOND_CARD],
+          new Date(`2026-05-0${index}T00:00:00Z`),
+        );
+      }
       const firstDay = new Date("2026-07-20T10:00:00Z");
-      store.startReview(firstDay);
-      answerCurrent(store, ReviewRating.GOOD, firstDay);
+      const practiced = store.startReview(firstDay);
+      expect(practiced.snapshot!.queue.map((item) => item.card.direction)).toEqual([
+        CardDirection.FORWARD,
+        CardDirection.FORWARD,
+        CardDirection.FORWARD,
+      ]);
+      for (let index = 0; index < 3; index += 1) {
+        answerCurrent(store, ReviewRating.GOOD, firstDay);
+      }
 
-      // Reproduce a legacy/prod entry whose reviewed forward card predates an
-      // unintroduced reverse sibling.
-      Array.from(
-        state.storage.sql.exec(
-          `UPDATE vocabulary_cards
-           SET introduced_local_date = NULL, buried_until_local_date = NULL
-           WHERE entry_id = 1 AND direction = 'reverse'`,
-        ),
-      );
       seedEntries(store, 10, "untouched");
-
       const started = store.startReview(new Date("2026-07-21T10:00:00Z"));
       expect(started.status).toBe(StudyStartStatus.STARTED);
-      expect(started.snapshot!.queue.map((item) => item.card.entryId)).toEqual(
-        Array.from({ length: 10 }, (_, index) => index + 1),
-      );
+      expect(started.snapshot!.queue.map((item) => item.card.entryId)).toEqual([
+        4, 5, 6, 7, 8, 9, 10, 1, 2, 3,
+      ]);
+      expect(started.snapshot!.queue.map((item) => item.card.direction)).toEqual([
+        CardDirection.FORWARD,
+        CardDirection.FORWARD,
+        CardDirection.FORWARD,
+        CardDirection.FORWARD,
+        CardDirection.FORWARD,
+        CardDirection.FORWARD,
+        CardDirection.FORWARD,
+        CardDirection.REVERSE,
+        CardDirection.REVERSE,
+        CardDirection.REVERSE,
+      ]);
+    });
+  });
+
+  it("lends unused untouched capacity to practiced siblings", async () => {
+    await runInDurableObject(stub(), (_instance, _state) => {
+      const store = new VocabularyStore(_state.storage, "UTC");
+      for (let index = 1; index <= 10; index += 1) {
+        store.captureEntry(
+          `practiced-${index}`,
+          [CARD],
+          new Date(`2026-06-${String(index).padStart(2, "0")}T00:00:00Z`),
+        );
+      }
+      const firstDay = new Date("2026-07-20T10:00:00Z");
+      store.startReview(firstDay);
+      for (let index = 0; index < 10; index += 1) {
+        answerCurrent(store, ReviewRating.GOOD, firstDay);
+      }
+
+      const second = store.startReview(new Date("2026-07-21T10:00:00Z"));
+      expect(second.snapshot!.queue).toHaveLength(10);
+      expect(second.snapshot!.queue.every(
+        (item) => item.card.direction === CardDirection.REVERSE,
+      )).toBe(true);
     });
   });
 
@@ -607,33 +646,71 @@ describe("VocabularyStore finalization", () => {
     });
   });
 
-  it("does not append a same-session retry in a daily review", async () => {
+  it("appends one tail retry after Again in a daily review", async () => {
     await runInDurableObject(stub(), (_instance, state) => {
       const store = new VocabularyStore(state.storage, "UTC");
       store.captureEntry("obdurate", [CARD], new Date("2026-06-01T00:00:00Z"));
       const now = new Date("2026-07-20T10:00:00Z");
       store.startReview(now);
 
-      const outcome = answerCurrent(store, ReviewRating.AGAIN, now, {
+      const first = answerCurrent(store, ReviewRating.AGAIN, now, {
+        grade: EvaluationGrade.INCORRECT,
+        feedback: "Wrong.",
+      });
+      expect(first.result.transition!.retrySameSession).toBe(true);
+      expect(first.result.snapshot!.status).toBe("active");
+      expect(first.result.snapshot!.queue.map((item) => [
+        item.status,
+        item.retryOfQueueItemId,
+      ])).toEqual([
+        [StudyQueueStatus.COMPLETED, null],
+        [StudyQueueStatus.CURRENT, first.result.snapshot!.queue[0]!.id],
+      ]);
+
+      const retryAt = new Date("2026-07-20T10:05:00Z");
+      const retry = answerCurrent(store, ReviewRating.GOOD, retryAt);
+      expect(retry.result.transition!.retrySameSession).toBe(false);
+      expect(retry.result.snapshot!.status).toBe("completed");
+      expect(retry.result.snapshot!.queue).toHaveLength(2);
+      expect(retry.result.snapshot!.queue.every(
+        (item) => item.status === StudyQueueStatus.COMPLETED,
+      )).toBe(true);
+      expect(
+        rows<{ is_same_session_retry: number }>(
+          state.storage,
+          "SELECT is_same_session_retry FROM review_attempts ORDER BY id",
+        ),
+      ).toEqual([{ is_same_session_retry: 0 }, { is_same_session_retry: 1 }]);
+    });
+  });
+
+  it("does not append a third queue item when the daily-review retry is Again", async () => {
+    await runInDurableObject(stub(), (_instance, state) => {
+      const store = new VocabularyStore(state.storage, "UTC");
+      store.captureEntry("obdurate", [CARD], new Date("2026-06-01T00:00:00Z"));
+      const now = new Date("2026-07-20T10:00:00Z");
+      store.startReview(now);
+      answerCurrent(store, ReviewRating.AGAIN, now, {
         grade: EvaluationGrade.INCORRECT,
         feedback: "Wrong.",
       });
 
-      expect(outcome.result.transition!.retrySameSession).toBe(false);
-      expect(outcome.result.transition!.effectiveDue.getTime())
-        .toBe(outcome.result.transition!.rawDue.getTime());
-      expect(outcome.result.transition!.effectiveDue.getTime())
-        .toBeGreaterThanOrEqual(Date.parse("2026-07-21T10:00:00Z"));
-      expect(outcome.result.snapshot!.queue.filter(
-        (item) => item.retryOfQueueItemId !== null,
-      )).toHaveLength(0);
-      expect(outcome.result.snapshot!.status).toBe("completed");
+      const retryAt = new Date("2026-07-20T10:05:00Z");
+      const retry = answerCurrent(store, ReviewRating.AGAIN, retryAt, {
+        grade: EvaluationGrade.INCORRECT,
+        feedback: "Still wrong.",
+      });
+      expect(retry.result.transition!.retrySameSession).toBe(false);
+      expect(retry.result.transition!.effectiveDue.getTime())
+        .toBeGreaterThanOrEqual(Date.parse("2026-07-21T10:05:00Z"));
+      expect(retry.result.snapshot!.queue).toHaveLength(2);
+      expect(retry.result.snapshot!.status).toBe("completed");
       expect(
         rows<{ is_same_session_retry: number }>(
           state.storage,
-          "SELECT is_same_session_retry FROM review_attempts",
+          "SELECT is_same_session_retry FROM review_attempts ORDER BY id",
         ),
-      ).toEqual([{ is_same_session_retry: 0 }]);
+      ).toEqual([{ is_same_session_retry: 0 }, { is_same_session_retry: 1 }]);
     });
   });
 });

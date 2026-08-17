@@ -66,6 +66,25 @@ confirm `/admin/summary` returns JSON before trusting an import.
 The same shape bites in production: forget `wrangler secret put ADMIN_TOKEN` and
 the admin surface is not broken, it is absent.
 
+### Authenticated production inspection
+
+`/admin/export` is the full production-history endpoint. Its
+`snapshot.reviewAttempts` array includes ratings, evaluator grades, submitted
+answers, review timestamps, and the complete before/after FSRS state. Export it
+without exposing the admin token:
+
+```bash
+curl -sS https://vocab.ryanmuenker.com/admin/export \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -o /tmp/hermes-vocab-export.json
+```
+
+Use `/admin/inspector-data` for the bounded recent-per-entry inspector and
+`/admin/summary` for counts only. Wrangler can list the `ADMIN_TOKEN` binding,
+but Cloudflare does not reveal secret values after they are set. Do not paste
+the token into chat or substitute the local SQLite database, an older snapshot,
+or Python output for this authenticated production export.
+
 To repair one mis-entered word without a full snapshot replace:
 
 ```bash

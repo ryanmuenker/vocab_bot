@@ -26,6 +26,32 @@ Claims about live entries, cards, reviews, queues, prompts, or any production co
 
 Always record which deployed version was exercised and what production path was observed. Local Worker execution can verify code before deployment, but it cannot prove that the same version or configuration is live.
 
+### Fast path for authenticated production analysis
+
+Use the admin surfaces according to their actual evidence:
+
+- `/admin/export` returns the complete Durable Object snapshot. `snapshot.reviewAttempts` is the production history for ratings, evaluator grades, answers, before/after scheduling state, review timestamps, and due dates.
+- `/admin/inspector-data` is a bounded inspection view with recent attempts per entry.
+- `/admin/summary` returns counts, not review history.
+
+First identify the version receiving production traffic and inspect its bindings:
+
+```bash
+cd worker
+ACTIVE_VERSION_ID="$(npx wrangler deployments list --json | jq -r '.[-1].versions | max_by(.percentage).version_id')"
+npx wrangler versions view "$ACTIVE_VERSION_ID" --json
+```
+
+Cloudflare secret values are write-only. Wrangler can prove that `ADMIN_TOKEN` is bound, but it cannot recover the token. Do not search local databases, browser storage, shell history, or Cloudflare internals for it, and never ask a user to paste it into chat. Prefer an authenticated response written locally:
+
+```bash
+curl -sS https://vocab.ryanmuenker.com/admin/export \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -o /tmp/hermes-vocab-export.json
+```
+
+If `/tmp/hermes-vocab-export.json` already exists, validate its envelope and analyze it directly. If the token is unavailable to the agent, ask the user only to create that file, then continue without another design or access handoff. Record the export SHA-256, fetch time, local analysis window, active version ID, and endpoint used. A stale export, local SQLite database, or Python snapshot remains non-production evidence.
+
 ## Worker verification
 
 From `worker/`, first run a focused Vitest invocation for the affected path, using the relevant test file and, when useful, test name:
