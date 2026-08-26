@@ -130,11 +130,15 @@ function transport(): Transport {
     "fetch",
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.includes("/chat/completions")) {
+      if (url.includes("/responses") || url.includes("/chat/completions")) {
         modelCalls += 1;
         if (state.modelStatus !== 200) return jsonResponse({}, state.modelStatus);
-        const body = JSON.parse(init!.body as string) as { messages: { content: string }[] };
-        const content = body.messages[0]!.content.includes("dictionary")
+        const body = JSON.parse(init!.body as string) as {
+          instructions?: string;
+          messages?: { content: string }[];
+        };
+        const systemPrompt = body.instructions ?? body.messages?.[0]?.content ?? "";
+        const content = systemPrompt.includes("dictionary")
           ? JSON.stringify({
               senses: [
                 {
@@ -145,7 +149,14 @@ function transport(): Transport {
               ],
             })
           : JSON.stringify(state.evaluation);
-        return jsonResponse({ choices: [{ message: { content } }] });
+        return url.includes("/responses")
+          ? jsonResponse({
+              output: [{
+                type: "message",
+                content: [{ type: "output_text", text: content }],
+              }],
+            })
+          : jsonResponse({ choices: [{ message: { content } }] });
       }
       if (state.telegramFails) return jsonResponse({ ok: false });
       sent.push(JSON.parse(init!.body as string).text as string);

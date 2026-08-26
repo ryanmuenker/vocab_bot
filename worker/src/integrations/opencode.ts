@@ -81,6 +81,30 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boo
   return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }
 
+function chatCompletionContent(payload: Record<string, unknown>): string | null {
+  if (!Array.isArray(payload.choices)) return null;
+  const choice = object(payload.choices[0]);
+  const message = choice === null ? null : object(choice.message);
+  return message !== null && typeof message.content === "string"
+    ? message.content
+    : null;
+}
+
+function responsesContent(payload: Record<string, unknown>): string | null {
+  if (!Array.isArray(payload.output)) return null;
+  for (const candidate of payload.output) {
+    const output = object(candidate);
+    if (output === null || output.type !== "message" || !Array.isArray(output.content)) continue;
+    for (const candidateContent of output.content) {
+      const content = object(candidateContent);
+      if (content !== null && content.type === "output_text" && typeof content.text === "string") {
+        return content.text;
+      }
+    }
+  }
+  return null;
+}
+
 export function parseDefinitionResponse(text: unknown): DefinitionResult {
   if (typeof text !== "string") return { status: DefinitionStatus.INVALID_RESPONSE, cards: [] };
   let parsed: unknown;
@@ -219,12 +243,9 @@ export class OpenCodeAdapter {
           }),
         },
       ],
-      // `max_tokens` bounds reasoning tokens plus content, and the configured
-      // model reasons before answering: grading one answer spends ~650 tokens
-      // thinking. A 500 budget truncated the JSON mid-key, which surfaced as
-      // "I couldn't evaluate that answer" for exactly the substantive answers
-      // that deserve grading, while nonsense answers stayed cheap enough to
-      // pass. Budget for the reasoning, not just the two short fields.
+      // The configured models reason before answering. Budget for reasoning and
+      // output rather than only the two short JSON fields; a 500-token budget
+      // truncated substantive evaluations while cheap nonsense answers passed.
       4_000,
     );
     if (content.kind === "rate_limited") {
@@ -239,25 +260,39 @@ export class OpenCodeAdapter {
     messages: readonly { readonly role: "system" | "user"; readonly content: string }[],
     maxTokens: number,
   ): Promise<ChatResult> {
+    const responsesApi = this.config.model === "gpt-5.6-luna" ||
+      this.config.model === "grok-4.5" ||
+      this.config.model === "muse-spark-1.2-contributor";
+    const requestBody = responsesApi
+      ? JSON.stringify({
+        model: this.config.model,
+        instructions: messages[0]?.content ?? "",
+        input: messages[1]?.content ?? "",
+        max_output_tokens: maxTokens,
+      })
+      : JSON.stringify({
+        model: this.config.model,
+        messages,
+        max_tokens: maxTokens,
+        temperature: 0,
+        tools: [],
+      });
     for (let attempt = 0; attempt < CHAT_MAX_ATTEMPTS; attempt += 1) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 60_000);
       try {
-        const response = await fetch(`${this.config.baseUrl}/chat/completions`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${this.config.apiKey}`,
-            "Content-Type": "application/json",
+        const response = await fetch(
+          `${this.config.baseUrl}/${responsesApi ? "responses" : "chat/completions"}`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${this.config.apiKey}`,
+              "Content-Type": "application/json",
+            },
+            body: requestBody,
+            signal: controller.signal,
           },
-          body: JSON.stringify({
-            model: this.config.model,
-            messages,
-            max_tokens: maxTokens,
-            temperature: 0,
-            tools: [],
-          }),
-          signal: controller.signal,
-        });
+        );
         if (response.ok) {
           let responseBody: unknown;
           try {
@@ -267,14 +302,13 @@ export class OpenCodeAdapter {
             throw error;
           }
           const payload = object(responseBody);
-          if (payload === null || !Array.isArray(payload.choices)) {
-            return { kind: "provider_error" };
-          }
-          const choice = object(payload.choices[0]);
-          const message = choice === null ? null : object(choice.message);
-          return message !== null && typeof message.content === "string"
-            ? { kind: "content", content: message.content }
-            : { kind: "provider_error" };
+          if (payload === null) return { kind: "provider_error" };
+          const content = responsesApi
+            ? responsesContent(payload)
+            : chatCompletionContent(payload);
+          return content === null
+            ? { kind: "provider_error" }
+            : { kind: "content", content };
         }
         console.warn({
           event: "opencode_chat_failure",

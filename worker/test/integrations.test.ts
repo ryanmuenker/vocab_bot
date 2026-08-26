@@ -79,6 +79,44 @@ describe("OpenCodeAdapter", () => {
     expect(body.messages[0]!.content).toContain("semantically distinct");
   });
 
+  it("uses the Responses API required by GPT 5.6 Luna", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({
+      output: [{
+        type: "message",
+        content: [{
+          type: "output_text",
+          text: JSON.stringify({ grade: "correct", feedback: "Accurate." }),
+        }],
+      }],
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const adapter = new OpenCodeAdapter({
+      apiKey: "key",
+      baseUrl: "https://example.test/v1",
+      model: "gpt-5.6-luna",
+    });
+
+    expect(await adapter.evaluateAnswer(
+      ENTRY,
+      "It means stubbornly refusing to change one's opinion.",
+    )).toEqual({
+      status: EvaluationStatus.VALID,
+      evaluation: { grade: EvaluationGrade.CORRECT, feedback: "Accurate." },
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0]![0]).toBe("https://example.test/v1/responses");
+    const request = fetchMock.mock.calls[0]![1] as RequestInit;
+    const body = JSON.parse(request.body as string) as Record<string, unknown>;
+    expect(body).toMatchObject({
+      model: "gpt-5.6-luna",
+      max_output_tokens: 4_000,
+    });
+    expect(body.instructions).toContain("semantic paraphrase");
+    expect(body.input).toContain("stubbornly refusing");
+    expect(body).not.toHaveProperty("messages");
+    expect(body).not.toHaveProperty("max_tokens");
+  });
+
   it("retries two transient definition failures before succeeding", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response({}, 500))
