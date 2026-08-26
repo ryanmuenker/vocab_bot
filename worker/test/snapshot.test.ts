@@ -442,9 +442,10 @@ describe("v5 schema", () => {
         )).map(({ name }) => name);
 
       expect(names("table")).toEqual(expect.arrayContaining([
-        "answer_drafts", "inbox_events", "prompt_delivery_attempts", "review_attempts",
-        "review_events", "study_prompts", "study_queue", "study_sessions", "test_questions",
-        "test_sessions", "vocabulary_cards", "vocabulary_entries", "vocabulary_senses",
+        "answer_drafts", "companion_state", "inbox_events", "prompt_delivery_attempts",
+        "review_attempts", "review_events", "study_prompts", "study_queue",
+        "study_sessions", "test_questions", "test_sessions", "vocabulary_cards",
+        "vocabulary_entries", "vocabulary_senses",
       ]));
       expect(names("trigger")).toEqual([
         "answer_drafts_immutable_delete",

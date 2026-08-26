@@ -295,6 +295,87 @@ describe("VocabularyCompanion capture", () => {
   });
 });
 
+describe("VocabularyCompanion automatic review pause", () => {
+  it("exits an active review, captures words while paused, and resumes explicitly", async () => {
+    const io = transport();
+    const stub = companion("pause-active-review");
+    await stub.importSnapshot(library(2));
+
+    await stub.enqueueTelegramUpdate(message(1, "/review", "2026-07-23T04:00:00Z"));
+    await drain(stub);
+    expect(io.sent[0]).toContain("What does 'word-1' mean?");
+
+    await stub.enqueueTelegramUpdate(message(2, "/pause", "2026-07-23T04:01:00Z"));
+    await drain(stub);
+    expect(io.sent[1]).toBe(
+      "Automatic reviews paused. The pause ends 10 minutes after your last vocabulary request. " +
+        "Use /unpause to resume sooner.",
+    );
+
+    await stub.enqueueTelegramUpdate(message(3, "obdurate", "2026-07-23T04:02:00Z"));
+    await drain(stub);
+    expect(io.modelCalls()).toBe(1);
+    expect(io.sent[2]).toContain("obdurate");
+    expect((await stub.summary()).entries).toBe(3);
+
+    await stub.enqueueTelegramUpdate(message(4, "/unpause", "2026-07-23T04:03:00Z"));
+    await drain(stub);
+    expect(io.sent[3]).toBe("Automatic reviews resumed.");
+
+    expect(await stub.enqueueDailyReview({
+      dedupeKey: "pause-manual-resume",
+      nowUtc: "2026-07-23T04:04:00Z",
+    })).toBe("enqueued");
+    await drain(stub);
+    expect(io.sent[4]).toContain("What does 'word-1' mean?");
+  });
+
+  it("persists across eviction, extends on vocabulary requests, and expires after inactivity", async () => {
+    const io = transport();
+    const stub = companion("pause-inactivity");
+    await stub.importSnapshot(library(1));
+
+    await stub.enqueueTelegramUpdate(message(1, "/pause", "2026-07-23T04:00:00Z"));
+    await drain(stub);
+    await evictDurableObject(stub);
+
+    expect(await stub.enqueueDailyReview({
+      dedupeKey: "pause-before-word",
+      nowUtc: "2026-07-23T04:09:00Z",
+    })).toBe("silent");
+    await stub.enqueueTelegramUpdate(message(2, "obdurate", "2026-07-23T04:09:00Z"));
+    await drain(stub);
+    await evictDurableObject(stub);
+
+    expect(await stub.enqueueDailyReview({
+      dedupeKey: "pause-after-word",
+      nowUtc: "2026-07-23T04:18:00Z",
+    })).toBe("silent");
+    expect(await stub.enqueueDailyReview({
+      dedupeKey: "pause-expired",
+      nowUtc: "2026-07-23T04:20:00Z",
+    })).toBe("enqueued");
+    await drain(stub);
+
+    expect(io.sent).toHaveLength(3);
+    expect(io.sent[1]).toContain("obdurate");
+    expect(io.sent[2]).toContain("What does 'word-1' mean?");
+  });
+
+  it("allows an explicit review while automatic prompts remain paused", async () => {
+    const io = transport();
+    const stub = companion("pause-manual-review");
+    await stub.importSnapshot(library(1));
+
+    await stub.enqueueTelegramUpdate(message(1, "/pause", "2026-07-23T04:00:00Z"));
+    await drain(stub);
+    await stub.enqueueTelegramUpdate(message(2, "/review", "2026-07-23T04:01:00Z"));
+    await drain(stub);
+
+    expect(io.sent[1]).toContain("What does 'word-1' mean?");
+  });
+});
+
 describe("VocabularyCompanion delivery gating", () => {
   it("never makes a prompt answerable when its send fails, and echoes the next message", async () => {
     const io = transport();

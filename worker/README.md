@@ -4,13 +4,13 @@ An event-driven deployment of the same vocabulary companion that runs under the
 Hermes gateway: a Telegram webhook, a `VocabularyCompanion` Durable Object
 holding the SQLite study state, and a cron alarm that acts as the review ticker.
 
-It implements the production **v5 model**: embedded FSRS-6
-scheduling, one forward and up to three diverse reverse cards per entry,
-`/review`'s 10-card per-local-day introduction quota with practiced-sense
-coverage first, unseen-only directional tests, sibling burial, test-only tail
-retries, and `/review`, `/test forward|reverse`, `/endstudy`. Every definition
-remains stored; startup and snapshot import remove only surplus reverse cards
-that have never been queued or reviewed.
+It implements the production **v5 model**: embedded FSRS-6 scheduling, one
+forward and up to three diverse reverse cards per entry, `/review`'s 10-card
+per-local-day introduction quota with practiced-sense coverage first,
+unseen-only directional tests, sibling burial, repeatable tail retries, and
+`/review`, `/test forward|reverse`, `/endstudy`, `/pause`, and `/unpause`.
+Every definition remains stored; startup and snapshot import remove only
+surplus reverse cards that have never been queued or reviewed.
 
 The Worker implementation under `worker/src/` is the production source of truth. User-visible fixes must land here first and be covered under `worker/test/`. Python is secondary migration/reference code; update it only when snapshot compatibility, offline tooling, or deliberately maintained parity requires it.
 
@@ -25,7 +25,17 @@ safety property is the same as the Hermes path:
 3. a failed send records a `failed` attempt and leaves the prompt `prepared`, so
    it stays retryable and can never consume the next message you type.
 
-## Commands
+## Telegram commands
+
+`/pause` suppresses automatic daily-review prompts and exits an active review
+without changing any card due time. An explicit `/review` still starts or
+resumes study. While paused, each valid vocabulary request moves the inactivity
+deadline ten minutes forward; after ten minutes without one, the pause expires
+and the next scheduled tick may prompt again. `/unpause` clears the deadline
+immediately. Directional tests remain explicit and are not stopped by pausing
+automatic reviews.
+
+## Development commands
 
 ```bash
 npm test           # vitest against workerd
@@ -97,6 +107,20 @@ curl -X POST https://<worker-host>/admin/fix-entry \
 The entry's display and normalized text are replaced with the canonical
 normalization of the corrected text; senses, cards, and audit history are
 untouched. Unknown ids answer `404`; a normalized-text collision answers `409`.
+
+To permanently remove one or more entries by exact normalized text:
+
+```bash
+curl -X POST https://<worker-host>/admin/delete-entries \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"displayTexts":["Eglatine","obsolete phrase"]}'
+```
+
+The deletion transaction removes the complete aggregate, including cards,
+prompts, attempts, and queued work, then advances any unaffected active
+session. The inspector exposes the same operation under the selected entry's
+**Maintenance** section with a permanent-action confirmation.
 
 ## Migrating an existing library
 

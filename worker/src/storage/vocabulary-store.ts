@@ -50,6 +50,7 @@ import {
 import type { CardSchedule, ScheduleTransition } from "../domain/scheduling";
 import { initializeSchema } from "./schema";
 
+const REVIEW_PAUSE_TIMEOUT_MS = 10 * 60 * 1_000;
 /** Unseen cards admitted per local day by daily review. */
 const DAILY_INTRODUCTION_LIMIT = 10;
 /** Preferred share of introductions reserved for genuinely untouched entries. */
@@ -1220,6 +1221,50 @@ export class VocabularyStore {
 
   awaitingRating(): StudyPromptSnapshot | null {
     return this.queryPrompt(StudyPromptStatus.ANSWERED);
+  }
+
+  /** Pause automatic review prompts until ten minutes after the latest vocabulary request. */
+  pauseReviews(now = new Date()): Date {
+    const expiresAt = new Date(now.getTime() + REVIEW_PAUSE_TIMEOUT_MS);
+    all(
+      this.sql.exec(
+        `INSERT INTO companion_state (id, review_pause_expires_at)
+         VALUES (1, ?)
+         ON CONFLICT(id) DO UPDATE SET review_pause_expires_at = excluded.review_pause_expires_at`,
+        isoTimestamp(expiresAt),
+      ),
+    );
+    return expiresAt;
+  }
+
+  /** Clear an active pause; expired pauses are already logically inactive. */
+  unpauseReviews(now = new Date()): boolean {
+    const wasPaused = this.reviewsPaused(now);
+    all(this.sql.exec("DELETE FROM companion_state WHERE id = 1"));
+    return wasPaused;
+  }
+
+  /** Read and lazily clear the persisted inactivity deadline. */
+  reviewsPaused(now = new Date()): boolean {
+    const state = oneOrNull(
+      this.sql.exec<{ review_pause_expires_at: string | null }>(
+        "SELECT review_pause_expires_at FROM companion_state WHERE id = 1",
+      ),
+    );
+    if (
+      state !== null &&
+      state.review_pause_expires_at !== null &&
+      Date.parse(state.review_pause_expires_at) > now.getTime()
+    ) {
+      return true;
+    }
+    if (state !== null) all(this.sql.exec("DELETE FROM companion_state WHERE id = 1"));
+    return false;
+  }
+
+  /** Extend only a pause that is still active at this request instant. */
+  extendReviewPause(now = new Date()): Date | null {
+    return this.reviewsPaused(now) ? this.pauseReviews(now) : null;
   }
 
   /** Work is due but no prompt is answerable, so ordinary text is not an answer. */

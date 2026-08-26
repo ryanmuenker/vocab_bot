@@ -48,8 +48,10 @@ describe("Worker HTTP and cron surface", () => {
     expect((await webhook(update({ text: "/test forward" }))).status).toBe(200);
     expect((await webhook({ ...update({ text: "/review" }), update_id: 2 })).status).toBe(200);
     expect((await webhook({ ...update({ text: "/endstudy" }), update_id: 3 })).status).toBe(200);
-    expect((await webhook({ ...update({ text: "/tmp/vocabulary" }), update_id: 4 })).status).toBe(200);
-    expect(await env.VOCABULARY.getByName("123456").summary()).toMatchObject({ pendingInbox: 4 });
+    expect((await webhook({ ...update({ text: "/pause" }), update_id: 4 })).status).toBe(200);
+    expect((await webhook({ ...update({ text: "/unpause" }), update_id: 5 })).status).toBe(200);
+    expect((await webhook({ ...update({ text: "/tmp/vocabulary" }), update_id: 6 })).status).toBe(200);
+    expect(await env.VOCABULARY.getByName("123456").summary()).toMatchObject({ pendingInbox: 6 });
     const blockedExport = await exports.default.fetch(new Request("https://example.test/admin/export", {
       headers: { Authorization: "Bearer test-admin-token" },
     }));

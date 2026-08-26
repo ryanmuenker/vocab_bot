@@ -36,7 +36,7 @@ import {
   parseRating,
   parseStudyCommand,
 } from "./domain/routing";
-import type { StudyCommand } from "./domain/routing";
+import type { StudyCommand, StudyCommandName } from "./domain/routing";
 import { parseSnapshot, readSnapshot, sha256Snapshot, summarizeSnapshot, writeSnapshot } from "./domain/snapshot";
 import type { SnapshotSummary, SnapshotV2 } from "./domain/snapshot";
 import {
@@ -71,10 +71,24 @@ const EVALUATION_RATE_LIMIT_REPLY =
   "Try again after the limit resets or usage is restored — the next message you send is graded as your answer.";
 const REVIEW_USAGE = "Usage: /review";
 const ENDSTUDY_USAGE = "Usage: /endstudy";
+const PAUSE_USAGE = "Usage: /pause";
+const UNPAUSE_USAGE = "Usage: /unpause";
 const TEST_USAGE =
   "Usage: /test forward|reverse\n" +
   "Forward: recall each saved meaning from its word.\n" +
   "Reverse: recall the saved word from one exact definition.";
+const COMMAND_USAGE: Readonly<Record<StudyCommandName, string>> = {
+  review: REVIEW_USAGE,
+  test: TEST_USAGE,
+  endstudy: ENDSTUDY_USAGE,
+  pause: PAUSE_USAGE,
+  unpause: UNPAUSE_USAGE,
+};
+const PAUSED_REPLY =
+  "Automatic reviews paused. The pause ends 10 minutes after your last vocabulary request. " +
+  "Use /unpause to resume sooner.";
+const UNPAUSED_REPLY = "Automatic reviews resumed.";
+const ALREADY_UNPAUSED_REPLY = "Automatic reviews were already active.";
 const SHOW_ANSWER = "show answer";
 const IDK_FEEDBACK = "You said you don't know the answer.";
 const REVERSE_CORRECT_FEEDBACK = "Exact match to the saved entry.";
@@ -220,6 +234,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
       return "duplicate";
     }
     const now = new Date(input.nowUtc);
+    if (this.store.reviewsPaused(now)) return "silent";
     const mode = this.store.activeMode();
     if (
       this.store.answerablePrompt() !== null ||
@@ -387,13 +402,33 @@ export class VocabularyCompanion extends DurableObject<Env> {
     now: Date,
   ): Routed {
     if (command.kind === "usage") {
-      const usage =
-        command.command === "review"
-          ? REVIEW_USAGE
-          : command.command === "endstudy"
-            ? ENDSTUDY_USAGE
-            : TEST_USAGE;
-      return this.insertReadyEvent(dedupeKey, "telegram", usage, createdAt, null);
+      return this.insertReadyEvent(
+        dedupeKey,
+        "telegram",
+        COMMAND_USAGE[command.command],
+        createdAt,
+        null,
+      );
+    }
+    if (command.kind === "pause") {
+      if (
+        this.store.activeMode() === StudyMode.REVIEW &&
+        this.store.exitStudy(now) !== StudyMutationStatus.COMPLETED
+      ) {
+        return this.insertReadyEvent(
+          dedupeKey,
+          "telegram",
+          "I couldn't pause automatic reviews. Please try again.",
+          createdAt,
+          null,
+        );
+      }
+      this.store.pauseReviews(now);
+      return this.insertReadyEvent(dedupeKey, "telegram", PAUSED_REPLY, createdAt, null);
+    }
+    if (command.kind === "unpause") {
+      const response = this.store.unpauseReviews(now) ? UNPAUSED_REPLY : ALREADY_UNPAUSED_REPLY;
+      return this.insertReadyEvent(dedupeKey, "telegram", response, createdAt, null);
     }
     if (command.kind === "endstudy") {
       const text =
@@ -548,8 +583,11 @@ export class VocabularyCompanion extends DurableObject<Env> {
       snapshot.mode === StudyMode.REVIEW &&
       snapshot.status === StudySessionStatus.ACTIVE;
     if (
-      rolloverGap ||
-      (snapshot === null && this.store.dueButNotAnswerable(now) && !this.store.studyWasExited())
+      !this.store.reviewsPaused(now) &&
+      (
+        rolloverGap ||
+        (snapshot === null && this.store.dueButNotAnswerable(now) && !this.store.studyWasExited())
+      )
     ) {
       // Due work exists but no prompt is outstanding (for example the machine
       // was off, or the day rolled over). Ordinary text must surface that work
@@ -599,6 +637,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
     if (normalized.status !== EntryTextStatus.VALID) {
       throw new Error("unreachable entry normalization status");
     }
+    this.store.extendReviewPause(new Date(input.receivedAt));
     const existing = this.store.getEntry(normalized.normalizedText);
     if (existing !== null) {
       return this.insertReadyEvent(

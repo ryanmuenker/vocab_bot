@@ -24,6 +24,11 @@ CREATE TABLE IF NOT EXISTS maintenance_migrations (
   applied_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS companion_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  review_pause_expires_at TEXT
+);
+
 -- review_events, test_sessions and test_questions are audit carriers for
 -- history imported from the pre-card era. Nothing schedules from them.
 CREATE TABLE IF NOT EXISTS review_events (

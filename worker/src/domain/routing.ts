@@ -26,18 +26,22 @@ export function slashCommandName(message: string): string | null {
   return token.length > 0 && !token.includes("/") ? token : null;
 }
 
-export type StudyCommandName = "review" | "test" | "endstudy";
+export type StudyCommandName = "review" | "test" | "endstudy" | "pause" | "unpause";
 
 export type StudyCommand =
   | { readonly kind: "review" }
   | { readonly kind: "test"; readonly direction: CardDirection }
   | { readonly kind: "endstudy" }
+  | { readonly kind: "pause" }
+  | { readonly kind: "unpause" }
   | { readonly kind: "usage"; readonly command: StudyCommandName };
 
 const STUDY_COMMANDS: Record<string, StudyCommandName> = {
   review: "review",
   test: "test",
   endstudy: "endstudy",
+  pause: "pause",
+  unpause: "unpause",
 };
 
 /** Null means the message is not a study command and stays capturable. */
