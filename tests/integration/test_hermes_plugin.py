@@ -1072,6 +1072,7 @@ def test_registered_test_cross_path_survives_restart_and_evaluator_failure(
         '{"grade":"partial","feedback":"Feedback 4."}',
         '{"grade":"incorrect","feedback":"Feedback 5."}',
         '{"grade":"incorrect","feedback":"Retry feedback."}',
+        '{"grade":"correct","feedback":"Final retry feedback."}',
     ]
     context, path = register_plugin(monkeypatch, tmp_path, chat_id=7747352551)
     for index in range(5):
@@ -1176,37 +1177,43 @@ def test_registered_test_cross_path_survives_restart_and_evaluator_failure(
         "Question 5 of 5 · retry\n"
     )
     deliver_current(6)
-    completed = continue_study(restarted, "retry answer")
+    repeated = continue_study(restarted, "retry answer")
 
-    assert completed["status"] == "finalized"
-    assert completed["allowed_ratings"] == []
-    assert completed["text"].startswith(
+    assert repeated["status"] == "finalized"
+    assert repeated["allowed_ratings"] == []
+    assert repeated["text"].startswith(
         "Grade: Incorrect\nFeedback: Retry feedback."
     )
+    assert repeated["text"].endswith(
+        "\n\nQuestion 5 of 5 · retry\nWhat does 'word-4' mean?"
+    )
+
+    deliver_current(7)
+    final_answer = continue_study(restarted, "final retry answer")
+    assert final_answer["status"] == "awaiting_rating"
+    completed = continue_study(restarted, "good")
+    assert completed["status"] == "finalized"
     assert completed["text"].endswith(
         "Forward test complete.\n"
         "Results: 2 correct, 2 partial, 1 incorrect."
     )
-    assert completed["text"].index("Grade: Incorrect") < completed["text"].index(
-        "Forward test complete."
-    )
-    duplicate = continue_study(restarted, "retry answer")
+    duplicate = continue_study(restarted, "final retry answer")
     assert duplicate["status"] == "no_active"
     assert "Grade:" not in duplicate["text"]
     assert "Feedback:" not in duplicate["text"]
     assert [call.kwargs["task"] for call in call_llm.await_args_list] == [
         "vocabulary_answer_evaluation"
-    ] * 7
+    ] * 8
     with database.connect() as connection:
         assert connection.execute(
             "SELECT status FROM study_sessions"
         ).fetchone()[0] == "completed"
         assert connection.execute(
             "SELECT COUNT(*) FROM answer_drafts"
-        ).fetchone()[0] == 6
+        ).fetchone()[0] == 7
         assert connection.execute(
             "SELECT COUNT(*) FROM review_attempts"
-        ).fetchone()[0] == 6
+        ).fetchone()[0] == 7
         assert connection.execute(
             """
             SELECT COUNT(*) FROM vocabulary_cards

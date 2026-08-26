@@ -614,7 +614,7 @@ def test_rollover_without_answerable_prompt_reorders_newly_due_before_unseen_cur
             ).fetchone()[0] == "cancelled"
 
 
-def test_retry_attempt_links_to_original_after_restart_and_concurrent_finalize(
+def test_retry_attempt_links_through_chain_after_restart_and_concurrent_finalize(
     tmp_path: Path,
 ) -> None:
     service, _, database = setup_service(tmp_path)
@@ -641,7 +641,7 @@ def test_retry_attempt_links_to_original_after_restart_and_concurrent_finalize(
     assert first.status is FinalizeStatus.COMPLETED
     assert first.transition is not None and first.transition.retry_same_session is True
     assert sorted(result.status.value for result in results) == ["completed", "stale"]
-    assert second.transition is not None and second.transition.retry_same_session is False
+    assert second.transition is not None and second.transition.retry_same_session is True
     assert second.transition.effective_due >= datetime(2026, 7, 21, 4, tzinfo=UTC)
     with database.connect() as connection:
         attempts = connection.execute(
@@ -653,7 +653,7 @@ def test_retry_attempt_links_to_original_after_restart_and_concurrent_finalize(
         ).fetchall()
         assert connection.execute(
             "SELECT COUNT(*) FROM study_queue WHERE retry_of_queue_item_id IS NOT NULL"
-        ).fetchone()[0] == 1
+        ).fetchone()[0] == 2
     assert len(attempts) == 2
     assert attempts[1]["after_raw_due_at"] == second.transition.raw_due.isoformat().replace(
         "+00:00", "Z"

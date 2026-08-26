@@ -105,8 +105,8 @@ def transition(
 ) -> ScheduleTransition:
     """Apply one rating without mutating the scalar schedule snapshot.
 
-    ``same_session_retry`` identifies the one retry produced by a preceding
-    Again. Its caller must provide the next configured local-day boundary as an
+    ``same_session_retry`` identifies an Again submitted for a retry occurrence.
+    Its caller must provide the next configured local-day boundary as an
     already-converted UTC ``due_floor_utc``; timezone policy stays outside FSRS.
     """
 
@@ -161,7 +161,7 @@ def transition(
         parameters_version=PARAMETERS_VERSION,
     )
 
-    retry_same_session = rating is ReviewRating.AGAIN and not same_session_retry
+    retry_same_session = rating is ReviewRating.AGAIN
     effective_due = raw_due
     if same_session_retry:
         assert due_floor_utc is not None

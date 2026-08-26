@@ -309,7 +309,7 @@ def test_schedule_is_immutable_and_metadata_survives_transition() -> None:
     assert result.after.desired_retention == DESIRED_RETENTION
 
 
-def test_first_again_marks_one_same_session_retry() -> None:
+def test_first_again_marks_same_session_retry() -> None:
     result = transition(new_card(), ReviewRating.AGAIN, NOW)
 
     assert result.retry_same_session is True
@@ -317,7 +317,7 @@ def test_first_again_marks_one_same_session_retry() -> None:
     assert result.after.state is CardScheduleState.RELEARNING
 
 
-def test_second_same_session_again_retains_raw_state_and_applies_due_floor() -> None:
+def test_repeated_same_session_again_queues_retry_and_applies_due_floor() -> None:
     first = transition(new_card(), ReviewRating.AGAIN, NOW)
     due_floor = NOW + timedelta(days=2)
 
@@ -329,7 +329,7 @@ def test_second_same_session_again_retains_raw_state_and_applies_due_floor() -> 
         due_floor_utc=due_floor,
     )
 
-    assert second.retry_same_session is False
+    assert second.retry_same_session is True
     assert second.after.state is CardScheduleState.RELEARNING
     assert second.after.due == second.raw_due
     assert second.raw_due < due_floor

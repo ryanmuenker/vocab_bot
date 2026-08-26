@@ -93,9 +93,9 @@ export interface ScheduleTransition {
 }
 
 export interface TransitionOptions {
-  /** Marks the single retry produced by a preceding Again in the same session. */
+  /** Marks an Again submitted for a retry occurrence in the current session. */
   readonly sameSessionRetry?: boolean;
-  /** Whether an Again may append one retry to the current session. */
+  /** Whether every Again may append a retry to the current session. */
   readonly allowSameSessionRetry?: boolean;
   /** Next configured local-day boundary, already converted to UTC by the caller. */
   readonly dueFloorUtc?: Date | null;
@@ -193,7 +193,7 @@ export function retrievability(schedule: CardSchedule, at: Date): number {
 /**
  * Apply one rating without mutating the scalar schedule snapshot.
  *
- * `sameSessionRetry` identifies the one retry produced by a preceding Again.
+ * `sameSessionRetry` identifies an Again submitted for a retry occurrence.
  * Its caller must provide the next configured local-day boundary as an
  * already-converted UTC `dueFloorUtc`; timezone policy stays outside FSRS.
  */
@@ -266,8 +266,7 @@ export function transition(
     retrievability: currentRetrievability,
     rawDue,
     effectiveDue,
-    retrySameSession:
-      allowSameSessionRetry && rating === ReviewRating.AGAIN && !sameSessionRetry,
+    retrySameSession: allowSameSessionRetry && rating === ReviewRating.AGAIN,
   });
 }
 

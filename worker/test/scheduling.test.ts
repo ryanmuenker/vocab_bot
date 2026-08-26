@@ -415,7 +415,7 @@ describe("immutability and scheduler metadata", () => {
 });
 
 describe("same-session Again retries", () => {
-  it("marks exactly one same-session retry on the first Again", () => {
+  it("marks a same-session retry on the first Again", () => {
     const result = transition(newCard(), ReviewRating.AGAIN, NOW);
 
     expect(result.retrySameSession).toBe(true);
@@ -423,7 +423,7 @@ describe("same-session Again retries", () => {
     expect(result.after.state).toBe(CardScheduleState.RELEARNING);
   });
 
-  it("keeps the raw transition and applies the due floor on the second Again", () => {
+  it("queues another retry while applying the due floor on a repeated Again", () => {
     const first = transition(newCard(), ReviewRating.AGAIN, NOW);
     const dueFloor = plusDays(NOW, 2);
 
@@ -432,7 +432,7 @@ describe("same-session Again retries", () => {
       dueFloorUtc: dueFloor,
     });
 
-    expect(second.retrySameSession).toBe(false);
+    expect(second.retrySameSession).toBe(true);
     expect(second.after.state).toBe(CardScheduleState.RELEARNING);
     expect(second.after.due).toEqual(second.rawDue);
     expect(second.rawDue.getTime()).toBeLessThan(dueFloor.getTime());
