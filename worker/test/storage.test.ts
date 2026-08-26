@@ -278,6 +278,62 @@ describe("VocabularyStore capture", () => {
   });
 });
 
+describe("VocabularyStore deletion", () => {
+  it("deletes complete aggregates while preserving and advancing unrelated session work", async () => {
+    await runInDurableObject(stub(), (_instance, state) => {
+      const store = new VocabularyStore(state.storage, "UTC");
+      seedEntries(store, 2);
+      const now = new Date("2026-07-20T10:00:00Z");
+      store.startReview(now);
+      answerCurrent(store, ReviewRating.GOOD, now);
+
+      expect(store.deleteEntries(["entry-1", "missing"], new Date("2026-07-20T10:05:00Z")))
+        .toEqual({
+          deleted: [{ id: 1, displayText: "entry-1", normalizedText: "entry-1" }],
+          notFound: ["missing"],
+        });
+      expect(rows<{ normalized_text: string }>(
+        state.storage,
+        "SELECT normalized_text FROM vocabulary_entries ORDER BY id",
+      )).toEqual([{ normalized_text: "entry-2" }]);
+      expect(rows<{ count: number }>(
+        state.storage,
+        "SELECT COUNT(*) AS count FROM review_attempts",
+      )[0]!.count).toBe(0);
+      expect(rows<{ count: number }>(
+        state.storage,
+        "SELECT COUNT(*) AS count FROM study_prompts",
+      )[0]!.count).toBe(0);
+      expect(rows<{ status: string; card_id: number }>(
+        state.storage,
+        "SELECT status, card_id FROM study_queue",
+      )).toEqual([{ status: "current", card_id: 3 }]);
+
+      expect(store.deleteEntries(["entry-2"], new Date("2026-07-20T10:10:00Z"))).toEqual({
+        deleted: [{ id: 2, displayText: "entry-2", normalizedText: "entry-2" }],
+        notFound: [],
+      });
+      expect(rows<{ status: string }>(
+        state.storage,
+        "SELECT status FROM study_sessions",
+      )).toEqual([{ status: "completed" }]);
+      expect(rows<{ name: string }>(
+        state.storage,
+        `SELECT name FROM sqlite_schema
+         WHERE type = 'trigger' AND name IN (
+           'prompt_delivery_attempts_immutable_delete',
+           'answer_drafts_immutable_delete',
+           'review_attempts_immutable_delete'
+         ) ORDER BY name`,
+      ).map(({ name }) => name)).toEqual([
+        "answer_drafts_immutable_delete",
+        "prompt_delivery_attempts_immutable_delete",
+        "review_attempts_immutable_delete",
+      ]);
+    });
+  });
+});
+
 describe("VocabularyStore selection", () => {
   it("orders due cards ahead of unseen ones and skips cards buried for the local day", async () => {
     await runInDurableObject(stub(), (_instance, state) => {
@@ -684,33 +740,60 @@ describe("VocabularyStore finalization", () => {
     });
   });
 
-  it("does not append a third queue item when the daily-review retry is Again", async () => {
+  it("appends another tail retry whenever a daily-review retry is Again", async () => {
     await runInDurableObject(stub(), (_instance, state) => {
       const store = new VocabularyStore(state.storage, "UTC");
       store.captureEntry("obdurate", [CARD], new Date("2026-06-01T00:00:00Z"));
       const now = new Date("2026-07-20T10:00:00Z");
       store.startReview(now);
-      answerCurrent(store, ReviewRating.AGAIN, now, {
+      const first = answerCurrent(store, ReviewRating.AGAIN, now, {
         grade: EvaluationGrade.INCORRECT,
         feedback: "Wrong.",
       });
 
       const retryAt = new Date("2026-07-20T10:05:00Z");
-      const retry = answerCurrent(store, ReviewRating.AGAIN, retryAt, {
+      const second = answerCurrent(store, ReviewRating.AGAIN, retryAt, {
         grade: EvaluationGrade.INCORRECT,
         feedback: "Still wrong.",
       });
-      expect(retry.result.transition!.retrySameSession).toBe(false);
-      expect(retry.result.transition!.effectiveDue.getTime())
-        .toBeGreaterThanOrEqual(Date.parse("2026-07-21T10:05:00Z"));
-      expect(retry.result.snapshot!.queue).toHaveLength(2);
-      expect(retry.result.snapshot!.status).toBe("completed");
+      expect(second.result.transition!.retrySameSession).toBe(true);
+      expect(second.result.snapshot!.status).toBe("active");
+      expect(second.result.snapshot!.queue.map((item) => [
+        item.status,
+        item.retryOfQueueItemId,
+      ])).toEqual([
+        [StudyQueueStatus.COMPLETED, null],
+        [StudyQueueStatus.COMPLETED, first.result.snapshot!.queue[0]!.id],
+        [StudyQueueStatus.CURRENT, second.result.snapshot!.queue[1]!.id],
+      ]);
+
+      const third = answerCurrent(store, ReviewRating.AGAIN, new Date("2026-07-20T10:10:00Z"), {
+        grade: EvaluationGrade.INCORRECT,
+        feedback: "Still wrong.",
+      });
+      expect(third.result.transition!.retrySameSession).toBe(true);
+      expect(third.result.snapshot!.status).toBe("active");
+      expect(third.result.snapshot!.queue.map((item) => item.retryOfQueueItemId)).toEqual([
+        null,
+        first.result.snapshot!.queue[0]!.id,
+        second.result.snapshot!.queue[1]!.id,
+        third.result.snapshot!.queue[2]!.id,
+      ]);
+
+      const completed = answerCurrent(store, ReviewRating.GOOD, new Date("2026-07-20T10:15:00Z"));
+      expect(completed.result.snapshot!.status).toBe("completed");
+      expect(completed.result.snapshot!.queue).toHaveLength(4);
       expect(
         rows<{ is_same_session_retry: number }>(
           state.storage,
           "SELECT is_same_session_retry FROM review_attempts ORDER BY id",
         ),
-      ).toEqual([{ is_same_session_retry: 0 }, { is_same_session_retry: 1 }]);
+      ).toEqual([
+        { is_same_session_retry: 0 },
+        { is_same_session_retry: 1 },
+        { is_same_session_retry: 1 },
+        { is_same_session_retry: 1 },
+      ]);
     });
   });
 });

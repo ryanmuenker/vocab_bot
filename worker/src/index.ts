@@ -190,6 +190,32 @@ async function admin(request: Request, env: AdminEnv, pathname: string): Promise
       }
       return json(result);
     }
+    if (request.method === "POST" && pathname === "/admin/delete-entries") {
+      const body = object(await readJson(request));
+      if (
+        body === null ||
+        !exactKeys(body, ["displayTexts"]) ||
+        !Array.isArray(body.displayTexts) ||
+        body.displayTexts.length < 1 ||
+        body.displayTexts.length > 100
+      ) {
+        return json({ error: "invalid request" }, 400);
+      }
+      const normalizedTexts: string[] = [];
+      const seen = new Set<string>();
+      for (const displayText of body.displayTexts) {
+        if (typeof displayText !== "string") return json({ error: "invalid request" }, 400);
+        const normalized = normalizeEntryText(displayText);
+        if (normalized.status !== EntryTextStatus.VALID) {
+          return json({ error: "invalid request" }, 400);
+        }
+        if (!seen.has(normalized.normalizedText)) {
+          seen.add(normalized.normalizedText);
+          normalizedTexts.push(normalized.normalizedText);
+        }
+      }
+      return json(await owner(env).deleteEntries({ normalizedTexts }));
+    }
     if (request.method === "POST" && pathname === "/admin/send-smoke") {
       const contentLength = request.headers.get("Content-Length");
       if (contentLength !== null && Number(contentLength) > 0) return json({ error: "invalid request" }, 400);

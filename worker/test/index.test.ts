@@ -146,6 +146,9 @@ describe("Worker HTTP and cron surface", () => {
     expect(html).toContain('id="token-form"');
     expect(html).toContain('id="atlas-view"');
     expect(html).toContain('id="table-view"');
+    expect(html).toContain("Delete entry");
+    expect(html).toContain("/admin/delete-entries");
+    expect(html).toContain("This cannot be undone.");
     expect(html).not.toMatch(/<script[^>]+src=/u);
     expect(html).not.toMatch(/<link[^>]+href=/u);
 

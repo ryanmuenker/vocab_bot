@@ -47,6 +47,17 @@ function fixEntry(body: unknown) {
   }));
 }
 
+function deleteEntries(body: unknown) {
+  return exports.default.fetch(new Request("https://example.test/admin/delete-entries", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer test-admin-token",
+    },
+    body: JSON.stringify(body),
+  }));
+}
+
 describe("admin fix-entry surface", () => {
   it("requires admin auth and rejects non-JSON bodies", async () => {
     expect(
@@ -102,6 +113,52 @@ describe("admin fix-entry surface", () => {
     const exported = (await stub.exportSnapshot())!;
     expect(exported.entries).toEqual([
       expect.objectContaining({ id: 45, displayText: "Abscond", normalizedText: "abscond" }),
+      expect.objectContaining({ id: 46, displayText: "Harbour", normalizedText: "harbour" }),
+    ]);
+  });
+});
+
+describe("admin delete-entries surface", () => {
+  it("requires admin auth and rejects invalid batches", async () => {
+    expect(
+      (await exports.default.fetch(new Request("https://example.test/admin/delete-entries", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ displayTexts: ["Abscond"] }),
+      }))).status,
+    ).toBe(401);
+
+    for (const body of [
+      {},
+      { displayTexts: [] },
+      { displayTexts: ["   "] },
+      { displayTexts: [45] },
+      { displayTexts: Array.from({ length: 101 }, () => "word") },
+      { displayTexts: ["Abscond"], extra: true },
+    ]) {
+      expect((await deleteEntries(body)).status).toBe(400);
+    }
+  });
+
+  it("deletes exact normalized entries and reports misses", async () => {
+    const stub = env.VOCABULARY.getByName("123456");
+    await deleteEntries({ displayTexts: ["Abscond", "Abscond\nAbscond", "Harbour"] });
+    await stub.importSnapshot(SNAPSHOT);
+
+    const response = await deleteEntries({
+      displayTexts: ["  ABSCOND\nABSCOND  ", "missing", "MISSING"],
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      deleted: [{
+        id: 45,
+        displayText: "Abscond\nAbscond",
+        normalizedText: "abscond abscond",
+      }],
+      notFound: ["missing"],
+    });
+    expect((await stub.exportSnapshot())!.entries).toEqual([
       expect.objectContaining({ id: 46, displayText: "Harbour", normalizedText: "harbour" }),
     ]);
   });

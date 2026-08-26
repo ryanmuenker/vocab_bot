@@ -345,6 +345,25 @@ export class VocabularyCompanion extends DurableObject<Env> {
     };
   }
 
+  /** Permanently remove complete vocabulary aggregates through the admin RPC. */
+  async deleteEntries(input: {
+    readonly normalizedTexts: readonly string[];
+  }) {
+    if (input.normalizedTexts.length < 1 || input.normalizedTexts.length > 100) {
+      throw new TypeError("invalid normalized texts");
+    }
+    for (const normalizedText of input.normalizedTexts) {
+      const normalized = normalizeEntryText(normalizedText);
+      if (
+        normalized.status !== EntryTextStatus.VALID ||
+        normalized.normalizedText !== normalizedText
+      ) {
+        throw new TypeError("invalid normalized text");
+      }
+    }
+    return this.store.deleteEntries(input.normalizedTexts);
+  }
+
   async alarm(): Promise<void> {
     const event = rows(
       this.ctx.storage.sql.exec<InboxRow>(

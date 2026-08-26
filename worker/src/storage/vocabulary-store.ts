@@ -48,6 +48,7 @@ import {
   transition,
 } from "../domain/scheduling";
 import type { CardSchedule, ScheduleTransition } from "../domain/scheduling";
+import { initializeSchema } from "./schema";
 
 /** Unseen cards admitted per local day by daily review. */
 const DAILY_INTRODUCTION_LIMIT = 10;
@@ -63,6 +64,23 @@ const MAX_REVERSE_CARDS_PER_ENTRY = 3;
 const SEMANTIC_TOKEN_PATTERN = /[\p{Letter}\p{Number}]+/gu;
 const NO_PROTECTED_REVERSE_SENSES: ReadonlySet<number> = new Set();
 const REVERSE_CARD_CAP_MIGRATION = "reverse-card-cap-v1";
+
+const IMMUTABLE_HISTORY_DELETE_TRIGGERS = [
+  "prompt_delivery_attempts_immutable_delete",
+  "answer_drafts_immutable_delete",
+  "review_attempts_immutable_delete",
+] as const;
+
+export interface DeletedEntry {
+  readonly id: number;
+  readonly displayText: string;
+  readonly normalizedText: string;
+}
+
+export interface DeleteEntriesResult {
+  readonly deleted: readonly DeletedEntry[];
+  readonly notFound: readonly string[];
+}
 
 const VALID_GRADES: Record<EvaluationGradeValue, true> = {
   [EvaluationGrade.CORRECT]: true,
@@ -516,6 +534,171 @@ export class VocabularyStore {
     } catch {
       return { status: CaptureStatus.STORAGE_ERROR, entry: null };
     }
+  }
+
+  /**
+   * Permanently delete complete entry aggregates by exact normalized text.
+   *
+   * Audit rows are normally immutable. This explicit admin operation removes
+   * their whole aggregate in one deferred-foreign-key transaction, restores the
+   * deletion guards before commit, and advances any affected open session.
+   */
+  deleteEntries(
+    normalizedTexts: readonly string[],
+    now = new Date(),
+  ): DeleteEntriesResult {
+    const requested = [...new Set(normalizedTexts)];
+    if (requested.length === 0) return { deleted: [], notFound: [] };
+    const placeholders = requested.map(() => "?").join(", ");
+    return this.storage.transactionSync(() => {
+      const deleted = all(
+        this.sql.exec<{
+          id: number;
+          display_text: string;
+          normalized_text: string;
+        }>(
+          `SELECT id, display_text, normalized_text
+           FROM vocabulary_entries
+           WHERE normalized_text IN (${placeholders})
+           ORDER BY id`,
+          ...requested,
+        ),
+      ).map((entry) => ({
+        id: entry.id,
+        displayText: entry.display_text,
+        normalizedText: entry.normalized_text,
+      }));
+      const found = new Set(deleted.map(({ normalizedText }) => normalizedText));
+      const notFound = requested.filter((normalizedText) => !found.has(normalizedText));
+      if (deleted.length === 0) return { deleted, notFound };
+
+      const entryIds = deleted.map(({ id }) => id);
+      const entryPlaceholders = entryIds.map(() => "?").join(", ");
+      const affectedSessions = all(
+        this.sql.exec<{ session_id: number }>(
+          `SELECT DISTINCT queue.session_id
+           FROM study_queue queue
+           JOIN vocabulary_cards card ON card.id = queue.card_id
+           WHERE card.entry_id IN (${entryPlaceholders})`,
+          ...entryIds,
+        ),
+      ).map(({ session_id: sessionId }) => sessionId);
+
+      all(this.sql.exec("PRAGMA defer_foreign_keys = ON"));
+      for (const trigger of IMMUTABLE_HISTORY_DELETE_TRIGGERS) {
+        all(this.sql.exec(`DROP TRIGGER ${trigger}`));
+      }
+      all(
+        this.sql.exec(
+          `UPDATE inbox_events
+           SET status = 'completed', payload = NULL, prepared_target_id = NULL,
+               normalized_key = NULL, coalesced_to_event_id = NULL,
+               response_text = NULL, next_chunk_index = 0, updated_at = ?,
+               last_error = 'entry_deleted'
+           WHERE prepared_target_id IN (
+             SELECT prompt.id
+             FROM study_prompts prompt
+             JOIN study_queue queue ON queue.id = prompt.queue_item_id
+             JOIN vocabulary_cards card ON card.id = queue.card_id
+             WHERE card.entry_id IN (${entryPlaceholders})
+           )`,
+          isoTimestamp(now),
+          ...entryIds,
+        ),
+      );
+      for (const table of ["prompt_delivery_attempts", "answer_drafts"] as const) {
+        all(
+          this.sql.exec(
+            `DELETE FROM ${table}
+             WHERE prompt_id IN (
+               SELECT prompt.id
+               FROM study_prompts prompt
+               JOIN study_queue queue ON queue.id = prompt.queue_item_id
+               JOIN vocabulary_cards card ON card.id = queue.card_id
+               WHERE card.entry_id IN (${entryPlaceholders})
+             )`,
+            ...entryIds,
+          ),
+        );
+      }
+      all(
+        this.sql.exec(
+          `DELETE FROM review_attempts
+           WHERE card_id IN (
+             SELECT id FROM vocabulary_cards
+             WHERE entry_id IN (${entryPlaceholders})
+           )`,
+          ...entryIds,
+        ),
+      );
+      all(
+        this.sql.exec(
+          `DELETE FROM study_prompts
+           WHERE queue_item_id IN (
+             SELECT queue.id
+             FROM study_queue queue
+             JOIN vocabulary_cards card ON card.id = queue.card_id
+             WHERE card.entry_id IN (${entryPlaceholders})
+           )`,
+          ...entryIds,
+        ),
+      );
+      all(
+        this.sql.exec(
+          `DELETE FROM study_queue
+           WHERE card_id IN (
+             SELECT id FROM vocabulary_cards
+             WHERE entry_id IN (${entryPlaceholders})
+           )`,
+          ...entryIds,
+        ),
+      );
+      for (const [table, column] of [
+        ["review_events", "entry_id"],
+        ["test_questions", "entry_id"],
+        ["vocabulary_entries", "id"],
+      ] as const) {
+        all(
+          this.sql.exec(
+            `DELETE FROM ${table} WHERE ${column} IN (${entryPlaceholders})`,
+            ...entryIds,
+          ),
+        );
+      }
+
+      initializeSchema(this.sql);
+      for (const sessionId of affectedSessions) {
+        const session = oneOrNull(
+          this.sql.exec<{ status: StudySessionStatus }>(
+            "SELECT status FROM study_sessions WHERE id = ?",
+            sessionId,
+          ),
+        );
+        if (
+          session === null ||
+          (session.status !== StudySessionStatus.ACTIVE &&
+            session.status !== StudySessionStatus.INTERRUPTED)
+        ) continue;
+        const current = oneOrNull(
+          this.sql.exec<{ id: number }>(
+            "SELECT id FROM study_queue WHERE session_id = ? AND status = 'current'",
+            sessionId,
+          ),
+        );
+        if (current === null && this.promoteFirstQueued(sessionId) === null) {
+          all(
+            this.sql.exec(
+              `UPDATE study_sessions
+               SET status = 'completed', completed_at = ?
+               WHERE id = ? AND status IN ('active', 'interrupted')`,
+              isoTimestamp(now),
+              sessionId,
+            ),
+          );
+        }
+      }
+      return { deleted, notFound };
+    });
   }
 
   /** Project the missing forward card and at most three diverse reverse cards. */
