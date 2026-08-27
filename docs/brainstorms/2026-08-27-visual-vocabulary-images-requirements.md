@@ -52,7 +52,7 @@ Automatic image search can also teach the wrong association. Abstract words, amb
 - R1. Automatic images apply only when a vocabulary entry is newly saved; an already-saved response does not trigger another image lookup.
 - R2. An entry is eligible only when it has a clear visual referent, including concrete objects, plants, animals, places, materials, architectural forms, and visually distinctive descriptors.
 - R3. The bot must omit the image when the entry has several unrelated visual senses and no single sense is clearly dominant.
-- R4. The bot must omit graphic medical depictions, gore, sexually explicit content, and terms likely to retrieve those depictions. Non-graphic educational anatomy may remain eligible.
+- R4. The bot must reject medical/anatomy, sexual, gore, injury, and procedure topics before image lookup and must screen Wikimedia text metadata for the same classes. Pixel moderation is not part of this version; rare mislabeled or vandalized-file risk is accepted.
 - R5. Image selection must be grounded in the relevant stored sense, not merely the raw spelling of the requested word.
 - R6. Low confidence results in no image; coverage must not be increased by accepting a weak or misleading match.
 
@@ -81,7 +81,7 @@ Automatic image search can also teach the wrong association. Abstract words, amb
 ## Success Criteria
 
 - Concrete and visually distinctive new vocabulary receives a useful image often enough to strengthen recall without becoming expected for every word.
-- Misleading, ambiguous, graphic, or explicit images are not delivered in the defined acceptance cases.
+- Known abstract, ambiguous, medical/anatomy, sexual, gory, injury, and procedure cases remain text-only; metadata screening is conservative but does not claim pixel-perfect moderation.
 - Definition capture remains successful and unchanged whenever image enrichment is skipped or fails.
 - Every delivered image is traceable to its Wikimedia source and license.
 - Planning can implement the feature without inventing eligibility, delivery order, failure behavior, repeat-request behavior, or safety policy.
@@ -96,6 +96,7 @@ Automatic image search can also teach the wrong association. Abstract words, amb
 - No automatic image for ambiguous words merely because one sense is depictable.
 - No broad web image search, generated images, Pexels, or Unsplash in this version.
 - No image-specific warning when optional enrichment is unavailable.
+- No image-content moderation service or guarantee against a mislabeled/vandalized Commons file.
 
 ---
 
@@ -105,7 +106,7 @@ Automatic image search can also teach the wrong association. Abstract words, amb
 - Eligibility is conservative: a missing image is preferable to a wrong association.
 - Text precedes media: the existing vocabulary response remains the authoritative product behavior.
 - Images are first-capture enrichment: repeated requests remain lightweight and deterministic.
-- Sensitive filtering is narrow but explicit: ordinary educational imagery is allowed, while graphic medical, gory, and sexually explicit depictions are excluded.
+- Sensitive filtering is conservative and metadata-based: medical/anatomy, sexual, gore, injury, and procedure topics are excluded before lookup; rare Commons pixel/metadata mismatch risk is accepted.
 
 ---
 
@@ -114,6 +115,7 @@ Automatic image search can also teach the wrong association. Abstract words, amb
 - Wikimedia Commons remains reachable from the production Worker and exposes a candidate image, source page, and licensing metadata suitable for Telegram delivery.
 - The definition result contains enough semantic context to distinguish a dominant visual sense from ambiguity or abstraction.
 - Telegram accepts the selected Wikimedia image format or a suitable derivative URL.
+- Wikimedia Commons has no SafeSearch; this version intentionally relies on topic and metadata rejection rather than a second image-moderation provider.
 
 ---
 
