@@ -166,6 +166,10 @@ function containsMarker(text: string, markers: readonly string[]): boolean {
   return markers.some((marker) => padded.includes(` ${marker} `));
 }
 
+export function isSensitiveVisualText(value: string): boolean {
+  return CONTROL_CHARACTERS.test(value) || containsMarker(value, BLOCKED_MARKERS);
+}
+
 function categoriesIn(text: string): ReadonlySet<VisualCategory> {
   const padded = ` ${searchableText(text)} `;
   const categories = new Set<VisualCategory>();
@@ -218,8 +222,7 @@ export function validateVisualIntent(
     description,
   ];
   if (policyTexts.some((text) =>
-    CONTROL_CHARACTERS.test(text) ||
-    containsMarker(text, BLOCKED_MARKERS) ||
+    isSensitiveVisualText(text) ||
     containsMarker(text, AMBIGUITY_MARKERS)
   )) {
     return null;

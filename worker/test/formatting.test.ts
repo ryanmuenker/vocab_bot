@@ -23,6 +23,7 @@ import {
   formatDirectionalTotals,
   formatEntry,
   formatHint,
+  formatWikimediaCaption,
   formatStudyEvaluation,
   formatStudyEvaluationResult,
   formatStudyPrompt,
@@ -507,5 +508,70 @@ describe("directional totals formatting", () => {
         incorrect: 1,
       }),
     ).toBe("Reverse test complete.\nResults: 4 correct, 0 partial, 1 incorrect.");
+  });
+});
+
+describe("Wikimedia caption formatting", () => {
+  const ATTRIBUTION = {
+    entryName: "Doric",
+    senseDescription: "Relating to the Greek architectural order with plain column capitals.",
+    imageDescription: "Plain columns of the Doric architectural order.",
+    creator: "Jane Smith",
+    credit: "Own work",
+    licenseName: "CC BY-SA 4.0",
+    licenseUrl: "https://creativecommons.org/licenses/by-sa/4.0/",
+    sourceUrl: "https://commons.wikimedia.org/wiki/File:Doric_columns.jpg",
+  } as const;
+
+  it("names the entry and sense before complete plain-text attribution", () => {
+    expect(formatWikimediaCaption(ATTRIBUTION)).toBe(
+      "Doric — Relating to the Greek architectural order with plain column capitals.\n\n" +
+        "Plain columns of the Doric architectural order.\n\n" +
+        "Creator: Jane Smith\n" +
+        "Credit: Own work\n" +
+        "License: CC BY-SA 4.0 — https://creativecommons.org/licenses/by-sa/4.0/\n" +
+        "Source: Wikimedia Commons — https://commons.wikimedia.org/wiki/File:Doric_columns.jpg",
+    );
+  });
+
+  it("supports recognized public-domain attribution without inventing a license link", () => {
+    expect(formatWikimediaCaption({
+      ...ATTRIBUTION,
+      creator: null,
+      credit: null,
+      licenseName: "Public domain",
+      licenseUrl: null,
+    })).toContain(
+      "License: Public domain\n" +
+        "Source: Wikimedia Commons — https://commons.wikimedia.org/wiki/File:Doric_columns.jpg",
+    );
+  });
+
+  it("truncates only optional prose and preserves every mandatory boundary", () => {
+    const caption = formatWikimediaCaption({
+      ...ATTRIBUTION,
+      imageDescription: "decorative column ".repeat(200),
+    });
+
+    expect(caption).not.toBeNull();
+    expect(Array.from(caption!).length).toBeLessThanOrEqual(1024);
+    expect(caption).toContain("\n\nCreator: Jane Smith\n");
+    expect(caption).toContain("Credit: Own work\n");
+    expect(caption).toContain(
+      "License: CC BY-SA 4.0 — https://creativecommons.org/licenses/by-sa/4.0/\n",
+    );
+    expect(caption!.endsWith(
+      "Source: Wikimedia Commons — https://commons.wikimedia.org/wiki/File:Doric_columns.jpg",
+    )).toBe(true);
+    expect(caption).toContain("decorative column decorative column");
+    expect(caption).toContain("…\n\nCreator:");
+  });
+
+  it("rejects attribution whose mandatory content cannot fit the Telegram caption", () => {
+    expect(formatWikimediaCaption({
+      ...ATTRIBUTION,
+      creator: "C".repeat(900),
+      imageDescription: "",
+    })).toBeNull();
   });
 });

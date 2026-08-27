@@ -248,3 +248,69 @@ export function formatDirectionalTotals(
     `${totals.incorrect} incorrect.`
   );
 }
+
+export const TELEGRAM_PHOTO_CAPTION_LIMIT = 1024;
+
+export interface WikimediaCaptionInput {
+  readonly entryName: string;
+  readonly senseDescription: string;
+  readonly imageDescription: string;
+  readonly creator: string | null;
+  readonly credit: string | null;
+  readonly licenseName: string;
+  readonly licenseUrl: string | null;
+  readonly sourceUrl: string;
+}
+
+function codePointLength(value: string): number {
+  return Array.from(value).length;
+}
+
+
+/**
+ * Builds a Telegram photo caption without truncating association or attribution.
+ * Only the optional image prose may be shortened to fit Telegram's hard limit.
+ */
+export function formatWikimediaCaption(input: WikimediaCaptionInput): string | null {
+  if (
+    input.entryName.length === 0 ||
+    input.senseDescription.length === 0 ||
+    input.licenseName.length === 0 ||
+    input.sourceUrl.length === 0 ||
+    (input.licenseUrl !== null && input.licenseUrl.length === 0)
+  ) {
+    return null;
+  }
+
+  const heading = `${input.entryName} — ${input.senseDescription}`;
+  const attribution: string[] = [];
+  if (input.creator !== null && input.creator.length > 0) {
+    attribution.push(`Creator: ${input.creator}`);
+  }
+  if (input.credit !== null && input.credit.length > 0) {
+    attribution.push(`Credit: ${input.credit}`);
+  }
+  attribution.push(
+    input.licenseUrl === null
+      ? `License: ${input.licenseName}`
+      : `License: ${input.licenseName} — ${input.licenseUrl}`,
+    `Source: Wikimedia Commons — ${input.sourceUrl}`,
+  );
+
+  const mandatory = `${heading}\n\n${attribution.join("\n")}`;
+  const mandatoryLength = codePointLength(mandatory);
+  if (mandatoryLength > TELEGRAM_PHOTO_CAPTION_LIMIT) return null;
+  if (input.imageDescription.length === 0) return mandatory;
+
+  const availableDescription =
+    TELEGRAM_PHOTO_CAPTION_LIMIT - mandatoryLength - codePointLength("\n\n");
+  if (availableDescription <= 0) return mandatory;
+  if (codePointLength(input.imageDescription) <= availableDescription) {
+    return `${heading}\n\n${input.imageDescription}\n\n${attribution.join("\n")}`;
+  }
+  if (availableDescription === 1) return mandatory;
+
+  const description =
+    `${Array.from(input.imageDescription).slice(0, availableDescription - 1).join("")}…`;
+  return `${heading}\n\n${description}\n\n${attribution.join("\n")}`;
+}
