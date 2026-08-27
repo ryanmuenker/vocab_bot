@@ -43,17 +43,161 @@ afterEach(() => {
 });
 
 describe("OpenCodeAdapter", () => {
-  it("strictly parses definitions after validating every sense and deduplicates in order", () => {
+  it("preserves old found and not-found contracts while deduplicating senses in order", () => {
     const result = parseDefinitionResponse(JSON.stringify({ senses: [
       { part_of_speech: " noun ", definition: " first ", example_sentence: " one " },
       { part_of_speech: "NOUN", definition: "FIRST", example_sentence: "duplicate" },
-    ] }));
+    ] }), "word");
     expect(result).toEqual({
       status: DefinitionStatus.FOUND,
       cards: [{ partOfSpeech: "noun", definition: "first", exampleSentence: "one" }],
+      visualIntent: null,
     });
-    expect(parseDefinitionResponse('{"status":"not_found"}').status).toBe(DefinitionStatus.NOT_FOUND);
-    expect(parseDefinitionResponse('{"senses":[],"extra":1}').status).toBe(DefinitionStatus.INVALID_RESPONSE);
+    expect(parseDefinitionResponse('{"status":"not_found"}', "word")).toEqual({
+      status: DefinitionStatus.NOT_FOUND,
+      cards: [],
+      visualIntent: null,
+    });
+  });
+
+  it("parses one sense-grounded Doric visual intent and keeps aster eligible", () => {
+    const doric = parseDefinitionResponse(JSON.stringify({
+      senses: [{
+        part_of_speech: "adjective",
+        definition: "Relating to the Greek architectural order with plain column capitals.",
+        example_sentence: "The temple has a Doric colonnade.",
+      }],
+      visual: {
+        sense_index: 0,
+        category: "architecture",
+        query: "Doric order columns",
+        description: "Plain columns of the Doric architectural order.",
+      },
+    }), "Doric");
+    expect(doric).toMatchObject({
+      status: DefinitionStatus.FOUND,
+      visualIntent: {
+        senseIndex: 0,
+        category: "architecture",
+        query: "Doric order columns",
+      },
+    });
+
+    const aster = parseDefinitionResponse(JSON.stringify({
+      senses: [{
+        part_of_speech: "noun",
+        definition: "A flowering plant with daisy-like blossoms.",
+        example_sentence: "The asters bloomed in autumn.",
+      }],
+      visual: {
+        sense_index: 0,
+        category: "plant",
+        query: "aster flowering plant",
+        description: "Purple flowers on an aster plant.",
+      },
+    }), "aster");
+    expect(aster.visualIntent).not.toBeNull();
+  });
+
+  it("isolates malformed optional visual metadata from valid ordered senses", () => {
+    const senses = [{
+      part_of_speech: "noun",
+      definition: "A flowering plant with daisy-like blossoms.",
+      example_sentence: "The asters bloomed in autumn.",
+    }];
+    const cards = [{
+      partOfSpeech: "noun",
+      definition: "A flowering plant with daisy-like blossoms.",
+      exampleSentence: "The asters bloomed in autumn.",
+    }];
+    const malformed = [
+      { category: "plant", query: "aster plant", description: "An aster flower." },
+      { sense_index: 4, category: "plant", query: "aster plant", description: "An aster flower." },
+      { sense_index: [0, 1], category: "plant", query: "aster plant", description: "An aster flower." },
+      { sense_index: 0, category: "abstract", query: "aster plant", description: "An aster flower." },
+      { sense_index: 0, category: "plant", query: "incategory:Plants", description: "An aster flower." },
+      { sense_index: 0, category: "plant", query: "aster plant", description: 7 },
+      { sense_index: 0, category: "plant", query: "aster plant", description: "An aster flower.", extra: true },
+    ];
+    for (const visual of malformed) {
+      expect(parseDefinitionResponse(JSON.stringify({ senses, visual }), "aster")).toEqual({
+        status: DefinitionStatus.FOUND,
+        cards,
+        visualIntent: null,
+      });
+    }
+  });
+
+  it("keeps malformed senses invalid even when optional visual metadata is valid", () => {
+    expect(parseDefinitionResponse(JSON.stringify({
+      senses: [{
+        part_of_speech: "noun",
+        definition: "",
+        example_sentence: "The asters bloomed in autumn.",
+      }],
+      visual: {
+        sense_index: 0,
+        category: "plant",
+        query: "aster flowering plant",
+        description: "Purple flowers on an aster plant.",
+      },
+    }), "aster")).toEqual({
+      status: DefinitionStatus.INVALID_RESPONSE,
+      cards: [],
+      visualIntent: null,
+    });
+  });
+
+  it("keeps ambiguous, abstract, and sensitive definitions text-only", () => {
+    const candidate = {
+      sense_index: 0,
+      category: "animal",
+      query: "crane bird",
+      description: "A tall crane bird in water.",
+    };
+    const crane = parseDefinitionResponse(JSON.stringify({
+      senses: [
+        {
+          part_of_speech: "noun",
+          definition: "A tall wading bird with a long neck.",
+          example_sentence: "A crane stood in the marsh.",
+        },
+        {
+          part_of_speech: "noun",
+          definition: "A large machine used for lifting heavy objects.",
+          example_sentence: "The crane lifted the beam.",
+        },
+      ],
+      visual: candidate,
+    }), "crane");
+    expect(crane).toMatchObject({ status: DefinitionStatus.FOUND, visualIntent: null });
+
+    for (const [entry, definition] of [
+      ["duplicity", "Deceitful conduct or double-dealing."],
+      ["paraphimosis", "A medical condition involving the foreskin."],
+    ] as const) {
+      const result = parseDefinitionResponse(JSON.stringify({
+        senses: [{
+          part_of_speech: "noun",
+          definition,
+          example_sentence: `The term was ${entry}.`,
+        }],
+        visual: {
+          sense_index: 0,
+          category: "visual style",
+          query: `${entry} visual style`,
+          description: `A visual representation of ${entry}.`,
+        },
+      }), entry);
+      expect(result).toMatchObject({ status: DefinitionStatus.FOUND, visualIntent: null });
+    }
+  });
+
+  it("retains strict top-level and core-field validation", () => {
+    expect(parseDefinitionResponse('{"senses":[],"extra":1}', "word").status)
+      .toBe(DefinitionStatus.INVALID_RESPONSE);
+    expect(parseDefinitionResponse('{"status":"not_found","visual":null}', "word").status)
+      .toBe(DefinitionStatus.INVALID_RESPONSE);
   });
 
   it("makes one bounded tool-free request and accepts only choices message content", async () => {
@@ -77,6 +221,9 @@ describe("OpenCodeAdapter", () => {
     expect(body.messages[0]!.content).toContain("most common");
     expect(body.messages[0]!.content).toContain("first three");
     expect(body.messages[0]!.content).toContain("semantically distinct");
+    expect(body.messages[0]!.content).toContain("sense_index");
+    expect(body.messages[0]!.content).toContain("medical/anatomy");
+    expect(body.messages[0]!.content).toContain("Omit visual");
   });
 
   it("uses the Responses API required by GPT 5.6 Luna", async () => {
@@ -162,6 +309,7 @@ describe("OpenCodeAdapter", () => {
     expect(definition).toEqual({
       status: DefinitionStatus.PROVIDER_ERROR,
       cards: [],
+      visualIntent: null,
     });
     expect(warn).toHaveBeenCalledTimes(3);
     expect(warn).toHaveBeenLastCalledWith({
@@ -275,6 +423,7 @@ describe("OpenCodeAdapter", () => {
     expect(await adapter.defineEntry("Prostration")).toEqual({
       status: DefinitionStatus.INVALID_RESPONSE,
       cards: [],
+      visualIntent: null,
     });
     expect(warn).toHaveBeenCalledOnce();
     expect(warn).toHaveBeenCalledWith({

@@ -54,6 +54,29 @@ export interface SenseCard {
   readonly exampleSentence: string;
 }
 
+export const VisualCategory = {
+  PLANT: "plant",
+  ANIMAL: "animal",
+  ARCHITECTURE: "architecture",
+  OBJECT: "object",
+  MATERIAL: "material",
+  PLACE: "place",
+  GARMENT: "garment",
+  FOOD: "food",
+  VEHICLE: "vehicle",
+  INSTRUMENT: "instrument",
+  LANDFORM: "landform",
+  VISUAL_STYLE: "visual style",
+} as const;
+export type VisualCategory = (typeof VisualCategory)[keyof typeof VisualCategory];
+
+export interface VisualIntent {
+  readonly senseIndex: number;
+  readonly category: VisualCategory;
+  readonly query: string;
+  readonly description: string;
+}
+
 export interface CaptureCommand {
   readonly displayText: string;
   readonly operation: CaptureOperation;

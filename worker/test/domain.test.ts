@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { CaptureOperation, EntryTextStatus } from "../src/domain/models";
-import type { CaptureCommand } from "../src/domain/models";
+import { CaptureOperation, EntryTextStatus, VisualCategory } from "../src/domain/models";
+import type { CaptureCommand, SenseCard } from "../src/domain/models";
 import {
   MAX_ENTRY_TEXT_LENGTH,
   MAX_PART_OF_SPEECH_LENGTH,
@@ -15,6 +15,201 @@ import {
   prepareCaptureCommand,
   validateSenseCards,
 } from "../src/domain/normalization";
+import {
+  MAX_VISUAL_DESCRIPTION_LENGTH,
+  MAX_VISUAL_QUERY_LENGTH,
+  validateVisualIntent,
+} from "../src/domain/visual-enrichment";
+
+const DORIC_SENSES: readonly SenseCard[] = [{
+  partOfSpeech: "adjective",
+  definition: "Relating to the ancient Greek architectural order with plain column capitals.",
+  exampleSentence: "The temple has a Doric colonnade.",
+}];
+
+const ASTER_SENSES: readonly SenseCard[] = [{
+  partOfSpeech: "noun",
+  definition: "A flowering plant with daisy-like blossoms.",
+  exampleSentence: "Purple asters flowered beside the path.",
+}];
+
+const OBJECT_SENSES: readonly SenseCard[] = [{
+  partOfSpeech: "noun",
+  definition: "A small carved object.",
+  exampleSentence: "The object was displayed.",
+}];
+
+describe("visual enrichment policy", () => {
+  it("fixes the initial eligible category boundary", () => {
+    expect(Object.values(VisualCategory)).toEqual([
+      "plant",
+      "animal",
+      "architecture",
+      "object",
+      "material",
+      "place",
+      "garment",
+      "food",
+      "vehicle",
+      "instrument",
+      "landform",
+      "visual style",
+    ]);
+  });
+
+  it("accepts a bounded Doric architectural intent grounded in one sense", () => {
+    expect(validateVisualIntent("Doric", DORIC_SENSES, {
+      sense_index: 0,
+      category: "architecture",
+      query: "Doric order columns",
+      description: "Plain capitals and fluted columns of the Doric architectural order.",
+    })).toEqual({
+      senseIndex: 0,
+      category: VisualCategory.ARCHITECTURE,
+      query: "Doric order columns",
+      description: "Plain capitals and fluted columns of the Doric architectural order.",
+    });
+  });
+
+  it("accepts the dominant plant sense of aster", () => {
+    expect(validateVisualIntent("aster", ASTER_SENSES, {
+      sense_index: 0,
+      category: "plant",
+      query: "aster flowering plant",
+      description: "Purple flowers on an aster plant.",
+    })).toMatchObject({
+      senseIndex: 0,
+      category: VisualCategory.PLANT,
+    });
+  });
+
+  it("rejects competing unrelated visual senses and ambiguity claims", () => {
+    const craneSenses: readonly SenseCard[] = [
+      {
+        partOfSpeech: "noun",
+        definition: "A tall wading bird with a long neck.",
+        exampleSentence: "A crane stood in the marsh.",
+      },
+      {
+        partOfSpeech: "noun",
+        definition: "A large machine used for lifting heavy objects.",
+        exampleSentence: "The crane lifted the beam.",
+      },
+    ];
+    const candidate = {
+      sense_index: 0,
+      category: "animal",
+      query: "crane bird",
+      description: "A tall crane bird standing in water.",
+    };
+    expect(validateVisualIntent("crane", craneSenses, candidate)).toBeNull();
+    expect(validateVisualIntent("aster", ASTER_SENSES, {
+      ...candidate,
+      query: "ambiguous aster image",
+      description: "No dominant visual referent.",
+    })).toBeNull();
+  });
+
+  it("keeps duplicity and every sensitive paraphimosis surface text-only", () => {
+    expect(validateVisualIntent("duplicity", [{
+      partOfSpeech: "noun",
+      definition: "Deceitful conduct or double-dealing.",
+      exampleSentence: "The scheme depended on duplicity.",
+    }], {
+      sense_index: 0,
+      category: "visual style",
+      query: "duplicity visual pattern",
+      description: "A visual pattern representing duplicity.",
+    })).toBeNull();
+
+    const neutralObjectSense = OBJECT_SENSES;
+    expect(validateVisualIntent("paraphimosis", neutralObjectSense, {
+      sense_index: 0,
+      category: "object",
+      query: "carved object",
+      description: "A small carved object.",
+    })).toBeNull();
+    expect(validateVisualIntent("token", [{
+      ...neutralObjectSense[0]!,
+      definition: "An object used during a surgical procedure.",
+    }], {
+      sense_index: 0,
+      category: "object",
+      query: "carved object",
+      description: "A small carved object.",
+    })).toBeNull();
+    expect(validateVisualIntent("token", neutralObjectSense, {
+      sense_index: 0,
+      category: "object",
+      query: "medical object",
+      description: "A small carved object.",
+    })).toBeNull();
+    expect(validateVisualIntent("token", neutralObjectSense, {
+      sense_index: 0,
+      category: "object",
+      query: "carved object",
+      description: "An object beside an injured body.",
+    })).toBeNull();
+  });
+
+  it("rejects every fixed text-only topic class", () => {
+    const visual = {
+      sense_index: 0,
+      category: "object",
+      query: "carved object",
+      description: "A small carved object.",
+    };
+    for (const topic of [
+      "anatomy",
+      "sexual",
+      "gore",
+      "injury",
+      "procedure",
+      "person",
+      "action",
+      "event",
+      "emotion",
+      "abstract",
+    ]) {
+      expect(validateVisualIntent(topic, OBJECT_SENSES, visual)).toBeNull();
+    }
+  });
+
+  it("rejects malformed, unbounded, and search-operator metadata", () => {
+    const valid = {
+      sense_index: 0,
+      category: "architecture",
+      query: "Doric order columns",
+      description: "Doric architectural columns.",
+    };
+    expect(validateVisualIntent("Doric", DORIC_SENSES, { ...valid, extra: true })).toBeNull();
+    expect(validateVisualIntent("Doric", DORIC_SENSES, { ...valid, sense_index: [0, 1] })).toBeNull();
+    expect(validateVisualIntent("Doric", DORIC_SENSES, {
+      ...valid,
+      query: "incategory:Architecture Doric",
+    })).toBeNull();
+    expect(validateVisualIntent("Doric", DORIC_SENSES, {
+      ...valid,
+      query: "Doric OR Ionic",
+    })).toBeNull();
+    expect(validateVisualIntent("Doric", DORIC_SENSES, {
+      ...valid,
+      query: "Doric\ncolumns",
+    })).toBeNull();
+    expect(validateVisualIntent("Doric", [{
+      ...DORIC_SENSES[0]!,
+      definition: "Doric\u0000 architectural columns.",
+    }], valid)).toBeNull();
+    expect(validateVisualIntent("Doric", DORIC_SENSES, {
+      ...valid,
+      query: "D".repeat(MAX_VISUAL_QUERY_LENGTH + 1),
+    })).toBeNull();
+    expect(validateVisualIntent("Doric", DORIC_SENSES, {
+      ...valid,
+      description: "D".repeat(MAX_VISUAL_DESCRIPTION_LENGTH + 1),
+    })).toBeNull();
+  });
+});
 
 describe("Python-compatible vocabulary identity", () => {
   it("performs full Unicode case folding", () => {

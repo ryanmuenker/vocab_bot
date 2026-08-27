@@ -1,11 +1,12 @@
 import { EvaluationGrade } from "../domain/models";
-import type { Evaluation, SenseCard, VocabularyEntry } from "../domain/models";
+import type { Evaluation, SenseCard, VisualIntent, VocabularyEntry } from "../domain/models";
 import {
   MAX_PART_OF_SPEECH_LENGTH,
   MAX_SENSE_TEXT_LENGTH,
   normalizeSenseIdentity,
   trimPythonWhitespace,
 } from "../domain/normalization";
+import { validateVisualIntent } from "../domain/visual-enrichment";
 
 export const DefinitionStatus = {
   FOUND: "found",
@@ -17,6 +18,7 @@ export type DefinitionStatus = (typeof DefinitionStatus)[keyof typeof Definition
 export interface DefinitionResult {
   readonly status: DefinitionStatus;
   readonly cards: readonly SenseCard[];
+  readonly visualIntent: VisualIntent | null;
 }
 
 export const EvaluationStatus = {
@@ -44,19 +46,22 @@ const VALID_GRADE: Record<string, EvaluationGrade> = {
 
 const DEFINITION_SYSTEM_PROMPT =
   "You are a focused English dictionary enrichment service. " +
-  "Return JSON only. For a defined entry, return exactly one " +
-  "top-level key, senses, containing 1 to 20 senses. " +
-  "List every credible distinct English sense for the supplied " +
-  "entry, including common, literary, archaic, regional, and " +
-  "major technical senses. Order senses with the most common " +
-  "meaning first. When there are more than three senses, make the " +
-  "first three semantically distinct from one another while still " +
-  "prioritizing common meanings. Exclude hyper-specialized jargon and " +
-  "do not split mere wording variants into separate senses. " +
-  "Each sense must contain exactly part_of_speech, definition, " +
-  "and example_sentence. Definitions must be concise and examples " +
-  "must demonstrate that sense. If the entry is not an English " +
-  "term or expression, return exactly {\"status\":\"not_found\"}.";
+  "Return JSON only. For a defined entry, return senses containing 1 to 20 senses. " +
+  "List every credible distinct English sense for the supplied entry, including common, " +
+  "literary, archaic, regional, and major technical senses. Order senses with the most " +
+  "common meaning first. When there are more than three senses, make the first three " +
+  "semantically distinct from one another while still prioritizing common meanings. " +
+  "Exclude hyper-specialized jargon and do not split mere wording variants into separate " +
+  "senses. Each sense must contain exactly part_of_speech, definition, and example_sentence. " +
+  "Definitions must be concise and examples must demonstrate that sense. " +
+  "Optionally include visual with exactly sense_index, category, query, and description " +
+  "only when one zero-based sense_index is the clear dominant visual referent. Category " +
+  "must be exactly plant, animal, architecture, object, material, place, garment, food, " +
+  "vehicle, instrument, landform, or visual style. Query must be a short literal Commons " +
+  "search phrase grounded in that sense, and description must concisely describe the image. " +
+  "Omit visual for competing unrelated senses, low confidence, or medical/anatomy, sexual, " +
+  "gore, injury, procedure, person/social-role, action, event, emotion, or abstract topics. " +
+  "If the entry is not an English term or expression, return exactly {\"status\":\"not_found\"}.";
 
 const EVALUATION_SYSTEM_PROMPT =
   "You evaluate an English vocabulary learner's answer against stored senses. " +
@@ -105,22 +110,27 @@ function responsesContent(payload: Record<string, unknown>): string | null {
   return null;
 }
 
-export function parseDefinitionResponse(text: unknown): DefinitionResult {
-  if (typeof text !== "string") return { status: DefinitionStatus.INVALID_RESPONSE, cards: [] };
+export function parseDefinitionResponse(text: unknown, displayText: string): DefinitionResult {
+  if (typeof text !== "string") {
+    return { status: DefinitionStatus.INVALID_RESPONSE, cards: [], visualIntent: null };
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    return { status: DefinitionStatus.INVALID_RESPONSE, cards: [] };
+    return { status: DefinitionStatus.INVALID_RESPONSE, cards: [], visualIntent: null };
   }
   const payload = object(parsed);
-  if (payload === null) return { status: DefinitionStatus.INVALID_RESPONSE, cards: [] };
-  if (exactKeys(payload, ["status"]) && payload.status === "not_found") {
-    return { status: DefinitionStatus.NOT_FOUND, cards: [] };
+  if (payload === null) {
+    return { status: DefinitionStatus.INVALID_RESPONSE, cards: [], visualIntent: null };
   }
-  if (!exactKeys(payload, ["senses"]) || !Array.isArray(payload.senses) ||
+  if (exactKeys(payload, ["status"]) && payload.status === "not_found") {
+    return { status: DefinitionStatus.NOT_FOUND, cards: [], visualIntent: null };
+  }
+  const validTopLevel = exactKeys(payload, ["senses"]) || exactKeys(payload, ["senses", "visual"]);
+  if (!validTopLevel || !Array.isArray(payload.senses) ||
       payload.senses.length < 1 || payload.senses.length > MAX_SENSES) {
-    return { status: DefinitionStatus.INVALID_RESPONSE, cards: [] };
+    return { status: DefinitionStatus.INVALID_RESPONSE, cards: [], visualIntent: null };
   }
   const validated: SenseCard[] = [];
   for (const candidate of payload.senses) {
@@ -128,7 +138,7 @@ export function parseDefinitionResponse(text: unknown): DefinitionResult {
     if (sense === null || !exactKeys(sense, ["part_of_speech", "definition", "example_sentence"]) ||
         typeof sense.part_of_speech !== "string" || typeof sense.definition !== "string" ||
         typeof sense.example_sentence !== "string") {
-      return { status: DefinitionStatus.INVALID_RESPONSE, cards: [] };
+      return { status: DefinitionStatus.INVALID_RESPONSE, cards: [], visualIntent: null };
     }
     const card = {
       partOfSpeech: trimPythonWhitespace(sense.part_of_speech),
@@ -142,7 +152,9 @@ export function parseDefinitionResponse(text: unknown): DefinitionResult {
       Array.from(card.definition).length > MAX_SENSE_TEXT_LENGTH ||
       Array.from(card.exampleSentence).length < 1 ||
       Array.from(card.exampleSentence).length > MAX_SENSE_TEXT_LENGTH
-    ) return { status: DefinitionStatus.INVALID_RESPONSE, cards: [] };
+    ) {
+      return { status: DefinitionStatus.INVALID_RESPONSE, cards: [], visualIntent: null };
+    }
     validated.push(card);
   }
   const cards: SenseCard[] = [];
@@ -155,7 +167,13 @@ export function parseDefinitionResponse(text: unknown): DefinitionResult {
       cards.push(card);
     }
   }
-  return { status: DefinitionStatus.FOUND, cards };
+  return {
+    status: DefinitionStatus.FOUND,
+    cards,
+    visualIntent: Object.hasOwn(payload, "visual")
+      ? validateVisualIntent(displayText, cards, payload.visual)
+      : null,
+  };
 }
 
 export function parseEvaluationResponse(text: unknown): EvaluationResult {
@@ -205,9 +223,9 @@ export class OpenCodeAdapter {
       4_000,
     );
     if (content.kind !== "content") {
-      return { status: DefinitionStatus.PROVIDER_ERROR, cards: [] };
+      return { status: DefinitionStatus.PROVIDER_ERROR, cards: [], visualIntent: null };
     }
-    const result = parseDefinitionResponse(content.content);
+    const result = parseDefinitionResponse(content.content, displayText);
     if (result.status === DefinitionStatus.INVALID_RESPONSE) {
       console.warn({
         event: "opencode_definition_failure",
