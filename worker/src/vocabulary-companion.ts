@@ -29,6 +29,7 @@ import type {
   StudyPromptSnapshot,
   VisualIntent,
 } from "./domain/models";
+import { validateVisualIntent } from "./domain/visual-enrichment";
 import { caseFold, normalizeEntryText, trimPythonWhitespace } from "./domain/normalization";
 import {
   allowedRatings,
@@ -47,6 +48,11 @@ import {
 } from "./integrations/opencode";
 import type { EvaluationResult } from "./integrations/opencode";
 import { splitTelegramMessage, TelegramAdapter } from "./integrations/telegram";
+import { WikimediaAdapter } from "./integrations/wikimedia";
+import type {
+  WikimediaLookupRequest,
+  WikimediaPhotoCandidate,
+} from "./integrations/wikimedia";
 import { initializeSchema, migrateInboxVisualIntent } from "./storage/schema";
 import { TEST_REQUIRED_CARDS, VocabularyStore } from "./storage/vocabulary-store";
 
@@ -145,6 +151,11 @@ export interface AdmittedTelegramMessage {
   readonly receivedAt: string;
 }
 
+interface PhotoDeliveryRequest {
+  readonly eventId: number;
+  readonly lookup: WikimediaLookupRequest;
+}
+
 function timestamp(now = new Date()): string {
   return now.toISOString().replace(/\.000Z$/u, "Z");
 }
@@ -177,6 +188,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
   private readonly store: VocabularyStore;
   private readonly provider: OpenCodeAdapter;
   private readonly telegram: TelegramAdapter;
+  private readonly wikimedia: WikimediaAdapter;
   private readonly reviewHour: number;
   private readonly timeZone: string;
 
@@ -195,6 +207,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
       botToken: env.TELEGRAM_BOT_TOKEN,
       chatId: env.TELEGRAM_ALLOWED_CHAT_ID,
     });
+    this.wikimedia = new WikimediaAdapter();
     const hour = Number(env.HERMES_REVIEW_HOUR);
     this.reviewHour =
       Number.isSafeInteger(hour) && hour >= 0 && hour <= 23 ? hour : DEFAULT_REVIEW_HOUR;
@@ -925,26 +938,27 @@ export class VocabularyCompanion extends DurableObject<Env> {
       this.completeDelivery(event.id);
       return false;
     }
+    let finalTextDelivered = false;
     try {
       const sent = await this.telegram.sendText(chunks[event.next_chunk_index]!);
       const messageIds = [...this.deliveredMessageIds(event), ...sent];
       const next = event.next_chunk_index + 1;
       if (next >= chunks.length) {
         await this.confirmDelivery(event, messageIds);
-        this.completeDelivery(event.id);
+        finalTextDelivered = true;
+      } else {
+        rows(this.ctx.storage.sql.exec(
+          `UPDATE inbox_events
+           SET next_chunk_index = ?, attempt_count = 0, payload = ?, updated_at = ?, last_error = NULL
+           WHERE id = ? AND status = 'ready'`,
+          next,
+          JSON.stringify(messageIds),
+          timestamp(),
+          event.id,
+        ));
+        await this.rescheduleIfActionable();
         return false;
       }
-      rows(this.ctx.storage.sql.exec(
-        `UPDATE inbox_events
-         SET next_chunk_index = ?, attempt_count = 0, payload = ?, updated_at = ?, last_error = NULL
-         WHERE id = ? AND status = 'ready'`,
-        next,
-        JSON.stringify(messageIds),
-        timestamp(),
-        event.id,
-      ));
-      await this.rescheduleIfActionable();
-      return false;
     } catch {
       const attempts = event.attempt_count + 1;
       if (attempts < SEND_RETRY_DELAYS_SECONDS.length) {
@@ -984,6 +998,114 @@ export class VocabularyCompanion extends DurableObject<Env> {
       }));
       return false;
     }
+
+    if (!finalTextDelivered) return false;
+    let photoRequest: PhotoDeliveryRequest | null = null;
+    try {
+      photoRequest = this.photoDeliveryRequest(event);
+    } catch {
+      this.logOptionalPhotoFailure(event.id, "intent", "invalid");
+    }
+    this.completeDelivery(event.id);
+    if (photoRequest !== null) {
+      try {
+        this.ctx.waitUntil(this.deliverOptionalPhoto(photoRequest));
+      } catch {
+        this.logOptionalPhotoFailure(event.id, "lifecycle", "rejected");
+      }
+    }
+    return false;
+  }
+
+  private photoDeliveryRequest(event: InboxRow): PhotoDeliveryRequest | null {
+    if (event.visual_intent === null) return null;
+    if (event.normalized_key === null) {
+      this.logOptionalPhotoFailure(event.id, "intent", "invalid");
+      return null;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(event.visual_intent);
+    } catch {
+      this.logOptionalPhotoFailure(event.id, "intent", "invalid");
+      return null;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      this.logOptionalPhotoFailure(event.id, "intent", "invalid");
+      return null;
+    }
+    const value = parsed as Record<string, unknown>;
+    const keys = Object.keys(value);
+    if (
+      keys.length !== 4 ||
+      !Object.hasOwn(value, "senseIndex") ||
+      !Object.hasOwn(value, "category") ||
+      !Object.hasOwn(value, "query") ||
+      !Object.hasOwn(value, "description")
+    ) {
+      this.logOptionalPhotoFailure(event.id, "intent", "invalid");
+      return null;
+    }
+    const entry = this.store.getEntry(event.normalized_key);
+    if (entry === null) {
+      this.logOptionalPhotoFailure(event.id, "intent", "invalid");
+      return null;
+    }
+    const intent = validateVisualIntent(entry.displayText, entry.senses, {
+      sense_index: value.senseIndex,
+      category: value.category,
+      query: value.query,
+      description: value.description,
+    });
+    if (intent === null) {
+      this.logOptionalPhotoFailure(event.id, "intent", "invalid");
+      return null;
+    }
+    const sense = entry.senses[intent.senseIndex];
+    if (sense === undefined) {
+      this.logOptionalPhotoFailure(event.id, "intent", "invalid");
+      return null;
+    }
+    return {
+      eventId: event.id,
+      lookup: {
+        displayText: entry.displayText,
+        sense,
+        intent,
+      },
+    };
+  }
+
+  private async deliverOptionalPhoto(request: PhotoDeliveryRequest): Promise<void> {
+    let candidate: WikimediaPhotoCandidate | null;
+    try {
+      candidate = await this.wikimedia.findPhoto(request.lookup);
+    } catch {
+      this.logOptionalPhotoFailure(request.eventId, "wikimedia", "unavailable");
+      return;
+    }
+    if (candidate === null) {
+      this.logOptionalPhotoFailure(request.eventId, "wikimedia", "unavailable");
+      return;
+    }
+    try {
+      await this.telegram.sendPhoto(candidate.photoUrl, candidate.caption);
+    } catch {
+      this.logOptionalPhotoFailure(request.eventId, "telegram", "rejected");
+    }
+  }
+
+  private logOptionalPhotoFailure(
+    eventId: number,
+    stage: "intent" | "lifecycle" | "wikimedia" | "telegram",
+    kind: "invalid" | "rejected" | "unavailable",
+  ): void {
+    console.error(JSON.stringify({
+      event: "optional_photo_failed",
+      eventId,
+      stage,
+      kind,
+    }));
   }
 
   private deliveredMessageIds(event: InboxRow): number[] {

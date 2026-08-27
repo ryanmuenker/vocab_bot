@@ -12,6 +12,7 @@ import {
 import { encodeReal } from "../src/domain/snapshot";
 import { normalizeReverseAnswer } from "../src/domain/routing";
 import type { SnapshotCard, SnapshotV2 } from "../src/domain/snapshot";
+import { TELEGRAM_PHOTO_TIMEOUT_MS } from "../src/integrations/telegram";
 
 const VISUAL_INTENT = {
   senseIndex: 0,
@@ -26,6 +27,12 @@ const PROVIDER_VISUAL = {
   query: "street object",
   description: "An object beside a paved street.",
 } as const;
+
+const LONG_VISUAL_SENSES = Array.from({ length: 6 }, (_value, index) => ({
+  part_of_speech: "noun",
+  definition: `an object beside a street in sense ${index}. ${"Solid ".repeat(70)}`.trim(),
+  example_sentence: `The object remained beside the street. ${"Nearby ".repeat(60)}`.trim(),
+}));
 
 function message(updateId: number, text: string, receivedAt = "2026-07-23T04:00:00Z") {
   return {
@@ -122,25 +129,83 @@ function library(count: number): SnapshotV2 {
 
 interface Transport {
   readonly sent: string[];
+  readonly textAttempts: string[];
+  readonly photos: { readonly photo: string; readonly caption: string }[];
+  readonly sequence: string[];
   readonly modelCalls: () => number;
+  readonly wikimediaCalls: () => number;
+  readonly photoCalls: () => number;
+  readonly holdWikimedia: () => void;
+  readonly waitForWikimedia: () => Promise<void>;
+  readonly waitForPhoto: () => Promise<void>;
+  readonly releaseWikimedia: () => void;
+  readonly textFailureCalls: Set<number>;
+  telegramFailAfterCall: number | null;
   telegramFails: boolean;
   modelStatus: number;
   evaluation: { grade: string; feedback: string };
   definitionVisual: unknown;
+  definitionSenses: readonly {
+    readonly part_of_speech: string;
+    readonly definition: string;
+    readonly example_sentence: string;
+  }[] | null;
+  wikimediaMode: "empty" | "success" | "malformed" | "reject";
+  telegramPhotoMode:
+    | "success"
+    | "api-reject"
+    | "malformed"
+    | "missing-photo"
+    | "fetch-reject"
+    | "timeout";
 }
 
-/** Stub the model and Telegram endpoints, recording what each one saw. */
+/** Stub model, Commons, and Telegram endpoints while recording delivery order. */
 function transport(): Transport {
   const sent: string[] = [];
+  const textAttempts: string[] = [];
+  const photos: { photo: string; caption: string }[] = [];
+  const sequence: string[] = [];
   let modelCalls = 0;
+  let wikimediaCalls = 0;
+  let photoCalls = 0;
   let messageId = 1_000;
+  let textCall = 0;
+  let wikimediaGate: Promise<void> | null = null;
+  let releaseWikimedia = (): void => {};
+  let resolveWikimediaStarted = (): void => {};
+  const wikimediaStarted = new Promise<void>((resolve) => {
+    resolveWikimediaStarted = resolve;
+  });
+  let resolvePhotoStarted = (): void => {};
+  const photoStarted = new Promise<void>((resolve) => {
+    resolvePhotoStarted = resolve;
+  });
   const state: Transport = {
     sent,
+    textAttempts,
+    photos,
+    sequence,
     modelCalls: () => modelCalls,
+    wikimediaCalls: () => wikimediaCalls,
+    photoCalls: () => photoCalls,
+    holdWikimedia: () => {
+      wikimediaGate = new Promise<void>((resolve) => {
+        releaseWikimedia = resolve;
+      });
+    },
+    releaseWikimedia: () => releaseWikimedia(),
+    waitForWikimedia: () => wikimediaStarted,
+    waitForPhoto: () => photoStarted,
+    textFailureCalls: new Set<number>(),
     telegramFails: false,
+    telegramFailAfterCall: null,
     modelStatus: 200,
     evaluation: { grade: "correct", feedback: "Accurate." },
     definitionVisual: undefined,
+    definitionSenses: null,
+    wikimediaMode: "empty",
+    telegramPhotoMode: "success",
   };
   vi.stubGlobal(
     "fetch",
@@ -154,19 +219,18 @@ function transport(): Transport {
           messages?: { content: string }[];
         };
         const systemPrompt = body.instructions ?? body.messages?.[0]?.content ?? "";
+        const senses = state.definitionSenses ?? [{
+          part_of_speech: "noun",
+          definition: state.definitionVisual === undefined
+            ? "a street"
+            : "an object beside a street",
+          example_sentence: state.definitionVisual === undefined
+            ? "The street was quiet."
+            : "The object stood beside the street.",
+        }];
         const content = systemPrompt.includes("dictionary")
           ? JSON.stringify({
-              senses: [
-                {
-                  part_of_speech: "noun",
-                  definition: state.definitionVisual === undefined
-                    ? "a street"
-                    : "an object beside a street",
-                  example_sentence: state.definitionVisual === undefined
-                    ? "The street was quiet."
-                    : "The object stood beside the street.",
-                },
-              ],
+              senses,
               ...(state.definitionVisual === undefined
                 ? {}
                 : { visual: state.definitionVisual }),
@@ -181,8 +245,100 @@ function transport(): Transport {
             })
           : jsonResponse({ choices: [{ message: { content } }] });
       }
-      if (state.telegramFails) return jsonResponse({ ok: false });
-      sent.push(JSON.parse(init!.body as string).text as string);
+      if (url.startsWith("https://commons.wikimedia.org/")) {
+        resolveWikimediaStarted();
+        wikimediaCalls += 1;
+        sequence.push("wikimedia");
+        if (state.wikimediaMode === "reject") throw new TypeError("Commons unavailable");
+        if (wikimediaGate !== null) await wikimediaGate;
+        if (state.wikimediaMode === "malformed") return new Response("{", { status: 200 });
+        if (state.wikimediaMode !== "success") {
+          return jsonResponse({ batchcomplete: true, query: { pages: [] } });
+        }
+        return jsonResponse({
+          batchcomplete: true,
+          query: {
+            pages: [{
+              pageid: 1,
+              ns: 6,
+              index: 1,
+              title: "File:Street object.jpg",
+              imageinfo: [{
+                thumburl:
+                  "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a2/Street_object.jpg/1280px-Street_object.jpg",
+                thumbwidth: 1_280,
+                thumbheight: 853,
+                mime: "image/jpeg",
+                descriptionurl:
+                  "https://commons.wikimedia.org/wiki/File:Street_object.jpg",
+                extmetadata: {
+                  Artist: { value: "Jane Smith" },
+                  Credit: { value: "Own work" },
+                  ImageDescription: { value: "An object beside a paved street." },
+                  LicenseShortName: { value: "CC BY-SA 4.0" },
+                  LicenseUrl: {
+                    value: "https://creativecommons.org/licenses/by-sa/4.0/",
+                  },
+                  UsageTerms: {
+                    value: "Creative Commons Attribution-Share Alike 4.0",
+                  },
+                  Copyrighted: { value: "True" },
+                  Restrictions: { value: "" },
+                },
+              }],
+            }],
+          },
+        });
+      }
+      const body = JSON.parse(init!.body as string) as {
+        text?: string;
+        photo?: string;
+        caption?: string;
+      };
+      if (url.endsWith("/sendPhoto")) {
+        photoCalls += 1;
+        sequence.push("photo");
+        resolvePhotoStarted();
+        if (state.telegramPhotoMode === "fetch-reject") {
+          throw new TypeError("Telegram unavailable");
+        }
+        if (state.telegramPhotoMode === "timeout") {
+          return new Promise<Response>((_resolve, reject) => {
+            const signal = init?.signal;
+            if (signal?.aborted === true) reject(signal.reason);
+            else signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+          });
+        }
+        if (state.telegramPhotoMode === "malformed") return new Response("{", { status: 200 });
+        if (state.telegramPhotoMode === "api-reject") return jsonResponse({ ok: false });
+        if (state.telegramPhotoMode === "missing-photo") {
+          return jsonResponse({ ok: true, result: { message_id: ++messageId } });
+        }
+        photos.push({ photo: body.photo!, caption: body.caption! });
+        return jsonResponse({
+          ok: true,
+          result: {
+            message_id: ++messageId,
+            photo: [{
+              file_id: "photo-file",
+              file_unique_id: "unique-photo",
+              width: 1_280,
+              height: 853,
+            }],
+          },
+        });
+      }
+      textCall += 1;
+      textAttempts.push(body.text!);
+      sequence.push("text");
+      if (
+        state.telegramFails ||
+        (state.telegramFailAfterCall !== null && textCall >= state.telegramFailAfterCall) ||
+        state.textFailureCalls.has(textCall)
+      ) {
+        return jsonResponse({ ok: false });
+      }
+      sent.push(body.text!);
       messageId += 1;
       return jsonResponse({ ok: true, result: { message_id: messageId } });
     }),
@@ -200,7 +356,11 @@ function companion(name: string) {
   return env.VOCABULARY.getByName(`${name}-${crypto.randomUUID()}`);
 }
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
 
 describe("VocabularyCompanion capture", () => {
   it("deduplicates updates, coalesces equivalent captures, and projects both card directions", async () => {
@@ -490,6 +650,204 @@ describe("VocabularyCompanion capture", () => {
 
     expect(exported.senses).toHaveLength(5);
     expect(exported.cards.filter((card) => card.direction === "reverse")).toHaveLength(3);
+  });
+});
+
+describe("VocabularyCompanion optional photo delivery", () => {
+  it("delivers complete text before one attributed photo for only the coalesced leader", async () => {
+    const io = transport();
+    io.definitionVisual = PROVIDER_VISUAL;
+    io.wikimediaMode = "success";
+    const stub = companion("photo-happy-path");
+
+    await stub.enqueueTelegramUpdate(message(1, "Street"));
+    await stub.enqueueTelegramUpdate(message(2, " street "));
+    await drain(stub);
+    await io.waitForPhoto();
+    await vi.waitFor(() => expect(io.photos).toHaveLength(1));
+
+    expect(io.sent).toHaveLength(2);
+    expect(io.sequence.indexOf("text")).toBeLessThan(io.sequence.indexOf("photo"));
+    expect(io.wikimediaCalls()).toBe(1);
+    expect(io.photoCalls()).toBe(1);
+    expect(io.photos[0]).toEqual({
+      photo:
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a2/Street_object.jpg/1280px-Street_object.jpg",
+      caption: expect.stringMatching(
+        /^Street — an object beside a street\n\n[\s\S]*License: CC BY-SA 4\.0[\s\S]*Source: Wikimedia Commons/u,
+      ),
+    });
+
+    await stub.enqueueTelegramUpdate(message(3, "STREET"));
+    await drain(stub);
+    expect(io.sent).toHaveLength(3);
+    expect(io.wikimediaCalls()).toBe(1);
+    expect(io.photoCalls()).toBe(1);
+  });
+
+  it.each([
+    ["terminal first-chunk failure", false],
+    ["terminal partial-send failure", true],
+  ])("does not look up an image after %s", async (_label, partial) => {
+    const io = transport();
+    io.definitionVisual = PROVIDER_VISUAL;
+    io.wikimediaMode = "success";
+    if (partial) {
+      io.definitionSenses = LONG_VISUAL_SENSES;
+      io.telegramFailAfterCall = 2;
+    } else {
+      io.telegramFails = true;
+    }
+    const stub = companion(`photo-text-failure-${String(partial)}`);
+
+    await stub.enqueueTelegramUpdate(message(1, "Street"));
+    await drain(stub, 12);
+
+    expect(io.wikimediaCalls()).toBe(0);
+    expect(io.photoCalls()).toBe(0);
+    expect(io.sent).toHaveLength(partial ? 1 : 0);
+    expect(await stub.summary()).toMatchObject({ pendingInbox: 0, failedInbox: 1 });
+  });
+
+  it("waits through chunk retry and starts the image only after the final chunk succeeds", async () => {
+    const io = transport();
+    io.definitionVisual = PROVIDER_VISUAL;
+    io.definitionSenses = LONG_VISUAL_SENSES;
+    io.wikimediaMode = "success";
+    io.textFailureCalls.add(2);
+    const stub = companion("photo-chunk-retry");
+
+    await stub.enqueueTelegramUpdate(message(1, "Street"));
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(io.wikimediaCalls()).toBe(0);
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(io.wikimediaCalls()).toBe(0);
+
+    await drain(stub);
+    await io.waitForPhoto();
+    await vi.waitFor(() => expect(io.photos).toHaveLength(1));
+    expect(io.textAttempts.length).toBeGreaterThan(io.sent.length);
+    expect(io.wikimediaCalls()).toBe(1);
+    expect(io.photoCalls()).toBe(1);
+  });
+
+  it.each(["empty", "malformed", "reject"] as const)(
+    "keeps completed text silent when Wikimedia is %s",
+    async (wikimediaMode) => {
+      const io = transport();
+      io.definitionVisual = PROVIDER_VISUAL;
+      io.wikimediaMode = wikimediaMode;
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      const stub = companion(`photo-wikimedia-${wikimediaMode}`);
+
+      await stub.enqueueTelegramUpdate(message(1, "Street"));
+      await drain(stub);
+
+      expect(io.sent).toHaveLength(1);
+      expect(io.photoCalls()).toBe(0);
+      expect(await stub.summary()).toMatchObject({ pendingInbox: 0, failedInbox: 0 });
+      expect(await runInDurableObject(stub, (_instance, state) =>
+        state.storage.sql.exec<{ status: string; attempt_count: number }>(
+          "SELECT status, attempt_count FROM inbox_events WHERE dedupe_key = 'telegram:1'",
+        ).one()
+      )).toEqual({ status: "completed", attempt_count: 0 });
+      expect(log).toHaveBeenCalledWith(JSON.stringify({
+        event: "optional_photo_failed",
+        eventId: 1,
+        stage: "wikimedia",
+        kind: "unavailable",
+      }));
+      expect(log.mock.calls.flat().join(" ")).not.toMatch(
+        /Street|street object|wikimedia\.org\/wiki|creativecommons/u,
+      );
+    },
+  );
+
+  it.each([
+    "success",
+    "api-reject",
+    "malformed",
+    "missing-photo",
+    "fetch-reject",
+  ] as const)(
+    "recovers the inbox after Telegram photo %s without a retry or user error",
+    async (telegramPhotoMode) => {
+      const io = transport();
+      io.definitionVisual = PROVIDER_VISUAL;
+      io.wikimediaMode = "success";
+      io.telegramPhotoMode = telegramPhotoMode;
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const stub = companion(`photo-telegram-${telegramPhotoMode}`);
+
+      await stub.enqueueTelegramUpdate(message(1, "Street"));
+      await drain(stub);
+      await io.waitForPhoto();
+      expect(io.photoCalls()).toBe(1);
+
+      io.definitionVisual = undefined;
+      await stub.enqueueTelegramUpdate(message(2, "Avenue"));
+      await drain(stub);
+
+      expect(io.sent).toHaveLength(2);
+      expect(io.photoCalls()).toBe(1);
+      expect(await stub.summary()).toMatchObject({ pendingInbox: 0, failedInbox: 0 });
+      expect(io.photos).toHaveLength(telegramPhotoMode === "success" ? 1 : 0);
+    },
+  );
+
+  it("completes optional work and keeps later definitions deliverable", async () => {
+    const io = transport();
+    io.definitionVisual = PROVIDER_VISUAL;
+    io.wikimediaMode = "success";
+    const stub = companion("photo-queue-recovery");
+
+    await stub.enqueueTelegramUpdate(message(1, "Street"));
+    await drain(stub);
+    await io.waitForPhoto();
+    expect(io.sent).toHaveLength(1);
+    expect(io.photos).toHaveLength(1);
+
+    io.definitionVisual = undefined;
+    await stub.enqueueTelegramUpdate(message(2, "Avenue"));
+    await drain(stub);
+    expect(io.sent).toHaveLength(2);
+    expect(io.photos[0]!.caption).toMatch(/^Street — an object beside a street/u);
+  });
+
+  it("does not replay optional work after completed-state eviction", async () => {
+    const io = transport();
+    io.definitionVisual = PROVIDER_VISUAL;
+    io.wikimediaMode = "malformed";
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const stub = companion("photo-crash-boundary");
+
+    await stub.enqueueTelegramUpdate(message(1, "Street"));
+    await drain(stub);
+    expect(io.wikimediaCalls()).toBe(1);
+    await evictDurableObject(stub);
+
+    expect(await stub.enqueueTelegramUpdate(message(1, "Street"))).toBe("duplicate");
+    await stub.enqueueTelegramUpdate(message(2, "STREET"));
+    await drain(stub);
+    expect(io.wikimediaCalls()).toBe(1);
+    expect(io.photoCalls()).toBe(0);
+  });
+
+  it("times out a hung photo once without changing the delivered text", async () => {
+    const io = transport();
+    io.definitionVisual = PROVIDER_VISUAL;
+    io.wikimediaMode = "success";
+    io.telegramPhotoMode = "timeout";
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const stub = companion("photo-timeout-recovery");
+
+    await stub.enqueueTelegramUpdate(message(1, "Street"));
+    const firstAlarm = runDurableObjectAlarm(stub);
+    await io.waitForPhoto();
+    await firstAlarm;
+    expect(io.sent).toHaveLength(1);
+    expect(io.photoCalls()).toBe(1);
+    expect(io.photos).toHaveLength(0);
   });
 });
 

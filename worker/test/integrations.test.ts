@@ -9,7 +9,11 @@ import {
   parseDefinitionResponse,
   parseEvaluationResponse,
 } from "../src/integrations/opencode";
-import { splitTelegramMessage, TelegramAdapter } from "../src/integrations/telegram";
+import {
+  splitTelegramMessage,
+  TelegramAdapter,
+  TELEGRAM_PHOTO_TIMEOUT_MS,
+} from "../src/integrations/telegram";
 
 const ENTRY: VocabularyEntry = {
   id: 1,
@@ -479,5 +483,104 @@ describe("TelegramAdapter", () => {
     const adapter = new TelegramAdapter({ botToken: "token", chatId: "123" });
 
     await expect(adapter.sendText("hello")).rejects.toThrow(/message id/u);
+  });
+
+  it("sends a remote photo with a plain caption and validates the photo receipt", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({
+      ok: true,
+      result: {
+        message_id: 42,
+        photo: [{
+          file_id: "photo-file",
+          file_unique_id: "unique-photo",
+          width: 1_280,
+          height: 853,
+        }],
+      },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const adapter = new TelegramAdapter({ botToken: "token", chatId: "123" });
+
+    await expect(
+      adapter.sendPhoto(
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a2/photo.jpg",
+        "Street — an object beside a street\n\nLicense: CC BY 4.0",
+      ),
+    ).resolves.toBe(42);
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0]![0]).toBe(
+      "https://api.telegram.org/bottoken/sendPhoto",
+    );
+    const init = fetchMock.mock.calls[0]![1] as RequestInit;
+    expect(JSON.parse(init.body as string)).toEqual({
+      chat_id: "123",
+      photo: "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a2/photo.jpg",
+      caption: "Street — an object beside a street\n\nLicense: CC BY 4.0",
+    });
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it.each([
+    ["HTTP rejection", response({}, 502)],
+    ["Bot API rejection", response({ ok: false })],
+    ["malformed JSON", new Response("{", { status: 200 })],
+    ["missing photo", response({ ok: true, result: { message_id: 42 } })],
+    ["empty photo", response({ ok: true, result: { message_id: 42, photo: [] } })],
+    [
+      "malformed photo",
+      response({
+        ok: true,
+        result: {
+          message_id: 42,
+          photo: [{
+            file_id: "",
+            file_unique_id: "unique-photo",
+            width: 1_280,
+            height: 853,
+          }],
+        },
+      }),
+    ],
+  ])("rejects a %s photo response", async (_label, telegramResponse) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(telegramResponse));
+    const adapter = new TelegramAdapter({ botToken: "token", chatId: "123" });
+
+    await expect(adapter.sendPhoto("https://example.test/photo.jpg", "Caption"))
+      .rejects.toThrow();
+  });
+
+  it("rejects photo fetch failures and aborts a hung photo send at its own deadline", async () => {
+    const adapter = new TelegramAdapter({ botToken: "token", chatId: "123" });
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("network unavailable")));
+    await expect(adapter.sendPhoto("https://example.test/photo.jpg", "Caption"))
+      .rejects.toThrow(/network unavailable/u);
+
+    vi.useFakeTimers();
+    let signal: AbortSignal | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        const requestSignal = init?.signal;
+        if (requestSignal === null || requestSignal === undefined) {
+          throw new Error("photo request missing deadline signal");
+        }
+        signal = requestSignal;
+        return new Promise<Response>((_resolve, reject) => {
+          requestSignal.addEventListener(
+            "abort",
+            () => reject(requestSignal.reason),
+            { once: true },
+          );
+        });
+      }),
+    );
+    const pending = adapter.sendPhoto("https://example.test/photo.jpg", "Caption");
+    const rejection = expect(pending).rejects.toBeDefined();
+    await vi.advanceTimersByTimeAsync(TELEGRAM_PHOTO_TIMEOUT_MS);
+
+    await rejection;
+    expect(signal).not.toBeNull();
+    expect((signal as unknown as AbortSignal).aborted).toBe(true);
   });
 });
