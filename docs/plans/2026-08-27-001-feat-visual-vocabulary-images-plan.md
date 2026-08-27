@@ -183,7 +183,7 @@ The text path remains authoritative. Every arrow after inbox completion is optio
 - Apply deterministic rejection over the requested entry, all generated senses, the model-provided search phrase, and the model-provided description. Validate sense/category references, ambiguity indicators, field bounds, literal-query characters, and normalized sensitive markers. The local policy may only reject.
 - Treat category and blocked-class tables as reviewed product policy. Implementation may add normalized spelling variants but may not add eligible categories or weaken exclusions.
 
-**Execution note:** Start with failing parser and policy tests for `Doric`, `aster`, `duplicity`, competing senses, and `paraphimosis` before changing the provider prompt.
+**Execution note:** Start with failing parser and policy tests for `Doric`, `aster`, `duplicity`, competing senses, and `paraphimosis`. Before changing the provider prompt, capture a small fixed core-definition fixture/smoke corpus; afterward verify core parse success, sense ordering/shape, response latency, and output budget remain acceptable without requiring identical model prose.
 
 **Patterns to follow:**
 - Strict core-field validation and typed provider outcomes in `worker/src/integrations/opencode.ts`.
@@ -198,6 +198,7 @@ The text path remains authoritative. Every arrow after inbox completion is optio
 - Sensitive — **Covers AE5.** `paraphimosis` and medical/anatomy, sexual, gore, injury, or procedure markers in entry, senses, query, or description collapse to text-only.
 - Optional-error path — malformed or unknown visual metadata collapses to `null`; the same valid ordered senses still save and format unchanged.
 - Core-error path — malformed senses retain the existing invalid-definition behavior.
+- Core compatibility — an existing valid found-definition response with no visual field parses and formats exactly as before.
 - Compatibility — `not_found` remains valid without visual fields.
 
 **Verification:**
@@ -395,6 +396,7 @@ The text path remains authoritative. Every arrow after inbox completion is optio
 | Risk | Mitigation |
 |------|------------|
 | Malformed optional visual metadata breaks definition capture | Parse visual metadata independently and reduce failures to text-only while keeping strict core-sense validation |
+| Augmented provider prompt degrades core definition output | Preserve visual as optional, retain old found-response compatibility, and compare a fixed core-definition smoke corpus for parse success, sense shape/order, latency, and output budget before rollout |
 | Model incorrectly approves an abstract, ambiguous, or blocked topic | Fixed eligible-category and blocked-class policy rejects across entry/sense/descriptor fields; no fallback broadens eligibility |
 | Commons has no SafeSearch and benign metadata cannot prove safe pixels | Exclude medical/anatomy, sexual, gore, injury, and procedure topics before lookup; canonicalize/screen candidate text; accept the user-approved residual mislabeled-file risk |
 | Model-generated query changes MediaWiki behavior | Use fixed parameterized controls and a bounded literal phrase policy that rejects controls/operators and cannot override namespace or limits |
