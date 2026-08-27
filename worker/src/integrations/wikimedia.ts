@@ -2,9 +2,9 @@ import type { SenseCard, VisualIntent } from "../domain/models";
 import { formatWikimediaCaption } from "../domain/formatting";
 import { caseFold } from "../domain/normalization";
 import {
-  MAX_VISUAL_DESCRIPTION_LENGTH,
-  MAX_VISUAL_QUERY_LENGTH,
   isSensitiveVisualText,
+  isValidVisualDescription,
+  isValidVisualQuery,
 } from "../domain/visual-enrichment";
 
 const WIKIMEDIA_ENDPOINT = "https://commons.wikimedia.org/w/api.php";
@@ -13,6 +13,7 @@ const WIKIMEDIA_APPLICATION_AGENT =
 const WIKIMEDIA_RESULT_LIMIT = 5;
 const WIKIMEDIA_THUMB_WIDTH = 1280;
 export const WIKIMEDIA_TIMEOUT_MS = 3_000;
+export const MAX_WIKIMEDIA_RESPONSE_BYTES = 1_048_576;
 
 const MAX_RAW_METADATA_LENGTH = 20_000;
 const MAX_TITLE_LENGTH = 240;
@@ -23,12 +24,6 @@ const MAX_RESTRICTIONS_LENGTH = 240;
 const MAX_IMAGE_DIMENSION_SUM = 10_000;
 const MAX_IMAGE_ASPECT_RATIO = 20;
 
-const LITERAL_QUERY = /^[\p{L}\p{M}\p{N}][\p{L}\p{M}\p{N} '\u2019-]*$/u;
-const QUERY_OPERATORS: Readonly<Record<string, true>> = {
-  and: true,
-  or: true,
-  not: true,
-};
 const SUPPORTED_MIME_TYPES: Readonly<Record<string, true>> = {
   "image/jpeg": true,
   "image/png": true,
@@ -179,6 +174,42 @@ function object(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+
+async function readBoundedJson(response: Response): Promise<unknown | null> {
+  const declaredLength = response.headers.get("Content-Length");
+  if (
+    declaredLength !== null &&
+    (!Number.isSafeInteger(Number(declaredLength)) ||
+      Number(declaredLength) < 0 ||
+      Number(declaredLength) > MAX_WIKIMEDIA_RESPONSE_BYTES)
+  ) return null;
+  if (response.body === null) return null;
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_WIKIMEDIA_RESPONSE_BYTES) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    return null;
+  }
+}
 function findTagEnd(value: string, start: number): number {
   let quote: "\"" | "'" | null = null;
   for (let index = start + 1; index < value.length; index += 1) {
@@ -404,14 +435,7 @@ function parseAttribution(metadata: Record<string, unknown>): AttributionMetadat
 
 function validQuery(request: WikimediaLookupRequest): boolean {
   const { query, description } = request.intent;
-  if (
-    Array.from(query).length < 1 || Array.from(query).length > MAX_VISUAL_QUERY_LENGTH ||
-    Array.from(description).length < 1 ||
-    Array.from(description).length > MAX_VISUAL_DESCRIPTION_LENGTH ||
-    !LITERAL_QUERY.test(query)
-  ) return false;
-  const queryTokens = caseFold(query.normalize("NFKC")).match(/[\p{L}\p{M}\p{N}]+/gu) ?? [];
-  if (queryTokens.some((token) => Object.hasOwn(QUERY_OPERATORS, token))) return false;
+  if (!isValidVisualQuery(query) || !isValidVisualDescription(description)) return false;
   return [
     request.displayText,
     request.sense.partOfSpeech,
@@ -561,12 +585,8 @@ export class WikimediaAdapter {
       if (response.status >= 300 && response.status < 400) return null;
       if (!response.ok) return null;
 
-      let body: unknown;
-      try {
-        body = await response.json();
-      } catch {
-        return null;
-      }
+      const body = await readBoundedJson(response);
+      if (body === null) return null;
       const payload = object(body);
       if (payload === null || Object.hasOwn(payload, "error")) return null;
       const query = object(payload.query);

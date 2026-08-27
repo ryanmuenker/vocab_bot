@@ -29,7 +29,10 @@ import type {
   StudyPromptSnapshot,
   VisualIntent,
 } from "./domain/models";
-import { validateVisualIntent } from "./domain/visual-enrichment";
+import {
+  decodeVisualIntent,
+  encodeVisualIntent,
+} from "./domain/visual-enrichment";
 import { caseFold, normalizeEntryText, trimPythonWhitespace } from "./domain/normalization";
 import {
   allowedRatings,
@@ -1023,40 +1026,12 @@ export class VocabularyCompanion extends DurableObject<Env> {
       this.logOptionalPhotoFailure(event.id, "intent", "invalid");
       return null;
     }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(event.visual_intent);
-    } catch {
-      this.logOptionalPhotoFailure(event.id, "intent", "invalid");
-      return null;
-    }
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-      this.logOptionalPhotoFailure(event.id, "intent", "invalid");
-      return null;
-    }
-    const value = parsed as Record<string, unknown>;
-    const keys = Object.keys(value);
-    if (
-      keys.length !== 4 ||
-      !Object.hasOwn(value, "senseIndex") ||
-      !Object.hasOwn(value, "category") ||
-      !Object.hasOwn(value, "query") ||
-      !Object.hasOwn(value, "description")
-    ) {
-      this.logOptionalPhotoFailure(event.id, "intent", "invalid");
-      return null;
-    }
     const entry = this.store.getEntry(event.normalized_key);
     if (entry === null) {
       this.logOptionalPhotoFailure(event.id, "intent", "invalid");
       return null;
     }
-    const intent = validateVisualIntent(entry.displayText, entry.senses, {
-      sense_index: value.senseIndex,
-      category: value.category,
-      query: value.query,
-      description: value.description,
-    });
+    const intent = decodeVisualIntent(entry.displayText, entry.senses, event.visual_intent);
     if (intent === null) {
       this.logOptionalPhotoFailure(event.id, "intent", "invalid");
       return null;
@@ -1194,7 +1169,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
            updated_at = ?, last_error = NULL
        WHERE id = ? AND status IN ('pending', 'waiting')`,
       response,
-      visualIntent === null ? null : JSON.stringify(visualIntent),
+      visualIntent === null ? null : encodeVisualIntent(visualIntent),
       preparedTargetId,
       timestamp(),
       id,

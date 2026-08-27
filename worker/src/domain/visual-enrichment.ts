@@ -179,10 +179,21 @@ function categoriesIn(text: string): ReadonlySet<VisualCategory> {
   return categories;
 }
 
-function validQuery(value: string): boolean {
-  if (!LITERAL_QUERY.test(value)) return false;
-  const words = searchableText(value).split(" ");
+export function isValidVisualQuery(value: string): boolean {
+  if (CONTROL_CHARACTERS.test(value)) return false;
+  const normalized = normalizeText(value);
+  if (codePointLength(normalized) < 1 ||
+      codePointLength(normalized) > MAX_VISUAL_QUERY_LENGTH ||
+      !LITERAL_QUERY.test(normalized)) return false;
+  const words = searchableText(normalized).split(" ");
   return !words.some((word) => Object.hasOwn(QUERY_OPERATORS, word));
+}
+
+export function isValidVisualDescription(value: string): boolean {
+  if (CONTROL_CHARACTERS.test(value)) return false;
+  const normalized = normalizeText(value);
+  return codePointLength(normalized) >= 1 &&
+    codePointLength(normalized) <= MAX_VISUAL_DESCRIPTION_LENGTH;
 }
 
 /**
@@ -206,14 +217,9 @@ export function validateVisualIntent(
   }
 
   const category = ALLOWED_VISUAL_CATEGORIES[value.category]!;
+  if (!isValidVisualQuery(value.query) || !isValidVisualDescription(value.description)) return null;
   const query = normalizeText(value.query);
   const description = normalizeText(value.description);
-  if (
-    codePointLength(query) < 1 || codePointLength(query) > MAX_VISUAL_QUERY_LENGTH ||
-    codePointLength(description) < 1 || codePointLength(description) > MAX_VISUAL_DESCRIPTION_LENGTH ||
-    CONTROL_CHARACTERS.test(value.query) || CONTROL_CHARACTERS.test(value.description) ||
-    !validQuery(query)
-  ) return null;
 
   const policyTexts = [
     displayText,
@@ -249,4 +255,33 @@ export function validateVisualIntent(
     query,
     description,
   };
+}
+
+/** Stable transient-inbox representation; vocabulary aggregates never store it. */
+export function encodeVisualIntent(intent: VisualIntent): string {
+  return JSON.stringify(intent);
+}
+
+/** Decode persisted transient intent through the same rejection-only policy. */
+export function decodeVisualIntent(
+  displayText: string,
+  senses: readonly SenseCard[],
+  serialized: string,
+): VisualIntent | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(serialized);
+  } catch {
+    return null;
+  }
+  const value = object(parsed);
+  if (value === null || !exactKeys(value, ["senseIndex", "category", "query", "description"])) {
+    return null;
+  }
+  return validateVisualIntent(displayText, senses, {
+    sense_index: value.senseIndex,
+    category: value.category,
+    query: value.query,
+    description: value.description,
+  });
 }

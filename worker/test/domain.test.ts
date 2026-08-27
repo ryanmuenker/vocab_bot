@@ -18,6 +18,8 @@ import {
 import {
   MAX_VISUAL_DESCRIPTION_LENGTH,
   MAX_VISUAL_QUERY_LENGTH,
+  decodeVisualIntent,
+  encodeVisualIntent,
   validateVisualIntent,
 } from "../src/domain/visual-enrichment";
 
@@ -208,6 +210,24 @@ describe("visual enrichment policy", () => {
       ...valid,
       description: "D".repeat(MAX_VISUAL_DESCRIPTION_LENGTH + 1),
     })).toBeNull();
+  });
+
+  it("round-trips transient intent through the domain-owned persisted representation", () => {
+    const intent = validateVisualIntent("Doric", DORIC_SENSES, {
+      sense_index: 0,
+      category: "architecture",
+      query: "Doric order columns",
+      description: "Doric architectural columns.",
+    })!;
+    const serialized = encodeVisualIntent(intent);
+
+    expect(decodeVisualIntent("Doric", DORIC_SENSES, serialized)).toEqual(intent);
+    expect(decodeVisualIntent("Doric", DORIC_SENSES, "{")).toBeNull();
+    expect(decodeVisualIntent(
+      "Doric",
+      DORIC_SENSES,
+      JSON.stringify({ ...intent, extra: true }),
+    )).toBeNull();
   });
 });
 

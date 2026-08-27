@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { VisualCategory, type SenseCard, type VisualIntent } from "../src/domain/models";
 import {
+  MAX_WIKIMEDIA_RESPONSE_BYTES,
   WikimediaAdapter,
   WIKIMEDIA_TIMEOUT_MS,
   canonicalizeWikimediaMetadata,
@@ -312,6 +313,20 @@ describe("WikimediaAdapter", () => {
     ];
     for (const failure of failures) {
       const fetchMock = vi.fn(failure);
+      vi.stubGlobal("fetch", fetchMock);
+      expect(await new WikimediaAdapter().findPhoto(LOOKUP)).toBeNull();
+      expect(fetchMock).toHaveBeenCalledOnce();
+    }
+  });
+
+  it("rejects oversized Commons responses before unbounded JSON parsing", async () => {
+    for (const response of [
+      new Response("{}", {
+        headers: { "Content-Length": String(MAX_WIKIMEDIA_RESPONSE_BYTES + 1) },
+      }),
+      new Response("x".repeat(MAX_WIKIMEDIA_RESPONSE_BYTES + 1)),
+    ]) {
+      const fetchMock = vi.fn().mockResolvedValue(response);
       vi.stubGlobal("fetch", fetchMock);
       expect(await new WikimediaAdapter().findPhoto(LOOKUP)).toBeNull();
       expect(fetchMock).toHaveBeenCalledOnce();
