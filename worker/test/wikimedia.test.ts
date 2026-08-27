@@ -48,7 +48,7 @@ function page(options: PageOptions = {}): Record<string, unknown> {
   };
   for (const [key, value] of Object.entries(options.metadata ?? {})) {
     if (value === null) delete metadata[key];
-    else metadata[key] = { value };
+    else if (value !== undefined) metadata[key] = { value };
   }
   return {
     pageid: options.index ?? 1,
@@ -126,7 +126,11 @@ describe("WikimediaAdapter", () => {
     const [requestUrl, request] = fetchMock.mock.calls[0] as [string, RequestInit];
     const url = new URL(requestUrl);
     expect(`${url.origin}${url.pathname}`).toBe("https://commons.wikimedia.org/w/api.php");
-    expect(Object.fromEntries(url.searchParams)).toEqual({
+    const queryParameters: Record<string, string> = {};
+    url.searchParams.forEach((value, key) => {
+      queryParameters[key] = value;
+    });
+    expect(queryParameters).toEqual({
       action: "query",
       format: "json",
       formatversion: "2",
@@ -330,7 +334,9 @@ describe("WikimediaAdapter", () => {
     vi.stubGlobal("fetch", fetchMock);
     expect(await new WikimediaAdapter().findPhoto(LOOKUP)).not.toBeNull();
     const params = new URL(fetchMock.mock.calls[0]![0] as string).searchParams;
-    expect([...params.keys()].some((key) => /size|bytes|length/iu.test(key) && key !== "iiprop"))
+    const parameterNames: string[] = [];
+    params.forEach((_value, key) => parameterNames.push(key));
+    expect(parameterNames.some((key) => /size|bytes|length/iu.test(key) && key !== "iiprop"))
       .toBe(false);
   });
 });

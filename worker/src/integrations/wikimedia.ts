@@ -441,9 +441,11 @@ function validatePhotoUrl(value: unknown): string | null {
   if (url === null || !url.pathname.startsWith("/wikipedia/commons/") || url.hash.length > 0) {
     return null;
   }
-  for (const key of url.searchParams.keys()) {
-    if (!Object.hasOwn(ALLOWED_WIKIMEDIA_TRACKING_PARAMETERS, key)) return null;
-  }
+  let supportedParameters = true;
+  url.searchParams.forEach((_value, key) => {
+    if (!Object.hasOwn(ALLOWED_WIKIMEDIA_TRACKING_PARAMETERS, key)) supportedParameters = false;
+  });
+  if (!supportedParameters) return null;
   url.search = "";
   return url.href;
 }

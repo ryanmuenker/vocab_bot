@@ -7,10 +7,11 @@ holding the SQLite study state, and a cron alarm that acts as the review ticker.
 It implements the production **v5 model**: embedded FSRS-6 scheduling, one
 forward and up to three diverse reverse cards per entry, `/review`'s 10-card
 per-local-day introduction quota with practiced-sense coverage first,
-unseen-only directional tests, sibling burial, repeatable tail retries, and
-`/review`, `/test forward|reverse`, `/endstudy`, `/pause`, and `/unpause`.
-Every definition remains stored; startup and snapshot import remove only
-surplus reverse cards that have never been queued or reviewed.
+unseen-only directional tests, sibling burial, repeatable tail retries,
+conservative Wikimedia images for newly saved visual vocabulary, and `/review`,
+`/test forward|reverse`, `/endstudy`, `/pause`, and `/unpause`. Every definition
+remains stored; startup and snapshot import remove only surplus reverse cards
+that have never been queued or reviewed.
 
 The Worker implementation under `worker/src/` is the production source of truth. User-visible fixes must land here first and be covered under `worker/test/`. Python is secondary migration/reference code; update it only when snapshot compatibility, offline tooling, or deliberately maintained parity requires it.
 
@@ -24,6 +25,22 @@ safety property is the same as the Hermes path:
    lands, recording the message IDs and a fingerprint of the text actually sent;
 3. a failed send records a `failed` attempt and leaves the prompt `prepared`, so
    it stays retryable and can never consume the next message you type.
+
+Newly saved entries may receive one separate Wikimedia Commons photo after the
+complete definition text. Eligibility is deliberately narrow: one dominant
+visual sense in an allowed concrete category, with medical/anatomy, sexual,
+gore, injury, procedure, abstract, action, event, emotion, and social-role
+topics kept text-only. Commons candidates must match that sense, use an accepted
+reusable license, and provide complete attribution. Wikimedia has no SafeSearch;
+this is conservative metadata screening, not pixel moderation, so rare
+mislabeled or vandalized-file risk remains.
+
+Image enrichment is optional and at-most-once. The text inbox event completes
+before a bounded background Commons lookup and Telegram `sendPhoto` attempt.
+Lookup timeout, missing metadata, wrong-sense results, photo rejection, or a
+restart silently omits the image. None can retry or alter the definition, card
+state, inbox result, or later definition delivery. Already-saved requests never
+look up or resend an image.
 
 ## Telegram commands
 
@@ -49,6 +66,11 @@ npx wrangler deploy
 Non-secret values live in `wrangler.jsonc` under `vars`: `OPENCODE_BASE_URL`,
 `OPENCODE_MODEL`, `HERMES_TIMEZONE`, and `HERMES_REVIEW_HOUR` (the local hour
 before which the ticker stays silent unless an older overdue backlog exists).
+
+Wikimedia lookup uses the public Commons Action API and needs no key or secret.
+Requests identify `HermesVocabularyCompanion/1.0` through `Api-User-Agent`,
+send only the generated sense-grounded search phrase, and never include
+Telegram chat/user identifiers or inbound message envelopes.
 
 Secrets, set with `wrangler secret put <NAME>`:
 
