@@ -15,7 +15,7 @@ import {
   StudyStartStatus,
 } from "../src/domain/models";
 import type { Evaluation, FinalizeResult, SenseCard, StudyPromptSnapshot } from "../src/domain/models";
-import { initializeSchema } from "../src/storage/schema";
+import { initializeSchema, migrateInboxVisualIntent } from "../src/storage/schema";
 import { VocabularyStore, localMidnightUtc } from "../src/storage/vocabulary-store";
 
 const CARD: SenseCard = {
@@ -120,6 +120,84 @@ function answerCurrent(
   store.recordAnswer(prompt.id, "an answer", grade, now);
   return { prompt, result: store.finalize(prompt.id, rating, now) };
 }
+
+describe("inbox schema migration", () => {
+  it("creates the transient visual intent column on a cold database", async () => {
+    await runInDurableObject(stub(), (_instance, state) => {
+      initializeSchema(state.storage.sql);
+      migrateInboxVisualIntent(state.storage.sql);
+
+      expect(rows<{ name: string }>(
+        state.storage,
+        "PRAGMA table_info(inbox_events)",
+      ).map(({ name }) => name)).toContain("visual_intent");
+    });
+  });
+
+  it("upgrades a populated old inbox once without losing its rows", async () => {
+    await runInDurableObject(stub(), (_instance, state) => {
+      Array.from(state.storage.sql.exec("DROP TABLE inbox_events"));
+      Array.from(state.storage.sql.exec(`
+        CREATE TABLE inbox_events (
+          id INTEGER PRIMARY KEY,
+          dedupe_key TEXT NOT NULL UNIQUE,
+          kind TEXT NOT NULL CHECK (kind IN ('telegram', 'daily_review')),
+          status TEXT NOT NULL CHECK (
+            status IN ('pending', 'waiting', 'ready', 'completed', 'failed')
+          ),
+          payload TEXT,
+          prepared_target_id INTEGER,
+          normalized_key TEXT,
+          coalesced_to_event_id INTEGER REFERENCES inbox_events(id),
+          response_text TEXT,
+          next_chunk_index INTEGER NOT NULL DEFAULT 0 CHECK (next_chunk_index >= 0),
+          attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 10),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          last_error TEXT,
+          CHECK (
+            (status = 'waiting' AND coalesced_to_event_id IS NOT NULL)
+            OR status != 'waiting'
+          )
+        )
+      `));
+      Array.from(state.storage.sql.exec(
+        `INSERT INTO inbox_events
+          (dedupe_key, kind, status, payload, prepared_target_id, normalized_key,
+           coalesced_to_event_id, response_text, created_at, updated_at)
+         VALUES (?, 'telegram', 'ready', NULL, NULL, ?, NULL, ?, ?, ?)`,
+        "telegram:old",
+        "aster",
+        "saved response",
+        "2026-08-27T00:00:00Z",
+        "2026-08-27T00:00:00Z",
+      ));
+
+      initializeSchema(state.storage.sql);
+      migrateInboxVisualIntent(state.storage.sql);
+      initializeSchema(state.storage.sql);
+      migrateInboxVisualIntent(state.storage.sql);
+
+      expect(rows<{ name: string }>(
+        state.storage,
+        "PRAGMA table_info(inbox_events)",
+      ).filter(({ name }) => name === "visual_intent")).toHaveLength(1);
+      expect(rows<{ dedupe_key: string; response_text: string; visual_intent: string | null }>(
+        state.storage,
+        "SELECT dedupe_key, response_text, visual_intent FROM inbox_events",
+      )).toEqual([{
+        dedupe_key: "telegram:old",
+        response_text: "saved response",
+        visual_intent: null,
+      }]);
+      expect(rows<{ count: number }>(
+        state.storage,
+        `SELECT COUNT(*) AS count FROM maintenance_migrations
+         WHERE name = 'inbox_visual_intent_v1'`,
+      )).toEqual([{ count: 1 }]);
+    });
+  });
+});
 
 describe("VocabularyStore capture", () => {
   it("keeps every sense but projects one forward and at most three diverse reverse cards atomically", async () => {
@@ -330,6 +408,37 @@ describe("VocabularyStore deletion", () => {
         "prompt_delivery_attempts_immutable_delete",
         "review_attempts_immutable_delete",
       ]);
+    });
+  });
+
+  it("clears transient capture intent when its vocabulary aggregate is deleted", async () => {
+    await runInDurableObject(stub(), (_instance, state) => {
+      const store = new VocabularyStore(state.storage, "UTC");
+      store.captureEntry("aster", [CARD], new Date("2026-08-27T00:00:00Z"));
+      Array.from(state.storage.sql.exec(
+        `INSERT INTO inbox_events
+          (dedupe_key, kind, status, normalized_key, response_text, visual_intent,
+           created_at, updated_at)
+         VALUES (?, 'telegram', 'ready', ?, ?, ?, ?, ?)`,
+        "telegram:visual",
+        "aster",
+        "✓ Saved.",
+        JSON.stringify({
+          senseIndex: 0,
+          category: "plant",
+          query: "aster flower",
+          description: "An aster flower.",
+        }),
+        "2026-08-27T00:00:00Z",
+        "2026-08-27T00:00:00Z",
+      ));
+
+      store.deleteEntries(["aster"], new Date("2026-08-27T00:01:00Z"));
+
+      expect(rows<{ visual_intent: string | null }>(
+        state.storage,
+        "SELECT visual_intent FROM inbox_events WHERE dedupe_key = 'telegram:visual'",
+      )).toEqual([{ visual_intent: null }]);
     });
   });
 });

@@ -335,6 +335,29 @@ describe("SnapshotV2 and JCS", () => {
     await runInDurableObject(stub(), (_instance, state) => {
       initializeSchema(state.storage.sql);
       writeSnapshot(state.storage, SNAPSHOT);
+      Array.from(state.storage.sql.exec(
+        `INSERT INTO inbox_events
+          (dedupe_key, kind, status, payload, prepared_target_id, normalized_key,
+           coalesced_to_event_id, response_text, created_at, updated_at)
+         VALUES (?, 'telegram', 'ready', NULL, NULL, ?, NULL, ?, ?, ?)`,
+        "telegram:legacy-explicit-columns",
+        "aster",
+        "✓ Saved.",
+        "2026-08-27T00:00:00Z",
+        "2026-08-27T00:00:00Z",
+      ));
+      expect(Array.from(state.storage.sql.exec<{ visual_intent: string | null }>(
+        "SELECT visual_intent FROM inbox_events",
+      ))).toEqual([{ visual_intent: null }]);
+      Array.from(state.storage.sql.exec(
+        "UPDATE inbox_events SET visual_intent = ?",
+        JSON.stringify({
+          senseIndex: 0,
+          category: "plant",
+          query: "aster flower",
+          description: "An aster flower.",
+        }),
+      ));
       const exported = readSnapshot(state.storage);
       expect(exported).toEqual(SNAPSHOT);
       expect(canonicalizeJcs(exported)).toBe(canonicalizeJcs(SNAPSHOT));

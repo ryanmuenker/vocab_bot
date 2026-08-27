@@ -284,6 +284,7 @@ CREATE TABLE IF NOT EXISTS inbox_events (
   normalized_key TEXT,
   coalesced_to_event_id INTEGER REFERENCES inbox_events(id),
   response_text TEXT,
+  visual_intent TEXT,
   next_chunk_index INTEGER NOT NULL DEFAULT 0 CHECK (next_chunk_index >= 0),
   attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 10),
   created_at TEXT NOT NULL,
@@ -405,6 +406,26 @@ CREATE INDEX IF NOT EXISTS inbox_events_capture_key_idx
   ON inbox_events(normalized_key, id);
 
 `;
+
+const INBOX_VISUAL_INTENT_MIGRATION = "inbox_visual_intent_v1";
+
+/**
+ * CREATE TABLE IF NOT EXISTS cannot add columns to a warm Durable Object.
+ * Inspect the actual table so retries and rollbacks remain safe even if the
+ * maintenance marker and the schema change were written by different runs.
+ */
+export function migrateInboxVisualIntent(sql: SqlStorage): void {
+  const columns = Array.from(sql.exec<{ name: string }>("PRAGMA table_info(inbox_events)"));
+  if (!columns.some(({ name }) => name === "visual_intent")) {
+    Array.from(sql.exec("ALTER TABLE inbox_events ADD COLUMN visual_intent TEXT"));
+  }
+  Array.from(sql.exec(
+    `INSERT OR IGNORE INTO maintenance_migrations (name, applied_at)
+     VALUES (?, ?)`,
+    INBOX_VISUAL_INTENT_MIGRATION,
+    new Date().toISOString().replace(/\.000Z$/u, "Z"),
+  ));
+}
 
 export function initializeSchema(sql: SqlStorage): void {
   Array.from(sql.exec(SCHEMA_SQL));

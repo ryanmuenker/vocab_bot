@@ -27,6 +27,7 @@ import type {
   ReviewRating,
   StudyAnswerContext,
   StudyPromptSnapshot,
+  VisualIntent,
 } from "./domain/models";
 import { caseFold, normalizeEntryText, trimPythonWhitespace } from "./domain/normalization";
 import {
@@ -46,7 +47,7 @@ import {
 } from "./integrations/opencode";
 import type { EvaluationResult } from "./integrations/opencode";
 import { splitTelegramMessage, TelegramAdapter } from "./integrations/telegram";
-import { initializeSchema } from "./storage/schema";
+import { initializeSchema, migrateInboxVisualIntent } from "./storage/schema";
 import { TEST_REQUIRED_CARDS, VocabularyStore } from "./storage/vocabulary-store";
 
 const EMPTY_REPLY = "Send a word or phrase.";
@@ -127,6 +128,7 @@ interface InboxRow extends Record<string, SqlStorageValue> {
   normalized_key: string | null;
   coalesced_to_event_id: number | null;
   response_text: string | null;
+  visual_intent: string | null;
   next_chunk_index: number;
   attempt_count: number;
   created_at: string;
@@ -198,6 +200,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
       Number.isSafeInteger(hour) && hour >= 0 && hour <= 23 ? hour : DEFAULT_REVIEW_HOUR;
     void this.ctx.blockConcurrencyWhile(async () => {
       initializeSchema(this.ctx.storage.sql);
+      migrateInboxVisualIntent(this.ctx.storage.sql);
       this.store.runReverseCardCapMaintenance();
     });
   }
@@ -728,6 +731,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
 
   private async prepareCapture(event: InboxRow, displayText: string): Promise<void> {
     const definition = await this.provider.defineEntry(displayText);
+    let visualIntent: VisualIntent | null = null;
     let response: string;
     if (definition.status === DefinitionStatus.NOT_FOUND) {
       response = NOT_FOUND_REPLY;
@@ -743,10 +747,11 @@ export class VocabularyCompanion extends DurableObject<Env> {
           result.entry,
           result.status === CaptureStatus.SAVED ? "✓ Saved." : "Already saved.",
         );
+        if (result.status === CaptureStatus.SAVED) visualIntent = definition.visualIntent;
       }
     }
     this.ctx.storage.transactionSync(() => {
-      this.readyEvent(event.id, response, null);
+      this.readyEvent(event.id, response, null, visualIntent);
       const followers = rows(
         this.ctx.storage.sql.exec<{ id: number }>(
           "SELECT id FROM inbox_events WHERE status = 'waiting' AND coalesced_to_event_id = ? ORDER BY id",
@@ -965,7 +970,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
       rows(this.ctx.storage.sql.exec(
         `UPDATE inbox_events
          SET status = 'failed', attempt_count = ?, updated_at = ?,
-             last_error = 'telegram_delivery_failed', payload = NULL
+             last_error = 'telegram_delivery_failed', payload = NULL, visual_intent = NULL
          WHERE id = ? AND status = 'ready'`,
         attempts,
         timestamp(),
@@ -1054,13 +1059,20 @@ export class VocabularyCompanion extends DurableObject<Env> {
     ));
   }
 
-  private readyEvent(id: number, response: string, preparedTargetId: number | null): void {
+  private readyEvent(
+    id: number,
+    response: string,
+    preparedTargetId: number | null,
+    visualIntent: VisualIntent | null = null,
+  ): void {
     rows(this.ctx.storage.sql.exec(
       `UPDATE inbox_events
-       SET status = 'ready', response_text = ?, payload = NULL, prepared_target_id = ?,
-           next_chunk_index = 0, attempt_count = 0, updated_at = ?, last_error = NULL
+       SET status = 'ready', response_text = ?, visual_intent = ?, payload = NULL,
+           prepared_target_id = ?, next_chunk_index = 0, attempt_count = 0,
+           updated_at = ?, last_error = NULL
        WHERE id = ? AND status IN ('pending', 'waiting')`,
       response,
+      visualIntent === null ? null : JSON.stringify(visualIntent),
       preparedTargetId,
       timestamp(),
       id,
@@ -1071,7 +1083,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
     rows(this.ctx.storage.sql.exec(
       `UPDATE inbox_events
        SET status = 'completed', payload = NULL, response_text = NULL,
-           updated_at = ?, last_error = NULL
+           visual_intent = NULL, updated_at = ?, last_error = NULL
        WHERE id = ? AND status = 'ready'`,
       timestamp(),
       id,
@@ -1081,7 +1093,8 @@ export class VocabularyCompanion extends DurableObject<Env> {
   private markFailed(id: number, reason: string): void {
     rows(this.ctx.storage.sql.exec(
       `UPDATE inbox_events
-       SET status = 'failed', payload = NULL, response_text = NULL, updated_at = ?, last_error = ?
+       SET status = 'failed', payload = NULL, response_text = NULL,
+           visual_intent = NULL, updated_at = ?, last_error = ?
        WHERE id = ?`,
       timestamp(),
       reason,

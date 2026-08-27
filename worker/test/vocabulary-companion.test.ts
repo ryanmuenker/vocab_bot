@@ -13,6 +13,20 @@ import { encodeReal } from "../src/domain/snapshot";
 import { normalizeReverseAnswer } from "../src/domain/routing";
 import type { SnapshotCard, SnapshotV2 } from "../src/domain/snapshot";
 
+const VISUAL_INTENT = {
+  senseIndex: 0,
+  category: "object",
+  query: "street object",
+  description: "An object beside a paved street.",
+} as const;
+
+const PROVIDER_VISUAL = {
+  sense_index: 0,
+  category: "object",
+  query: "street object",
+  description: "An object beside a paved street.",
+} as const;
+
 function message(updateId: number, text: string, receivedAt = "2026-07-23T04:00:00Z") {
   return {
     updateId,
@@ -112,6 +126,7 @@ interface Transport {
   telegramFails: boolean;
   modelStatus: number;
   evaluation: { grade: string; feedback: string };
+  definitionVisual: unknown;
 }
 
 /** Stub the model and Telegram endpoints, recording what each one saw. */
@@ -125,6 +140,7 @@ function transport(): Transport {
     telegramFails: false,
     modelStatus: 200,
     evaluation: { grade: "correct", feedback: "Accurate." },
+    definitionVisual: undefined,
   };
   vi.stubGlobal(
     "fetch",
@@ -143,10 +159,17 @@ function transport(): Transport {
               senses: [
                 {
                   part_of_speech: "noun",
-                  definition: "a street",
-                  example_sentence: "The street was quiet.",
+                  definition: state.definitionVisual === undefined
+                    ? "a street"
+                    : "an object beside a street",
+                  example_sentence: state.definitionVisual === undefined
+                    ? "The street was quiet."
+                    : "The object stood beside the street.",
                 },
               ],
+              ...(state.definitionVisual === undefined
+                ? {}
+                : { visual: state.definitionVisual }),
             })
           : JSON.stringify(state.evaluation);
         return url.includes("/responses")
@@ -198,6 +221,181 @@ describe("VocabularyCompanion capture", () => {
       ["reverse", exported.senses[0]!.id],
     ]);
     expect(await stub.summary()).toMatchObject({ entries: 1, senses: 1, pendingInbox: 0, failedInbox: 0 });
+  });
+
+  it("keeps one leader intent through retries and eviction while every duplicate stays null", async () => {
+    const io = transport();
+    io.definitionVisual = PROVIDER_VISUAL;
+    io.telegramFails = true;
+    const stub = companion("visual-intent-lifecycle");
+
+    await stub.enqueueTelegramUpdate(message(1, "Street"));
+    await stub.enqueueTelegramUpdate(message(2, " street "));
+    expect(await runInDurableObject(stub, (_instance, state) =>
+      Array.from(state.storage.sql.exec<{
+        dedupe_key: string;
+        status: string;
+        visual_intent: string | null;
+      }>(
+        `SELECT dedupe_key, status, visual_intent
+         FROM inbox_events ORDER BY id`,
+      ))
+    )).toEqual([
+      { dedupe_key: "telegram:1", status: "pending", visual_intent: null },
+      { dedupe_key: "telegram:2", status: "waiting", visual_intent: null },
+    ]);
+
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await runInDurableObject(stub, (_instance, state) =>
+      Array.from(state.storage.sql.exec<{
+        dedupe_key: string;
+        status: string;
+        response_text: string | null;
+        visual_intent: string | null;
+      }>(
+        `SELECT dedupe_key, status, response_text, visual_intent
+         FROM inbox_events ORDER BY id`,
+      ))
+    )).toEqual([
+      expect.objectContaining({
+        dedupe_key: "telegram:1",
+        status: "ready",
+        response_text: expect.stringContaining("✓ Saved."),
+        visual_intent: JSON.stringify(VISUAL_INTENT),
+      }),
+      expect.objectContaining({
+        dedupe_key: "telegram:2",
+        status: "ready",
+        response_text: expect.stringContaining("✓ Saved."),
+        visual_intent: null,
+      }),
+    ]);
+
+    await evictDurableObject(stub);
+    expect(await runInDurableObject(stub, (_instance, state) =>
+      Array.from(state.storage.sql.exec<{ visual_intent: string | null }>(
+        "SELECT visual_intent FROM inbox_events ORDER BY id",
+      ))
+    )).toEqual([
+      { visual_intent: JSON.stringify(VISUAL_INTENT) },
+      { visual_intent: null },
+    ]);
+
+    io.telegramFails = false;
+    await drain(stub);
+    expect(await stub.enqueueTelegramUpdate(message(3, "STREET"))).toBe("enqueued");
+    expect(await runInDurableObject(stub, (_instance, state) =>
+      Array.from(state.storage.sql.exec<{
+        status: string;
+        response_text: string | null;
+        visual_intent: string | null;
+      }>(
+        `SELECT status, response_text, visual_intent
+         FROM inbox_events WHERE dedupe_key = 'telegram:3'`,
+      ))
+    )).toEqual([{
+      status: "ready",
+      response_text: expect.stringContaining("Already saved."),
+      visual_intent: null,
+    }]);
+    await drain(stub);
+    expect(await runInDurableObject(stub, (_instance, state) =>
+      Array.from(state.storage.sql.exec<{ status: string; visual_intent: string | null }>(
+        "SELECT status, visual_intent FROM inbox_events ORDER BY id",
+      ))
+    )).toEqual([
+      { status: "completed", visual_intent: null },
+      { status: "completed", visual_intent: null },
+      { status: "completed", visual_intent: null },
+    ]);
+  });
+
+  it("copies a ready capture response to a follower without copying its intent", async () => {
+    transport();
+    const stub = companion("visual-ready-follower");
+    await stub.enqueueTelegramUpdate(message(1, "Street"));
+    await runInDurableObject(stub, (_instance, state) => {
+      Array.from(state.storage.sql.exec(
+        `UPDATE inbox_events
+         SET status = 'ready', payload = NULL, response_text = ?,
+             visual_intent = ?
+         WHERE dedupe_key = 'telegram:1'`,
+        "prepared definition",
+        JSON.stringify(VISUAL_INTENT),
+      ));
+    });
+
+    await stub.enqueueTelegramUpdate(message(2, " street "));
+
+    expect(await runInDurableObject(stub, (_instance, state) =>
+      Array.from(state.storage.sql.exec<{
+        dedupe_key: string;
+        response_text: string | null;
+        visual_intent: string | null;
+      }>(
+        `SELECT dedupe_key, response_text, visual_intent
+         FROM inbox_events ORDER BY id`,
+      ))
+    )).toEqual([
+      {
+        dedupe_key: "telegram:1",
+        response_text: "prepared definition",
+        visual_intent: JSON.stringify(VISUAL_INTENT),
+      },
+      {
+        dedupe_key: "telegram:2",
+        response_text: "prepared definition",
+        visual_intent: null,
+      },
+    ]);
+    await runInDurableObject(stub, async (_instance, state) => {
+      Array.from(state.storage.sql.exec(
+        `UPDATE inbox_events
+         SET status = 'completed', response_text = NULL, visual_intent = NULL
+         WHERE status = 'ready'`,
+      ));
+      await state.storage.deleteAlarm();
+    });
+  });
+
+  it("clears intent on generic and terminal delivery failures", async () => {
+    const io = transport();
+    io.definitionVisual = PROVIDER_VISUAL;
+    io.telegramFails = true;
+    const stub = companion("visual-intent-failures");
+    await stub.enqueueTelegramUpdate(message(1, "Street"));
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await runInDurableObject(stub, (_instance, state) => {
+      Array.from(state.storage.sql.exec(
+        "UPDATE inbox_events SET attempt_count = 9 WHERE dedupe_key = 'telegram:1'",
+      ));
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    await stub.enqueueTelegramUpdate(message(2, "Another street"));
+    await runInDurableObject(stub, (_instance, state) => {
+      Array.from(state.storage.sql.exec(
+        `UPDATE inbox_events
+         SET payload = '{', visual_intent = ?
+         WHERE dedupe_key = 'telegram:2'`,
+        JSON.stringify(VISUAL_INTENT),
+      ));
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    expect(await runInDurableObject(stub, (_instance, state) =>
+      Array.from(state.storage.sql.exec<{
+        dedupe_key: string;
+        status: string;
+        visual_intent: string | null;
+      }>(
+        `SELECT dedupe_key, status, visual_intent
+         FROM inbox_events ORDER BY id`,
+      ))
+    )).toEqual([
+      { dedupe_key: "telegram:1", status: "failed", visual_intent: null },
+      { dedupe_key: "telegram:2", status: "failed", visual_intent: null },
+    ]);
   });
 
   it("keeps imported senses while pruning untouched reverse cards to three diverse meanings", async () => {

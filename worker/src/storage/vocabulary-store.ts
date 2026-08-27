@@ -575,6 +575,7 @@ export class VocabularyStore {
 
       const entryIds = deleted.map(({ id }) => id);
       const entryPlaceholders = entryIds.map(() => "?").join(", ");
+      const deletedNormalizedPlaceholders = deleted.map(() => "?").join(", ");
       const affectedSessions = all(
         this.sql.exec<{ session_id: number }>(
           `SELECT DISTINCT queue.session_id
@@ -586,6 +587,14 @@ export class VocabularyStore {
       ).map(({ session_id: sessionId }) => sessionId);
 
       all(this.sql.exec("PRAGMA defer_foreign_keys = ON"));
+      all(
+        this.sql.exec(
+          `UPDATE inbox_events
+           SET visual_intent = NULL
+           WHERE normalized_key IN (${deletedNormalizedPlaceholders})`,
+          ...deleted.map(({ normalizedText }) => normalizedText),
+        ),
+      );
       for (const trigger of IMMUTABLE_HISTORY_DELETE_TRIGGERS) {
         all(this.sql.exec(`DROP TRIGGER ${trigger}`));
       }
@@ -594,8 +603,8 @@ export class VocabularyStore {
           `UPDATE inbox_events
            SET status = 'completed', payload = NULL, prepared_target_id = NULL,
                normalized_key = NULL, coalesced_to_event_id = NULL,
-               response_text = NULL, next_chunk_index = 0, updated_at = ?,
-               last_error = 'entry_deleted'
+               response_text = NULL, visual_intent = NULL, next_chunk_index = 0,
+               updated_at = ?, last_error = 'entry_deleted'
            WHERE prepared_target_id IN (
              SELECT prompt.id
              FROM study_prompts prompt
