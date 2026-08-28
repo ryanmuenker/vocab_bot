@@ -149,7 +149,7 @@ describe("WikimediaAdapter", () => {
     });
     expect(request).toMatchObject({ method: "GET", redirect: "manual" });
     expect(new Headers(request.headers)).toMatchObject(expect.any(Headers));
-    expect(new Headers(request.headers).get("Api-User-Agent")).toContain("HermesVocabularyCompanion/");
+    expect(new Headers(request.headers).get("User-Agent")).toContain("HermesVocabularyCompanion/");
     expect(new Headers(request.headers).get("Accept-Encoding")).toBe("gzip");
   });
 

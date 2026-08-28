@@ -518,17 +518,21 @@ function validImageDimensions(width: unknown, height: unknown): boolean {
   return Math.max(width, height) / Math.min(width, height) <= MAX_IMAGE_ASPECT_RATIO;
 }
 
+
 function parseCandidate(
   page: unknown,
   request: WikimediaLookupRequest,
 ): WikimediaPhotoCandidate | null {
   const pageObject = object(page);
-  if (pageObject === null || pageObject.ns !== 6 || typeof pageObject.title !== "string") return null;
+  if (pageObject === null || pageObject.ns !== 6 || typeof pageObject.title !== "string") {
+    return null;
+  }
   const canonicalTitle = sanitizeMetadata(pageObject.title, MAX_TITLE_LENGTH);
   if (canonicalTitle.truncated || !canonicalTitle.value.startsWith("File:") ||
       isSensitiveVisualText(canonicalTitle.value)) return null;
-
-  if (!Array.isArray(pageObject.imageinfo) || pageObject.imageinfo.length !== 1) return null;
+  if (!Array.isArray(pageObject.imageinfo) || pageObject.imageinfo.length !== 1) {
+    return null;
+  }
   const imageInfo = object(pageObject.imageinfo[0]);
   if (
     imageInfo === null || typeof imageInfo.mime !== "string" ||
@@ -538,7 +542,6 @@ function parseCandidate(
   const photoUrl = validatePhotoUrl(imageInfo.thumburl);
   const sourceUrl = validateSourceUrl(imageInfo.descriptionurl, canonicalTitle.value);
   if (photoUrl === null || sourceUrl === null) return null;
-
   const metadata = object(imageInfo.extmetadata);
   if (metadata === null) return null;
   const descriptionField = metadataValue(metadata, "ImageDescription", MAX_DESCRIPTION_LENGTH);
@@ -550,7 +553,6 @@ function parseCandidate(
   ) return null;
   const attribution = parseAttribution(metadata);
   if (attribution === null) return null;
-
   const caption = formatWikimediaCaption({
     entryName: request.displayText,
     senseDescription: request.sense.definition,
@@ -589,7 +591,6 @@ function buildRequestUrl(query: string): string {
 export class WikimediaAdapter {
   async findPhoto(request: WikimediaLookupRequest): Promise<WikimediaPhotoCandidate | null> {
     if (!validQuery(request)) return null;
-
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), WIKIMEDIA_TIMEOUT_MS);
     try {
@@ -598,14 +599,13 @@ export class WikimediaAdapter {
         headers: {
           Accept: "application/json",
           "Accept-Encoding": "gzip",
-          "Api-User-Agent": WIKIMEDIA_APPLICATION_AGENT,
+          "User-Agent": WIKIMEDIA_APPLICATION_AGENT,
         },
         redirect: "manual",
         signal: controller.signal,
       });
       if (response.status >= 300 && response.status < 400) return null;
       if (!response.ok) return null;
-
       const body = await readBoundedJson(response);
       if (body === null) return null;
       const payload = object(body);
