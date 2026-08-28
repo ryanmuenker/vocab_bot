@@ -12,7 +12,7 @@ const WIKIMEDIA_APPLICATION_AGENT =
   "HermesVocabularyCompanion/1.0 (https://vocab.ryanmuenker.com)";
 const WIKIMEDIA_RESULT_LIMIT = 5;
 const WIKIMEDIA_THUMB_WIDTH = 1280;
-export const WIKIMEDIA_TIMEOUT_MS = 3_000;
+export const WIKIMEDIA_TIMEOUT_MS = 8_000;
 export const MAX_WIKIMEDIA_RESPONSE_BYTES = 1_048_576;
 
 const MAX_RAW_METADATA_LENGTH = 20_000;

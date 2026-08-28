@@ -28,7 +28,7 @@ interface TelegramConfig {
   readonly chatId: string;
 }
 
-export const TELEGRAM_PHOTO_TIMEOUT_MS = 3_000;
+export const TELEGRAM_PHOTO_TIMEOUT_MS = 8_000;
 
 function validPhotoSizeReceipt(value: unknown): boolean {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
