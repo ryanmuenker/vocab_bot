@@ -140,6 +140,15 @@ describe("visual enrichment policy", () => {
       query: "carved object",
       description: "A small carved object.",
     })).toBeNull();
+    expect(validateVisualIntent("scalpel", [{
+      ...neutralObjectSense[0]!,
+      definition: "A small sharp knife used by a surgeon.",
+    }], {
+      sense_index: 0,
+      category: "object",
+      query: "scalpel tool",
+      description: "A scalpel object tool.",
+    })).toBeNull();
     expect(validateVisualIntent("token", neutralObjectSense, {
       sense_index: 0,
       category: "object",

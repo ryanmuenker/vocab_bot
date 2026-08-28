@@ -239,6 +239,16 @@ describe("WikimediaAdapter", () => {
           Copyrighted: "False",
         },
       }),
+      page({
+        metadata: {
+          Artist: "Waldemar Jan",
+          Credit: "Flower",
+          LicenseShortName: "CC0",
+          LicenseUrl: "http://creativecommons.org/publicdomain/zero/1.0/deed.en",
+          UsageTerms: "Creative Commons Zero, Public Domain Dedication",
+          Copyrighted: "True",
+        },
+      }),
     ];
     for (const candidatePage of accepted) {
       vi.stubGlobal("fetch", vi.fn().mockResolvedValue(apiResponse([candidatePage])));

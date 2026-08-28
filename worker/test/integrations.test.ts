@@ -64,6 +64,37 @@ describe("OpenCodeAdapter", () => {
     });
   });
 
+  it("remaps visual sense indexes after duplicate senses are removed", () => {
+    const result = parseDefinitionResponse(JSON.stringify({
+      senses: [
+        {
+          part_of_speech: "noun",
+          definition: "A flowering plant with daisy-like blossoms.",
+          example_sentence: "The asters bloomed in autumn.",
+        },
+        {
+          part_of_speech: "NOUN",
+          definition: "A FLOWERING PLANT WITH DAISY-LIKE BLOSSOMS.",
+          example_sentence: "Duplicate wording.",
+        },
+        {
+          part_of_speech: "noun",
+          definition: "A flowering plant with star-shaped purple blossoms.",
+          example_sentence: "Purple asters lined the garden path.",
+        },
+      ],
+      visual: {
+        sense_index: 2,
+        category: "plant",
+        query: "purple aster flowering plant",
+        description: "A purple aster flowering plant.",
+      },
+    }), "aster");
+
+    expect(result.cards).toHaveLength(2);
+    expect(result.visualIntent).toMatchObject({ senseIndex: 1, category: "plant" });
+  });
+
   it("parses one sense-grounded Doric visual intent and keeps aster eligible", () => {
     const doric = parseDefinitionResponse(JSON.stringify({
       senses: [{

@@ -97,7 +97,7 @@ interface LicensePolicy {
   readonly name: string;
   readonly url: string | null;
   readonly usageTerms: Readonly<Record<string, true>>;
-  readonly copyrighted: "true" | "false";
+  readonly copyrighted: Readonly<Partial<Record<"true" | "false", true>>>;
   readonly attributionRequired: boolean;
 }
 
@@ -137,18 +137,31 @@ const LICENSE_POLICIES: Readonly<Record<string, LicensePolicy>> = {
     "creative commons attribution share alike 4 0",
     "creative commons attribution sharealike 4 0",
   ]),
+  cc0: {
+    name: "CC0 1.0",
+    url: "https://creativecommons.org/publicdomain/zero/1.0/",
+    usageTerms: {
+      "creative commons zero public domain dedication": true,
+      "creative commons cc0 waiver": true,
+    },
+    copyrighted: { true: true, false: true },
+    attributionRequired: false,
+  },
   "cc0 1 0": {
     name: "CC0 1.0",
     url: "https://creativecommons.org/publicdomain/zero/1.0/",
-    usageTerms: { "cc0 1 0 universal public domain dedication": true, "creative commons cc0 waiver": true },
-    copyrighted: "false",
+    usageTerms: {
+      "cc0 1 0 universal public domain dedication": true,
+      "creative commons cc0 waiver": true,
+    },
+    copyrighted: { true: true, false: true },
     attributionRequired: false,
   },
   "public domain": {
     name: "Public domain",
     url: null,
     usageTerms: { "public domain": true },
-    copyrighted: "false",
+    copyrighted: { false: true },
     attributionRequired: false,
   },
 };
@@ -163,7 +176,7 @@ function creativeCommonsPolicy(
     name,
     url: `https://creativecommons.org/licenses/${path}/${version}/`,
     usageTerms: Object.fromEntries(usageTerms.map((term) => [term, true])),
-    copyrighted: "true",
+    copyrighted: { true: true },
     attributionRequired: true,
   };
 }
@@ -374,7 +387,7 @@ function validateMappedLicenseUrl(value: string, canonicalUrl: string): boolean 
     return false;
   }
   if (
-    url.protocol !== "https:" ||
+    (url.protocol !== "https:" && url.protocol !== "http:") ||
     url.hostname !== "creativecommons.org" ||
     url.username.length > 0 ||
     url.password.length > 0 ||
@@ -382,6 +395,12 @@ function validateMappedLicenseUrl(value: string, canonicalUrl: string): boolean 
     url.search.length > 0 ||
     url.hash.length > 0
   ) return false;
+  if (
+    canonicalUrl === "https://creativecommons.org/publicdomain/zero/1.0/" &&
+    url.protocol === "http:" &&
+    url.pathname === "/publicdomain/zero/1.0/deed.en"
+  ) return true;
+  if (url.protocol !== "https:") return false;
   const normalized = `${url.origin}${url.pathname.replace(/\/*$/u, "/")}`;
   return normalized === canonicalUrl;
 }
@@ -403,10 +422,12 @@ function parseAttribution(metadata: Record<string, unknown>): AttributionMetadat
   ) return null;
 
   const license = LICENSE_POLICIES[normalizeLicenseText(licenseNameField.value)];
+  const copyrighted = normalizeLicenseText(copyrightedField.value);
   if (
     license === undefined ||
     !Object.hasOwn(license.usageTerms, normalizeLicenseText(usageTermsField.value)) ||
-    normalizeLicenseText(copyrightedField.value) !== license.copyrighted
+    (copyrighted !== "true" && copyrighted !== "false") ||
+    !Object.hasOwn(license.copyrighted, copyrighted)
   ) return null;
 
   if (licenseUrlField === null) return null;

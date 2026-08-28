@@ -110,6 +110,17 @@ function responsesContent(payload: Record<string, unknown>): string | null {
   return null;
 }
 
+function remapVisualSenseIndex(candidate: unknown, senseIndexes: readonly number[]): unknown {
+  const value = object(candidate);
+  if (
+    value === null ||
+    typeof value.sense_index !== "number" ||
+    !Number.isInteger(value.sense_index)
+  ) return candidate;
+  const mapped = senseIndexes[value.sense_index];
+  return mapped === undefined ? candidate : { ...value, sense_index: mapped };
+}
+
 export function parseDefinitionResponse(text: unknown, displayText: string): DefinitionResult {
   if (typeof text !== "string") {
     return { status: DefinitionStatus.INVALID_RESPONSE, cards: [], visualIntent: null };
@@ -158,20 +169,30 @@ export function parseDefinitionResponse(text: unknown, displayText: string): Def
     validated.push(card);
   }
   const cards: SenseCard[] = [];
-  const seen = new Set<string>();
+  const indexByIdentity = new Map<string, number>();
+  const senseIndexes: number[] = [];
   for (const card of validated) {
     const [partOfSpeech, definition] = normalizeSenseIdentity(card.partOfSpeech, card.definition);
     const identity = `${partOfSpeech.length}:${partOfSpeech}${definition}`;
-    if (!seen.has(identity)) {
-      seen.add(identity);
-      cards.push(card);
+    const existingIndex = indexByIdentity.get(identity);
+    if (existingIndex !== undefined) {
+      senseIndexes.push(existingIndex);
+      continue;
     }
+    const index = cards.length;
+    indexByIdentity.set(identity, index);
+    senseIndexes.push(index);
+    cards.push(card);
   }
   return {
     status: DefinitionStatus.FOUND,
     cards,
     visualIntent: Object.hasOwn(payload, "visual")
-      ? validateVisualIntent(displayText, cards, payload.visual)
+      ? validateVisualIntent(
+        displayText,
+        cards,
+        remapVisualSenseIndex(payload.visual, senseIndexes),
+      )
       : null,
   };
 }

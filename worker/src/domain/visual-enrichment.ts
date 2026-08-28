@@ -70,6 +70,14 @@ const BLOCKED_CLASS_MARKERS: Record<BlockedClass, readonly string[]> = {
   ],
 };
 
+const BLOCKED_TOKEN_PREFIXES = [
+  "medic", "anatom", "patholog", "diagnos", "symptom", "infect", "lesion",
+  "genital", "peni", "vagin", "vulv", "uter", "testicul", "rectal",
+  "clinic", "hospital", "physician", "surgeon", "surg", "incis", "excis",
+  "amput", "cathet", "scalpel", "syring", "inject", "biops", "endoscop",
+  "injur", "wound", "trauma", "fractur", "bleed", "blood", "corpse",
+] as const;
+
 const CATEGORY_MARKERS: Record<VisualCategory, readonly string[]> = {
   [VisualCategory.PLANT]: [
     "plant", "plants", "flower", "flowers", "flowering", "tree", "trees", "shrub",
@@ -166,8 +174,17 @@ function containsMarker(text: string, markers: readonly string[]): boolean {
   return markers.some((marker) => padded.includes(` ${marker} `));
 }
 
+function containsBlockedPrefix(text: string): boolean {
+  const tokens = searchableText(text).split(" ");
+  return tokens.some((token) =>
+    BLOCKED_TOKEN_PREFIXES.some((prefix) => token.startsWith(prefix))
+  );
+}
+
 export function isSensitiveVisualText(value: string): boolean {
-  return CONTROL_CHARACTERS.test(value) || containsMarker(value, BLOCKED_MARKERS);
+  return CONTROL_CHARACTERS.test(value) ||
+    containsMarker(value, BLOCKED_MARKERS) ||
+    containsBlockedPrefix(value);
 }
 
 function categoriesIn(text: string): ReadonlySet<VisualCategory> {
