@@ -1,7 +1,7 @@
 ---
 title: "feat: Add trustworthy visual vocabulary images"
 type: feat
-status: active
+status: completed
 date: 2026-08-27
 origin: docs/brainstorms/2026-08-27-visual-vocabulary-images-requirements.md
 deepened: 2026-08-27
