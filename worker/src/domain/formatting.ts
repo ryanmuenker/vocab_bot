@@ -252,8 +252,6 @@ export function formatDirectionalTotals(
 export const TELEGRAM_PHOTO_CAPTION_LIMIT = 1024;
 
 export interface WikimediaCaptionInput {
-  readonly entryName: string;
-  readonly senseDescription: string;
   readonly imageDescription: string;
   readonly creator: string | null;
   readonly credit: string | null;
@@ -273,8 +271,7 @@ function codePointLength(value: string): number {
  */
 export function formatWikimediaCaption(input: WikimediaCaptionInput): string | null {
   if (
-    input.entryName.length === 0 ||
-    input.senseDescription.length === 0 ||
+    input.imageDescription.length === 0 ||
     input.licenseName.length === 0 ||
     input.sourceUrl.length === 0 ||
     (input.licenseUrl !== null && input.licenseUrl.length === 0)
@@ -282,7 +279,6 @@ export function formatWikimediaCaption(input: WikimediaCaptionInput): string | n
     return null;
   }
 
-  const heading = `${input.entryName} — ${input.senseDescription}`;
   const attribution: string[] = [];
   if (input.creator !== null && input.creator.length > 0) {
     attribution.push(`Creator: ${input.creator}`);
@@ -297,20 +293,17 @@ export function formatWikimediaCaption(input: WikimediaCaptionInput): string | n
     `Source: Wikimedia Commons — ${input.sourceUrl}`,
   );
 
-  const mandatory = `${heading}\n\n${attribution.join("\n")}`;
+  const mandatory = attribution.join("\n");
   const mandatoryLength = codePointLength(mandatory);
   if (mandatoryLength > TELEGRAM_PHOTO_CAPTION_LIMIT) return null;
-  if (input.imageDescription.length === 0) return mandatory;
-
-  const availableDescription =
-    TELEGRAM_PHOTO_CAPTION_LIMIT - mandatoryLength - codePointLength("\n\n");
-  if (availableDescription <= 0) return mandatory;
-  if (codePointLength(input.imageDescription) <= availableDescription) {
-    return `${heading}\n\n${input.imageDescription}\n\n${attribution.join("\n")}`;
+  if (codePointLength(input.imageDescription) <= TELEGRAM_PHOTO_CAPTION_LIMIT - mandatoryLength - codePointLength("\n\n")) {
+    return `${input.imageDescription}\n\n${attribution.join("\n")}`;
   }
-  if (availableDescription === 1) return mandatory;
 
+  const available =
+    TELEGRAM_PHOTO_CAPTION_LIMIT - mandatoryLength - codePointLength("\n\n");
+  if (available <= 1) return mandatory;
   const description =
-    `${Array.from(input.imageDescription).slice(0, availableDescription - 1).join("")}…`;
-  return `${heading}\n\n${description}\n\n${attribution.join("\n")}`;
+    `${Array.from(input.imageDescription).slice(0, available - 1).join("")}…`;
+  return `${description}\n\n${attribution.join("\n")}`;
 }

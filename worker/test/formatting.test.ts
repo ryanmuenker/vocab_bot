@@ -513,8 +513,6 @@ describe("directional totals formatting", () => {
 
 describe("Wikimedia caption formatting", () => {
   const ATTRIBUTION = {
-    entryName: "Doric",
-    senseDescription: "Relating to the Greek architectural order with plain column capitals.",
     imageDescription: "Plain columns of the Doric architectural order.",
     creator: "Jane Smith",
     credit: "Own work",
@@ -523,10 +521,9 @@ describe("Wikimedia caption formatting", () => {
     sourceUrl: "https://commons.wikimedia.org/wiki/File:Doric_columns.jpg",
   } as const;
 
-  it("names the entry and sense before complete plain-text attribution", () => {
+  it("formats image description and complete plain-text attribution without repeating the definition", () => {
     expect(formatWikimediaCaption(ATTRIBUTION)).toBe(
-      "Doric — Relating to the Greek architectural order with plain column capitals.\n\n" +
-        "Plain columns of the Doric architectural order.\n\n" +
+      "Plain columns of the Doric architectural order.\n\n" +
         "Creator: Jane Smith\n" +
         "Credit: Own work\n" +
         "License: CC BY-SA 4.0 — https://creativecommons.org/licenses/by-sa/4.0/\n" +

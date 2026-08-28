@@ -93,7 +93,6 @@ describe("WikimediaAdapter", () => {
       photoUrl:
         "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a2/Doric_columns.jpg/1280px-Doric_columns.jpg",
       caption:
-        "Doric — Relating to the Greek architectural order with plain column capitals.\n\n" +
         "Plain columns of the Doric architectural order.\n\n" +
         "Creator: Jane Smith\n" +
         "Credit: Own work\n" +

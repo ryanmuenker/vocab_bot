@@ -674,7 +674,7 @@ describe("VocabularyCompanion optional photo delivery", () => {
       photo:
         "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a2/Street_object.jpg/1280px-Street_object.jpg",
       caption: expect.stringMatching(
-        /^Street — an object beside a street\n\n[\s\S]*License: CC BY-SA 4\.0[\s\S]*Source: Wikimedia Commons/u,
+        /^An object beside a paved street\.\n\n[\s\S]*License: CC BY-SA 4\.0[\s\S]*Source: Wikimedia Commons/u,
       ),
     });
 
@@ -811,7 +811,7 @@ describe("VocabularyCompanion optional photo delivery", () => {
     await stub.enqueueTelegramUpdate(message(2, "Avenue"));
     await drain(stub);
     expect(io.sent).toHaveLength(2);
-    expect(io.photos[0]!.caption).toMatch(/^Street — an object beside a street/u);
+    expect(io.photos[0]!.caption).toMatch(/^An object beside a paved street\./u);
   });
 
   it("does not replay optional work after completed-state eviction", async () => {

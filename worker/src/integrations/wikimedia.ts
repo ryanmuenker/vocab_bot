@@ -554,8 +554,6 @@ function parseCandidate(
   const attribution = parseAttribution(metadata);
   if (attribution === null) return null;
   const caption = formatWikimediaCaption({
-    entryName: request.displayText,
-    senseDescription: request.sense.definition,
     imageDescription: request.intent.description,
     creator: attribution.creator,
     credit: attribution.credit,
