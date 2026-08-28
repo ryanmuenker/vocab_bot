@@ -257,11 +257,6 @@ export function validateVisualIntent(
   }
 
   const referencedSense = senses[value.sense_index]!;
-  const referencedCategories = categoriesIn(
-    `${referencedSense.partOfSpeech} ${referencedSense.definition} ${referencedSense.exampleSentence}`,
-  );
-  const descriptorCategories = categoriesIn(`${query} ${description}`);
-  if (!referencedCategories.has(category) || !descriptorCategories.has(category)) return null;
   for (let index = 0; index < senses.length; index += 1) {
     if (index === value.sense_index) continue;
     const competingSense = senses[index]!;
