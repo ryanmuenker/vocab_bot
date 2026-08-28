@@ -248,6 +248,14 @@ describe("WikimediaAdapter", () => {
           Copyrighted: "True",
         },
       }),
+      page({
+        metadata: {
+          LicenseShortName: "CC BY-SA 3.0",
+          LicenseUrl: "http://creativecommons.org/licenses/by-sa/3.0/",
+          UsageTerms: "Creative Commons Attribution-Share Alike 3.0",
+          Copyrighted: "True",
+        },
+      }),
     ];
     for (const candidatePage of accepted) {
       vi.stubGlobal("fetch", vi.fn().mockResolvedValue(apiResponse([candidatePage])));
@@ -260,6 +268,11 @@ describe("WikimediaAdapter", () => {
       { LicenseShortName: "All rights reserved", LicenseUrl: null },
       { LicenseShortName: "CC BY 4.0", LicenseUrl: "https://example.test/license" },
       { LicenseShortName: "CC BY 4.0", LicenseUrl: "https://creativecommons.org/licenses/by-sa/4.0/" },
+      {
+        LicenseShortName: "CC BY-SA 3.0",
+        LicenseUrl: "http://creativecommons.org/licenses/by-sa/3.0/deed.en",
+        UsageTerms: "Creative Commons Attribution-Share Alike 3.0",
+      },
       { Artist: null, Credit: null },
       { Restrictions: "Editorial use only" },
     ];

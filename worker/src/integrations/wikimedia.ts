@@ -381,14 +381,16 @@ function rawMetadataValue(
 
 function validateMappedLicenseUrl(value: string, canonicalUrl: string): boolean {
   let url: URL;
+  let canonical: URL;
   try {
     url = new URL(value);
+    canonical = new URL(canonicalUrl);
   } catch {
     return false;
   }
   if (
     (url.protocol !== "https:" && url.protocol !== "http:") ||
-    url.hostname !== "creativecommons.org" ||
+    url.hostname !== canonical.hostname ||
     url.username.length > 0 ||
     url.password.length > 0 ||
     url.port.length > 0 ||
@@ -400,9 +402,7 @@ function validateMappedLicenseUrl(value: string, canonicalUrl: string): boolean 
     url.protocol === "http:" &&
     url.pathname === "/publicdomain/zero/1.0/deed.en"
   ) return true;
-  if (url.protocol !== "https:") return false;
-  const normalized = `${url.origin}${url.pathname.replace(/\/*$/u, "/")}`;
-  return normalized === canonicalUrl;
+  return url.pathname.replace(/\/*$/u, "/") === canonical.pathname.replace(/\/*$/u, "/");
 }
 
 function parseAttribution(metadata: Record<string, unknown>): AttributionMetadata | null {
