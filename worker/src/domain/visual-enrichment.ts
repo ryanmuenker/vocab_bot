@@ -83,7 +83,8 @@ const BLOCKED_TOKEN_PREFIXES = [
 const CATEGORY_MARKERS: Record<VisualCategory, readonly string[]> = {
   [VisualCategory.PLANT]: [
     "plant", "plants", "flower", "flowers", "flowering", "tree", "trees", "shrub",
-    "shrubs", "herb", "herbs", "botanical", "botany",
+    "shrubs", "herb", "herbs", "botanical", "botany", "genus", "species",
+    "perennial", "wildflower", "wildflowers", "blossom", "blossoms",
   ],
   [VisualCategory.ANIMAL]: [
     "animal", "animals", "bird", "birds", "mammal", "mammals", "fish", "insect",
@@ -91,7 +92,9 @@ const CATEGORY_MARKERS: Record<VisualCategory, readonly string[]> = {
   ],
   [VisualCategory.ARCHITECTURE]: [
     "architecture", "architectural", "building", "buildings", "column", "columns",
-    "colonnade", "arch", "arches", "temple", "temples", "facade",
+    "colonnade", "arch", "arches", "temple", "temples", "facade", "tower", "towers",
+    "bell tower", "church", "cathedral", "dome", "roof", "structure", "structural",
+    "monument",
   ],
   [VisualCategory.OBJECT]: [
     "object", "objects", "tool", "tools", "machine", "machines", "device", "devices",

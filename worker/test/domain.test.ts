@@ -244,6 +244,29 @@ describe("visual enrichment policy", () => {
       JSON.stringify({ ...intent, extra: true }),
     )).toBeNull();
   });
+
+  it("recognizes common plant and tower language for visual categories", () => {
+    expect(validateVisualIntent("fleabane", [{
+      partOfSpeech: "noun",
+      definition: "A perennial species with daisy-like blossoms.",
+      exampleSentence: "Fleabane grew beside the meadow.",
+    }], {
+      sense_index: 0,
+      category: "plant",
+      query: "fleabane perennial wildflower",
+      description: "A flowering fleabane plant.",
+    })).not.toBeNull();
+    expect(validateVisualIntent("campanile", [{
+      partOfSpeech: "noun",
+      definition: "A bell tower standing separately from a church building.",
+      exampleSentence: "The medieval campanile dominates the square.",
+    }], {
+      sense_index: 0,
+      category: "architecture",
+      query: "campanile bell tower",
+      description: "A freestanding campanile bell tower.",
+    })).not.toBeNull();
+  });
 });
 
 describe("Python-compatible vocabulary identity", () => {

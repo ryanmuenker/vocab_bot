@@ -258,7 +258,7 @@ describe("OpenCodeAdapter", () => {
     expect(body.messages[0]!.content).toContain("semantically distinct");
     expect(body.messages[0]!.content).toContain("sense_index");
     expect(body.messages[0]!.content).toContain("medical/anatomy");
-    expect(body.messages[0]!.content).toContain("Omit visual");
+    expect(body.messages[0]!.content).toContain("Set visual to null");
   });
 
   it("uses the Responses API required by GPT 5.6 Luna", async () => {

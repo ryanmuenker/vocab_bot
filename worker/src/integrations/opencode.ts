@@ -54,14 +54,17 @@ const DEFINITION_SYSTEM_PROMPT =
   "Exclude hyper-specialized jargon and do not split mere wording variants into separate " +
   "senses. Each sense must contain exactly part_of_speech, definition, and example_sentence. " +
   "Definitions must be concise and examples must demonstrate that sense. " +
-  "Optionally include visual with exactly sense_index, category, query, and description " +
-  "only when one zero-based sense_index is the clear dominant visual referent. Category " +
-  "must be exactly plant, animal, architecture, object, material, place, garment, food, " +
-  "vehicle, instrument, landform, or visual style. Query must be a short literal Commons " +
-  "search phrase grounded in that sense, and description must concisely describe the image. " +
-  "Omit visual for competing unrelated senses, low confidence, or medical/anatomy, sexual, " +
-  "gore, injury, procedure, person/social-role, action, event, emotion, or abstract topics. " +
-  "If the entry is not an English term or expression, return exactly {\"status\":\"not_found\"}.";
+  "Every defined entry response must contain exactly two top-level keys: senses and visual. " +
+  "Set visual to null unless one sense is a clear dominant visual referent. When multiple " +
+  "senses describe the same visual family, use the earliest/common sense. Otherwise visual " +
+  "must contain exactly sense_index, category, query, and description. sense_index is " +
+  "zero-based. Category must be exactly plant, animal, architecture, object, material, " +
+  "place, garment, food, vehicle, instrument, landform, or visual style. Query must be a " +
+  "short literal Commons search phrase grounded in that sense, and description must " +
+  "concisely describe the image. Set visual to null for competing unrelated senses, low " +
+  "confidence, or medical/anatomy, sexual, gore, injury, procedure, person/social-role, " +
+  "action, event, emotion, or abstract topics. If the entry is not an English term or " +
+  "expression, return exactly {\"status\":\"not_found\"}.";
 
 const EVALUATION_SYSTEM_PROMPT =
   "You evaluate an English vocabulary learner's answer against stored senses. " +
