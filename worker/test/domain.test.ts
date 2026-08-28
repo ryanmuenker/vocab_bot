@@ -149,6 +149,12 @@ describe("visual enrichment policy", () => {
       query: "scalpel tool",
       description: "A scalpel object tool.",
     })).toBeNull();
+    expect(validateVisualIntent("porn", neutralObjectSense, {
+      sense_index: 0,
+      category: "object",
+      query: "adult visual media",
+      description: "A sexually explicit visual object.",
+    })).toBeNull();
     expect(validateVisualIntent("token", neutralObjectSense, {
       sense_index: 0,
       category: "object",

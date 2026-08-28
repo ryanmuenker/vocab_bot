@@ -41,8 +41,9 @@ const BLOCKED_CLASS_MARKERS: Record<BlockedClass, readonly string[]> = {
     "rectum", "rectal", "anus",
   ],
   sexual: [
-    "sex", "sexual", "sexuality", "intercourse", "erotic", "pornography",
-    "pornographic", "nude", "nudity", "naked", "masturbation", "orgasm",
+    "sex", "sexual", "sexuality", "sexually", "intercourse", "erotic", "porn",
+    "pornography", "pornographic", "nude", "nudity", "naked", "masturbation",
+    "orgasm", "adult content", "adult media", "sexually explicit",
   ],
   gore: [
     "gore", "gory", "gruesome", "corpse", "carcass", "dismembered", "severed",
@@ -75,6 +76,7 @@ const BLOCKED_TOKEN_PREFIXES = [
   "genital", "peni", "vagin", "vulv", "uter", "testicul", "rectal",
   "clinic", "hospital", "physician", "surgeon", "surg", "incis", "excis",
   "amput", "cathet", "scalpel", "syring", "inject", "biops", "endoscop",
+  "sex", "porn", "erotic", "nud", "masturb", "orgasm",
   "injur", "wound", "trauma", "fractur", "bleed", "blood", "corpse",
 ] as const;
 
