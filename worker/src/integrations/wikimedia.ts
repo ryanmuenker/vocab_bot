@@ -34,6 +34,10 @@ const ALLOWED_WIKIMEDIA_TRACKING_PARAMETERS: Readonly<Record<string, true>> = {
   utm_campaign: true,
   utm_content: true,
 };
+const ALLOWED_WIKIMEDIA_MEDIA_HOSTS: Readonly<Record<string, true>> = {
+  "upload.wikimedia.org": true,
+  "thumb.wikimedia.org": true,
+};
 const STOP_WORDS: Readonly<Record<string, true>> = {
   a: true,
   an: true,
@@ -467,14 +471,14 @@ function validQuery(request: WikimediaLookupRequest): boolean {
   ].every((text) => !isSensitiveVisualText(text));
 }
 
-function validateHttpsAuthority(value: string, hostname: string): URL | null {
+function validateHttpsUrl(value: string): URL | null {
   let url: URL;
   try {
     url = new URL(value);
   } catch {
     return null;
   }
-  return url.protocol === "https:" && url.hostname === hostname &&
+  return url.protocol === "https:" &&
       url.username.length === 0 && url.password.length === 0 && url.port.length === 0
     ? url
     : null;
@@ -482,10 +486,13 @@ function validateHttpsAuthority(value: string, hostname: string): URL | null {
 
 function validatePhotoUrl(value: unknown): string | null {
   if (typeof value !== "string") return null;
-  const url = validateHttpsAuthority(value, "upload.wikimedia.org");
-  if (url === null || !url.pathname.startsWith("/wikipedia/commons/") || url.hash.length > 0) {
-    return null;
-  }
+  const url = validateHttpsUrl(value);
+  if (
+    url === null ||
+    !Object.hasOwn(ALLOWED_WIKIMEDIA_MEDIA_HOSTS, url.hostname) ||
+    !url.pathname.startsWith("/wikipedia/commons/") ||
+    url.hash.length > 0
+  ) return null;
   let supportedParameters = true;
   url.searchParams.forEach((_value, key) => {
     if (!Object.hasOwn(ALLOWED_WIKIMEDIA_TRACKING_PARAMETERS, key)) supportedParameters = false;
@@ -497,8 +504,9 @@ function validatePhotoUrl(value: unknown): string | null {
 
 function validateSourceUrl(value: unknown, title: string): string | null {
   if (typeof value !== "string") return null;
-  const url = validateHttpsAuthority(value, "commons.wikimedia.org");
-  if (url === null || url.search.length > 0 || url.hash.length > 0 ||
+  const url = validateHttpsUrl(value);
+  if (url === null || url.hostname !== "commons.wikimedia.org" ||
+      url.search.length > 0 || url.hash.length > 0 ||
       !url.pathname.startsWith("/wiki/")) return null;
   let sourceTitle: string;
   try {

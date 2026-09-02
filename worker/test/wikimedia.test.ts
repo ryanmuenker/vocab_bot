@@ -102,10 +102,10 @@ describe("WikimediaAdapter", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
-  it("strips Wikimedia tracking parameters from live thumbnail URLs", async () => {
+  it("accepts the official thumbnail host and strips Wikimedia tracking parameters", async () => {
     const fetchMock = vi.fn().mockResolvedValue(apiResponse([page({
       photoUrl:
-        "https://upload.wikimedia.org/wikipedia/commons/1/16/DoricParthenon.jpg" +
+        "https://thumb.wikimedia.org/wikipedia/commons/1/16/DoricParthenon.jpg" +
         "?utm_source=commons.wikimedia.org&utm_campaign=imageinfo&utm_content=thumbnail_unscaled",
     })]));
     vi.stubGlobal("fetch", fetchMock);
@@ -113,7 +113,7 @@ describe("WikimediaAdapter", () => {
     const candidate = await new WikimediaAdapter().findPhoto(LOOKUP);
 
     expect(candidate?.photoUrl).toBe(
-      "https://upload.wikimedia.org/wikipedia/commons/1/16/DoricParthenon.jpg",
+      "https://thumb.wikimedia.org/wikipedia/commons/1/16/DoricParthenon.jpg",
     );
   });
 
@@ -208,11 +208,42 @@ describe("WikimediaAdapter", () => {
     const invalid: readonly PageOptions[] = [
       { photoUrl: "http://upload.wikimedia.org/wikipedia/commons/a/a2/Doric.jpg" },
       { photoUrl: "https://evil.test/Doric.jpg" },
+      {
+        photoUrl:
+          "https://thumb.wikimedia.org.evil.test/wikipedia/commons/a/a2/Doric.jpg",
+      },
       { photoUrl: "https://user:pass@upload.wikimedia.org/wikipedia/commons/a/a2/Doric.jpg" },
       { photoUrl: "https://upload.wikimedia.org:8443/wikipedia/commons/a/a2/Doric.jpg" },
       { photoUrl: "https://192.0.2.1/Doric.jpg" },
+      { photoUrl: "https://upload.wikimedia.org/not-commons/Doric.jpg" },
+      {
+        photoUrl:
+          "https://thumb.wikimedia.org/wikipedia/commons/a/a2/Doric.jpg?download=1",
+      },
+      {
+        photoUrl:
+          "https://thumb.wikimedia.org/wikipedia/commons/a/a2/Doric.jpg#fragment",
+      },
       { sourceUrl: "https://en.wikipedia.org/wiki/File:Doric_columns.jpg" },
       { sourceUrl: "https://commons.wikimedia.org:444/wiki/File:Doric_columns.jpg" },
+      { sourceUrl: "http://commons.wikimedia.org/wiki/File:Doric_columns.jpg" },
+      {
+        sourceUrl:
+          "https://user:pass@commons.wikimedia.org/wiki/File:Doric_columns.jpg",
+      },
+      { sourceUrl: "https://meta.wikimedia.org/wiki/File:Doric_columns.jpg" },
+      {
+        sourceUrl:
+          "https://commons.wikimedia.org.evil.test/wiki/File:Doric_columns.jpg",
+      },
+      {
+        sourceUrl:
+          "https://commons.wikimedia.org/wiki/File:Doric_columns.jpg?oldid=1",
+      },
+      {
+        sourceUrl:
+          "https://commons.wikimedia.org/wiki/File:Doric_columns.jpg#section",
+      },
       { sourceUrl: "https://commons.wikimedia.org/wiki/File:Different.jpg" },
       { sourceUrl: "not a URL" },
     ];
