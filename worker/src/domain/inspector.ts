@@ -1,3 +1,8 @@
+import {
+  ImageBackfillStatus,
+  type ImageBackfillStatus as ImageBackfillStatusValue,
+} from "./models";
+
 export const MEMORIZED_STABILITY_DAYS = 30;
 
 export type InspectorStatus = "unseen" | "learning" | "memorized";
@@ -46,6 +51,13 @@ export interface InspectorEntry {
   readonly recentAttempts: readonly InspectorAttempt[];
 }
 
+export interface InspectorImageSummary {
+  readonly associated: number;
+  readonly telegramCached: number;
+  readonly unresolvedCandidates: number;
+  readonly backfillFailures: Readonly<Record<ImageBackfillStatusValue, number>>;
+}
+
 export interface InspectorData {
   readonly generatedAt: string;
   readonly memorizedStabilityDays: number;
@@ -56,6 +68,7 @@ export interface InspectorData {
     readonly memorized: number;
     readonly due: number;
   };
+  readonly images: InspectorImageSummary;
   readonly entries: readonly InspectorEntry[];
 }
 
@@ -100,6 +113,17 @@ interface AttemptRow extends SqlRow {
   rating: "again" | "hard" | "good" | "easy";
   evaluator_grade: "correct" | "partial" | "incorrect" | null;
   reviewed_at: string;
+}
+
+interface ImageAssociationSummaryRow extends SqlRow {
+  associated: number;
+  telegram_cached: number;
+  unresolved_candidates: number;
+}
+
+interface ImageBackfillFailureRow extends SqlRow {
+  status: ImageBackfillStatusValue;
+  count: number;
 }
 
 function grouped<T extends { readonly entry_id: number }>(rows: Iterable<T>): Map<number, T[]> {
@@ -147,6 +171,28 @@ export function readInspectorData(
       WHERE entry_rank <= 3
       ORDER BY entry_id, reviewed_at DESC, id DESC`,
   ));
+  const imageAssociationSummary = Array.from(
+    storage.sql.exec<ImageAssociationSummaryRow>(
+      `SELECT COUNT(*) AS associated,
+              COUNT(telegram_file_id) AS telegram_cached,
+              COUNT(CASE WHEN photo_url IS NULL THEN 1 END) AS unresolved_candidates
+         FROM vocabulary_entry_images`,
+    ),
+  )[0]!;
+  const backfillFailures: Record<ImageBackfillStatusValue, number> = {
+    [ImageBackfillStatus.NO_VISUAL]: 0,
+    [ImageBackfillStatus.PROVIDER_ERROR]: 0,
+    [ImageBackfillStatus.RATE_LIMITED]: 0,
+    [ImageBackfillStatus.INVALID_RESPONSE]: 0,
+    [ImageBackfillStatus.IMAGE_UNAVAILABLE]: 0,
+  };
+  for (const row of storage.sql.exec<ImageBackfillFailureRow>(
+    `SELECT status, COUNT(*) AS count
+       FROM image_backfill_attempts
+      GROUP BY status`,
+  )) {
+    backfillFailures[row.status] = row.count;
+  }
 
   const nowTimestamp = Date.parse(nowUtc);
   const summary = { total: entryRows.length, unseen: 0, learning: 0, memorized: 0, due: 0 };
@@ -215,6 +261,12 @@ export function readInspectorData(
     generatedAt: nowUtc,
     memorizedStabilityDays: MEMORIZED_STABILITY_DAYS,
     summary,
+    images: {
+      associated: imageAssociationSummary.associated,
+      telegramCached: imageAssociationSummary.telegram_cached,
+      unresolvedCandidates: imageAssociationSummary.unresolved_candidates,
+      backfillFailures,
+    },
     entries,
   };
 }

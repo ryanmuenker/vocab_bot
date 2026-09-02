@@ -21,6 +21,21 @@ export interface DefinitionResult {
   readonly visualIntent: VisualIntent | null;
 }
 
+export const VisualSelectionStatus = {
+  FOUND: "found",
+  NO_VISUAL: "no_visual",
+  INVALID_RESPONSE: "invalid_response",
+  PROVIDER_ERROR: "provider_error",
+  RATE_LIMITED: "rate_limited",
+} as const;
+export type VisualSelectionStatus = (
+  typeof VisualSelectionStatus
+)[keyof typeof VisualSelectionStatus];
+export interface VisualSelectionResult {
+  readonly status: VisualSelectionStatus;
+  readonly visualIntent: VisualIntent | null;
+}
+
 export const EvaluationStatus = {
   VALID: "valid",
   INVALID_RESPONSE: "invalid_response",
@@ -65,6 +80,18 @@ const DEFINITION_SYSTEM_PROMPT =
   "confidence, or medical/anatomy, sexual, gore, injury, procedure, person/social-role, " +
   "action, event, emotion, or abstract topics. If the entry is not an English term or " +
   "expression, return exactly {\"status\":\"not_found\"}.";
+
+const VISUAL_SELECTION_SYSTEM_PROMPT =
+  "You select one safe, durable visual association for an existing English vocabulary entry. " +
+  "Return JSON only with exactly one top-level key: visual. Set visual to null unless one stored " +
+  "sense is a clear dominant visual referent. When multiple senses describe the same visual " +
+  "family, use the earliest/common sense. Otherwise visual must contain exactly sense_index, " +
+  "category, query, and description. sense_index is zero-based. Category must be exactly plant, " +
+  "animal, architecture, object, material, place, garment, food, vehicle, instrument, landform, " +
+  "or visual style. Query must be a short literal Commons search phrase grounded in that sense, " +
+  "and description must concisely describe the image. Set visual to null for competing unrelated " +
+  "senses, low confidence, or medical/anatomy, sexual, gore, injury, procedure, " +
+  "person/social-role, action, event, emotion, or abstract topics.";
 
 const EVALUATION_SYSTEM_PROMPT =
   "You evaluate an English vocabulary learner's answer against stored senses. " +
@@ -200,6 +227,32 @@ export function parseDefinitionResponse(text: unknown, displayText: string): Def
   };
 }
 
+export function parseVisualSelectionResponse(
+  text: unknown,
+  entry: VocabularyEntry,
+): VisualSelectionResult {
+  if (typeof text !== "string") {
+    return { status: VisualSelectionStatus.INVALID_RESPONSE, visualIntent: null };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { status: VisualSelectionStatus.INVALID_RESPONSE, visualIntent: null };
+  }
+  const payload = object(parsed);
+  if (payload === null || !exactKeys(payload, ["visual"])) {
+    return { status: VisualSelectionStatus.INVALID_RESPONSE, visualIntent: null };
+  }
+  if (payload.visual === null) {
+    return { status: VisualSelectionStatus.NO_VISUAL, visualIntent: null };
+  }
+  const visualIntent = validateVisualIntent(entry.displayText, entry.senses, payload.visual);
+  return visualIntent === null
+    ? { status: VisualSelectionStatus.INVALID_RESPONSE, visualIntent: null }
+    : { status: VisualSelectionStatus.FOUND, visualIntent };
+}
+
 export function parseEvaluationResponse(text: unknown): EvaluationResult {
   if (typeof text !== "string") return { status: EvaluationStatus.INVALID_RESPONSE, evaluation: null };
   let parsed: unknown;
@@ -257,6 +310,32 @@ export class OpenCodeAdapter {
       });
     }
     return result;
+  }
+
+  async selectVisual(entry: VocabularyEntry): Promise<VisualSelectionResult> {
+    const content = await this.chat(
+      [
+        { role: "system", content: VISUAL_SELECTION_SYSTEM_PROMPT },
+        {
+          role: "user",
+          content: JSON.stringify({
+            display_text: entry.displayText,
+            senses: entry.senses.map((sense) => ({
+              part_of_speech: sense.partOfSpeech,
+              definition: sense.definition,
+              example_sentence: sense.exampleSentence,
+            })),
+          }),
+        },
+      ],
+      1_000,
+    );
+    if (content.kind === "rate_limited") {
+      return { status: VisualSelectionStatus.RATE_LIMITED, visualIntent: null };
+    }
+    return content.kind === "provider_error"
+      ? { status: VisualSelectionStatus.PROVIDER_ERROR, visualIntent: null }
+      : parseVisualSelectionResponse(content.content, entry);
   }
 
   async evaluateAnswer(entry: VocabularyEntry, answerText: string): Promise<EvaluationResult> {

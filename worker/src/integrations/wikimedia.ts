@@ -90,6 +90,7 @@ export interface WikimediaLookupRequest {
 export interface WikimediaPhotoCandidate {
   readonly photoUrl: string;
   readonly caption: string;
+  readonly sourceUrl: string;
 }
 
 interface CanonicalMetadata {
@@ -569,7 +570,7 @@ function parseCandidate(
     licenseUrl: attribution.licenseUrl,
     sourceUrl,
   });
-  return caption === null ? null : { photoUrl, caption };
+  return caption === null ? null : { photoUrl, caption, sourceUrl };
 }
 
 function buildRequestUrl(query: string): string {

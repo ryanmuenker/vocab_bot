@@ -30,23 +30,38 @@ interface TelegramConfig {
 
 export const TELEGRAM_PHOTO_TIMEOUT_MS = 8_000;
 
-function validPhotoSizeReceipt(value: unknown): boolean {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+export interface TelegramPhotoReceipt {
+  readonly messageId: number;
+  readonly fileId: string;
+  readonly fileUniqueId: string;
+}
+
+interface TelegramPhotoSizeReceipt {
+  readonly file_id: string;
+  readonly file_unique_id: string;
+  readonly width: number;
+  readonly height: number;
+  readonly file_size?: number;
+}
+
+function photoSizeReceipt(value: unknown): TelegramPhotoSizeReceipt | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
   const photo = value as Record<string, unknown>;
-  return (
-    typeof photo.file_id === "string" &&
-    photo.file_id.length > 0 &&
-    typeof photo.file_unique_id === "string" &&
-    photo.file_unique_id.length > 0 &&
-    Number.isSafeInteger(photo.width) &&
-    (photo.width as number) > 0 &&
-    Number.isSafeInteger(photo.height) &&
-    (photo.height as number) > 0 &&
+  if (
+    typeof photo.file_id !== "string" ||
+    photo.file_id.length === 0 ||
+    typeof photo.file_unique_id !== "string" ||
+    photo.file_unique_id.length === 0 ||
+    !Number.isSafeInteger(photo.width) ||
+    (photo.width as number) <= 0 ||
+    !Number.isSafeInteger(photo.height) ||
+    (photo.height as number) <= 0 ||
     (
-      photo.file_size === undefined ||
-      (Number.isSafeInteger(photo.file_size) && (photo.file_size as number) >= 0)
+      photo.file_size !== undefined &&
+      (!Number.isSafeInteger(photo.file_size) || (photo.file_size as number) < 0)
     )
-  );
+  ) return null;
+  return photo as unknown as TelegramPhotoSizeReceipt;
 }
 
 export class TelegramAdapter {
@@ -79,8 +94,8 @@ export class TelegramAdapter {
     return messageIds;
   }
 
-  /** Sends one remote-URL photo with a plain caption and returns its message id. */
-  async sendPhoto(photoUrl: string, caption: string): Promise<number> {
+  /** Sends one URL or reusable file-id photo and returns its largest receipt. */
+  async sendPhoto(photo: string, caption: string): Promise<TelegramPhotoReceipt> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), TELEGRAM_PHOTO_TIMEOUT_MS);
     try {
@@ -91,7 +106,7 @@ export class TelegramAdapter {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             chat_id: this.config.chatId,
-            photo: photoUrl,
+            photo,
             caption,
           }),
           signal: controller.signal,
@@ -111,14 +126,21 @@ export class TelegramAdapter {
         throw new Error("Telegram photo response missing message id");
       }
       const photos = payload.result?.photo;
-      if (
-        !Array.isArray(photos) ||
-        photos.length === 0 ||
-        !photos.every(validPhotoSizeReceipt)
-      ) {
+      if (!Array.isArray(photos) || photos.length === 0) {
         throw new Error("Telegram response missing photo receipt");
       }
-      return messageId as number;
+      const receipts = photos.map(photoSizeReceipt);
+      if (receipts.some((receipt) => receipt === null)) {
+        throw new Error("Telegram response missing photo receipt");
+      }
+      const largest = (receipts as TelegramPhotoSizeReceipt[]).reduce((left, right) =>
+        left.width * left.height >= right.width * right.height ? left : right
+      );
+      return {
+        messageId: messageId as number,
+        fileId: largest.file_id,
+        fileUniqueId: largest.file_unique_id,
+      };
     } finally {
       clearTimeout(timeout);
     }

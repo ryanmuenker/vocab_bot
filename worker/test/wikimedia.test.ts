@@ -92,6 +92,7 @@ describe("WikimediaAdapter", () => {
     expect(candidate).toEqual({
       photoUrl:
         "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a2/Doric_columns.jpg/1280px-Doric_columns.jpg",
+      sourceUrl: "https://commons.wikimedia.org/wiki/File:Doric_columns.jpg",
       caption:
         "Plain columns of the Doric architectural order.\n\n" +
         "Creator: Jane Smith\n" +

@@ -152,6 +152,35 @@ async function admin(request: Request, env: AdminEnv, pathname: string): Promise
     if (request.method === "GET" && pathname === "/admin/summary") {
       return json(await owner(env).summary());
     }
+    if (request.method === "GET" && pathname === "/admin/image-backfill") {
+      return json(await owner(env).imageBackfillStatus());
+    }
+    if (request.method === "POST" && pathname === "/admin/backfill-images") {
+      let value: unknown;
+      try {
+        value = await readJson(request);
+      } catch (error) {
+        return json(
+          { error: error instanceof RangeError ? "payload too large" : "invalid request" },
+          error instanceof RangeError ? 413 : 400,
+        );
+      }
+      const body = object(value);
+      if (
+        body === null ||
+        !exactKeys(body, ["limit", "retryFailures"]) ||
+        !Number.isSafeInteger(body.limit) ||
+        (body.limit as number) < 1 ||
+        (body.limit as number) > 10 ||
+        typeof body.retryFailures !== "boolean"
+      ) {
+        return json({ error: "invalid request" }, 400);
+      }
+      return json(await owner(env).backfillImages({
+        limit: body.limit as number,
+        retryFailures: body.retryFailures,
+      }));
+    }
     if (request.method === "GET" && pathname === "/admin/inspector-data") {
       return new Response(JSON.stringify(await owner(env).inspectorData()), {
         headers: INSPECTOR_JSON_HEADERS,

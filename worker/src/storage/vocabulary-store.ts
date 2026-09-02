@@ -1,4 +1,6 @@
 import {
+  EntryImageOrigin,
+  ImageBackfillStatus,
   CaptureStatus,
   CardDirection,
   CardScheduleState,
@@ -14,9 +16,11 @@ import {
 } from "../domain/models";
 import type {
   EntryCaptureResult,
+  EntryImageOrigin as EntryImageOriginValue,
   Evaluation,
   EvaluationGrade as EvaluationGradeValue,
   FinalizeResult,
+  ImageBackfillStatus as ImageBackfillStatusValue,
   ReviewRating,
   SenseCard,
   StudyAnswerContext,
@@ -28,7 +32,9 @@ import type {
   StudySnapshot,
   StudyStartResult,
   TestSummary,
+  VisualIntent,
   VocabularyEntry,
+  VocabularyEntryImage,
   VocabularySense,
 } from "../domain/models";
 import {
@@ -195,6 +201,60 @@ interface SenseRow extends SqlRow {
   example_sentence: string;
   source_context: string | null;
   date_added: string;
+}
+
+interface EntryImageRow extends SqlRow {
+  id: number;
+  entry_id: number;
+  sense_id: number;
+  category: VocabularyEntryImage["category"];
+  query: string;
+  description: string;
+  photo_url: string | null;
+  caption: string | null;
+  source_url: string | null;
+  telegram_file_id: string | null;
+  telegram_file_unique_id: string | null;
+  origin: EntryImageOriginValue;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EntryImageCandidate {
+  readonly photoUrl: string;
+  readonly caption: string;
+  readonly sourceUrl: string;
+}
+
+export interface EntryImageReceipt {
+  readonly telegramFileId: string;
+  readonly telegramFileUniqueId: string;
+}
+
+export interface ImageBackfillSummary {
+  readonly totalEntries: number;
+  readonly associatedEntries: number;
+  readonly neverAttemptedEntries: number;
+  readonly attempts: Readonly<Record<ImageBackfillStatusValue, number>>;
+}
+
+function entryImageFromRow(row: EntryImageRow): VocabularyEntryImage {
+  return {
+    id: row.id,
+    entryId: row.entry_id,
+    senseId: row.sense_id,
+    category: row.category,
+    query: row.query,
+    description: row.description,
+    telegramFileId: row.telegram_file_id,
+    photoUrl: row.photo_url,
+    telegramFileUniqueId: row.telegram_file_unique_id,
+    caption: row.caption,
+    sourceUrl: row.source_url,
+    origin: row.origin,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 interface ReverseCardRetentionRow extends SqlRow {
@@ -535,6 +595,185 @@ export class VocabularyStore {
     } catch {
       return { status: CaptureStatus.STORAGE_ERROR, entry: null };
     }
+  }
+
+  getEntryById(id: number): VocabularyEntry | null {
+    return Number.isSafeInteger(id) && id > 0 ? this.loadEntryById(id) : null;
+  }
+
+  getEntryImage(entryId: number): VocabularyEntryImage | null {
+    const row = oneOrNull(
+      this.sql.exec<EntryImageRow>(
+        "SELECT * FROM vocabulary_entry_images WHERE entry_id = ?",
+        entryId,
+      ),
+    );
+    return row === null ? null : entryImageFromRow(row);
+  }
+
+  saveEntryImageIntent(
+    entryId: number,
+    senseId: number,
+    intent: VisualIntent,
+    origin: EntryImageOriginValue,
+    now = new Date(),
+  ): VocabularyEntryImage | null {
+    return this.storage.transactionSync(() => {
+      const existing = this.getEntryImage(entryId);
+      if (existing !== null) return existing;
+      const timestamp = isoTimestamp(now);
+      all(
+        this.sql.exec(
+          `INSERT OR IGNORE INTO vocabulary_entry_images
+            (entry_id, sense_id, category, query, description, origin, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          entryId,
+          senseId,
+          intent.category,
+          intent.query,
+          intent.description,
+          origin,
+          timestamp,
+          timestamp,
+        ),
+      );
+      all(this.sql.exec("DELETE FROM image_backfill_attempts WHERE entry_id = ?", entryId));
+      return this.getEntryImage(entryId);
+    });
+  }
+
+
+  saveEntryImageCandidate(
+    entryId: number,
+    candidate: EntryImageCandidate,
+    now = new Date(),
+  ): boolean {
+    all(
+      this.sql.exec(
+        `UPDATE vocabulary_entry_images
+         SET photo_url = ?, caption = ?, source_url = ?, updated_at = ?
+         WHERE entry_id = ? AND photo_url IS NULL`,
+        candidate.photoUrl,
+        candidate.caption,
+        candidate.sourceUrl,
+        isoTimestamp(now),
+        entryId,
+      ),
+    );
+    return (
+      oneOrNull(this.sql.exec<{ count: number }>("SELECT changes() AS count"))?.count ?? 0
+    ) === 1;
+  }
+  attachEntryImageReceipt(
+    entryId: number,
+    receipt: EntryImageReceipt,
+    now = new Date(),
+  ): boolean {
+    all(
+      this.sql.exec(
+        `UPDATE vocabulary_entry_images
+         SET telegram_file_id = ?, telegram_file_unique_id = ?, updated_at = ?
+         WHERE entry_id = ? AND photo_url IS NOT NULL AND telegram_file_id IS NULL`,
+        receipt.telegramFileId,
+        receipt.telegramFileUniqueId,
+        isoTimestamp(now),
+        entryId,
+      ),
+    );
+    return (
+      oneOrNull(this.sql.exec<{ count: number }>("SELECT changes() AS count"))?.count ?? 0
+    ) === 1;
+  }
+
+  clearEntryImageReceipt(entryId: number, now = new Date()): void {
+    all(
+      this.sql.exec(
+        `UPDATE vocabulary_entry_images
+         SET telegram_file_id = NULL, telegram_file_unique_id = NULL, updated_at = ?
+         WHERE entry_id = ? AND telegram_file_id IS NOT NULL`,
+        isoTimestamp(now),
+        entryId,
+      ),
+    );
+  }
+
+
+  imageBackfillEntries(limit: number, retryFailures: boolean): VocabularyEntry[] {
+    return all(
+      this.sql.exec<EntryRow>(
+        `SELECT e.*
+         FROM vocabulary_entries e
+         LEFT JOIN vocabulary_entry_images i ON i.entry_id = e.id
+         LEFT JOIN image_backfill_attempts a ON a.entry_id = e.id
+         WHERE i.id IS NULL AND (? = 1 OR a.id IS NULL)
+         ORDER BY e.id
+         LIMIT ?`,
+        retryFailures ? 1 : 0,
+        limit,
+      ),
+    ).map((row) => this.entryFromRow(row));
+  }
+
+  recordImageBackfillAttempt(
+    entryId: number,
+    status: ImageBackfillStatusValue,
+    error: string | null,
+    now = new Date(),
+  ): void {
+    all(
+      this.sql.exec(
+        `INSERT INTO image_backfill_attempts
+          (entry_id, status, attempt_count, last_error, attempted_at)
+         SELECT ?, ?, 1, ?, ?
+         WHERE NOT EXISTS (
+           SELECT 1 FROM vocabulary_entry_images WHERE entry_id = ?
+         )
+         ON CONFLICT(entry_id) DO UPDATE SET
+           status = excluded.status,
+           attempt_count = image_backfill_attempts.attempt_count + 1,
+           last_error = excluded.last_error,
+           attempted_at = excluded.attempted_at`,
+        entryId,
+        status,
+        error,
+        isoTimestamp(now),
+        entryId,
+      ),
+    );
+  }
+
+  imageBackfillSummary(): ImageBackfillSummary {
+    const totalEntries =
+      oneOrNull(this.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM vocabulary_entries",
+      ))?.count ?? 0;
+    const associatedEntries =
+      oneOrNull(this.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM vocabulary_entry_images",
+      ))?.count ?? 0;
+    const neverAttemptedEntries =
+      oneOrNull(this.sql.exec<{ count: number }>(
+        `SELECT COUNT(*) AS count
+         FROM vocabulary_entries e
+         LEFT JOIN vocabulary_entry_images i ON i.entry_id = e.id
+         LEFT JOIN image_backfill_attempts a ON a.entry_id = e.id
+         WHERE i.id IS NULL AND a.id IS NULL`,
+      ))?.count ?? 0;
+    const attempts: Record<ImageBackfillStatusValue, number> = {
+      [ImageBackfillStatus.NO_VISUAL]: 0,
+      [ImageBackfillStatus.PROVIDER_ERROR]: 0,
+      [ImageBackfillStatus.RATE_LIMITED]: 0,
+      [ImageBackfillStatus.INVALID_RESPONSE]: 0,
+      [ImageBackfillStatus.IMAGE_UNAVAILABLE]: 0,
+    };
+    for (const row of all(
+      this.sql.exec<{ status: ImageBackfillStatusValue; count: number }>(
+        "SELECT status, COUNT(*) AS count FROM image_backfill_attempts GROUP BY status",
+      ),
+    )) {
+      attempts[row.status] = row.count;
+    }
+    return { totalEntries, associatedEntries, neverAttemptedEntries, attempts };
   }
 
   /**

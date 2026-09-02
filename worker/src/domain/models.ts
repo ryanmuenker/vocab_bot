@@ -105,6 +105,40 @@ export interface VocabularyEntry {
   readonly senses: readonly VocabularySense[];
 }
 
+export const EntryImageOrigin = {
+  CAPTURE: "capture",
+  BACKFILL: "backfill",
+} as const;
+export type EntryImageOrigin = (typeof EntryImageOrigin)[keyof typeof EntryImageOrigin];
+
+export interface VocabularyEntryImage {
+  readonly id: number;
+  readonly entryId: number;
+  readonly senseId: number;
+  readonly category: VisualCategory;
+  readonly query: string;
+  readonly description: string;
+  readonly photoUrl: string | null;
+  readonly telegramFileId: string | null;
+  readonly telegramFileUniqueId: string | null;
+  readonly caption: string | null;
+  readonly sourceUrl: string | null;
+  readonly origin: EntryImageOrigin;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export const ImageBackfillStatus = {
+  NO_VISUAL: "no_visual",
+  PROVIDER_ERROR: "provider_error",
+  RATE_LIMITED: "rate_limited",
+  IMAGE_UNAVAILABLE: "image_unavailable",
+  INVALID_RESPONSE: "invalid_response",
+} as const;
+export type ImageBackfillStatus = (
+  typeof ImageBackfillStatus
+)[keyof typeof ImageBackfillStatus];
+
 export interface CaptureResult {
   readonly status: CaptureStatus;
   readonly entry: VocabularyEntry | null;

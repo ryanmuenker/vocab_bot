@@ -227,7 +227,7 @@ def test_concurrent_fresh_initialization_is_idempotent(
     initialize_concurrently(path, monkeypatch, synchronized_target=1)
 
     with Database(path).connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         tables = {
             row[0]
@@ -261,7 +261,7 @@ def test_concurrent_v3_initialization_converges_on_intact_v4(
     initialize_concurrently(path, monkeypatch, synchronized_target=4)
 
     with Database(path).connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute(
             "SELECT COUNT(*) FROM vocabulary_entries"
@@ -291,7 +291,7 @@ def test_migration_rejects_skipping_a_schema_version(tmp_path: Path) -> None:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
 
 
-def test_fresh_database_applies_v4_schema_and_constraints(tmp_path: Path) -> None:
+def test_fresh_database_applies_v6_schema_and_constraints(tmp_path: Path) -> None:
     database = Database(tmp_path / "data" / "vocabulary.sqlite3")
 
     database.initialize()
@@ -309,9 +309,11 @@ def test_fresh_database_applies_v4_schema_and_constraints(tmp_path: Path) -> Non
             "review_events",
             "test_sessions",
             "test_questions",
+            "vocabulary_entry_images",
+            "image_backfill_attempts",
         } <= tables
         assert "vocabulary_words" not in tables
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 """
@@ -330,7 +332,7 @@ def test_v1_migration_preserves_entry_sense_event_and_answer(tmp_path: Path) -> 
     Database(path).initialize()
 
     with Database(path).connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert dict(
             connection.execute(
                 "SELECT id, display_text, normalized_text, date_added, last_reviewed, "
@@ -388,7 +390,7 @@ def test_v2_migration_preserves_entries_senses_and_reviews(tmp_path: Path) -> No
 
 def _assert_v2_fixture_migrated(path: Path) -> None:
     with Database(path).connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         tables = {
             row[0]
@@ -466,7 +468,7 @@ def test_reopening_migrated_database_is_idempotent(tmp_path: Path) -> None:
     database.initialize()
 
     with database.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert connection.execute("SELECT COUNT(*) FROM vocabulary_entries").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM vocabulary_senses").fetchone()[0] == 2
         assert connection.execute("SELECT COUNT(*) FROM review_events").fetchone()[0] == 1
@@ -535,7 +537,7 @@ def test_failed_initial_migration_leaves_empty_database_and_can_retry(
     monkeypatch.setattr(Database, "_migration_sql", staticmethod(original))
     Database(path).initialize()
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert connection.execute(
             "SELECT COUNT(*) FROM sqlite_master "
             "WHERE type = 'table' AND name = 'vocabulary_entries'"
@@ -810,7 +812,7 @@ def test_populated_v3_upgrade_preserves_legacy_audit_and_uses_v5_scheduling(
     assert started.snapshot is None
 
     with database.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert [
             tuple(row)
             for row in connection.execute(
@@ -893,6 +895,13 @@ def create_v4_database(path: Path) -> None:
         connection.executescript(_migration("004_graded_reviews_and_tests.sql"))
 
 
+def create_v5_database(path: Path) -> None:
+    create_v4_database(path)
+    database = Database(path)
+    with database.connect() as connection:
+        database._apply_migration(connection, 5)
+
+
 def add_legacy_entry(
     connection: sqlite3.Connection,
     *,
@@ -924,6 +933,181 @@ def add_legacy_entry(
             added_at,
         ),
     )
+
+
+def test_v5_to_v6_migration_preserves_entries_and_adds_empty_image_tables(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "data" / "vocabulary.sqlite3"
+    create_v5_database(path)
+    with sqlite3.connect(path) as connection:
+        add_legacy_entry(
+            connection,
+            entry_id=41,
+            sense_id=51,
+            added_at="2026-08-01T00:00:00Z",
+        )
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'vocabulary_entry_images'"
+        ).fetchone()[0] == 0
+
+    Database(path).initialize()
+
+    with Database(path).connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert tuple(
+            connection.execute(
+                "SELECT id, display_text, normalized_text "
+                "FROM vocabulary_entries WHERE id = 41"
+            ).fetchone()
+        ) == (41, "word-41", "word-41")
+        assert tuple(
+            connection.execute(
+                "SELECT id, entry_id, definition "
+                "FROM vocabulary_senses WHERE id = 51"
+            ).fetchone()
+        ) == (51, 41, "Definition 41.")
+        assert connection.execute(
+            "SELECT COUNT(*) FROM vocabulary_entry_images"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM image_backfill_attempts"
+        ).fetchone()[0] == 0
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_v6_image_schema_enforces_association_receipt_and_cascade_invariants(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "data" / "vocabulary.sqlite3")
+    database.initialize()
+
+    with database.connect() as connection:
+        add_legacy_entry(
+            connection,
+            entry_id=1,
+            sense_id=11,
+            added_at="2026-08-01T00:00:00Z",
+        )
+        add_legacy_entry(
+            connection,
+            entry_id=2,
+            sense_id=22,
+            added_at="2026-08-02T00:00:00Z",
+        )
+        insert_image = """
+            INSERT INTO vocabulary_entry_images (
+                entry_id, sense_id, category, query, description, origin,
+                created_at, updated_at
+            ) VALUES (?, ?, 'object', 'red teapot', 'a red teapot',
+                      'capture', '2026-08-03T00:00:00Z',
+                      '2026-08-03T00:00:00Z')
+        """
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(insert_image, (2, 11))
+        connection.execute(insert_image, (1, 11))
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(insert_image, (1, 11))
+        assert connection.execute(
+            "SELECT COUNT(*) FROM vocabulary_entry_images WHERE entry_id = 1"
+        ).fetchone()[0] == 1
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE vocabulary_entry_images SET photo_url = ? WHERE entry_id = 1",
+                ("https://upload.wikimedia.org/teapot.jpg",),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                UPDATE vocabulary_entry_images
+                SET telegram_file_id = ?, telegram_file_unique_id = ?
+                WHERE entry_id = 1
+                """,
+                ("telegram-file", "telegram-unique"),
+            )
+        connection.execute(
+            """
+            UPDATE vocabulary_entry_images
+            SET photo_url = ?, caption = ?, source_url = ?
+            WHERE entry_id = 1
+            """,
+            (
+                "https://upload.wikimedia.org/teapot.jpg",
+                "A red teapot",
+                "https://commons.wikimedia.org/wiki/File:Teapot.jpg",
+            ),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                UPDATE vocabulary_entry_images
+                SET telegram_file_id = ?
+                WHERE entry_id = 1
+                """,
+                ("telegram-file",),
+            )
+        connection.execute(
+            """
+            UPDATE vocabulary_entry_images
+            SET telegram_file_id = ?, telegram_file_unique_id = ?
+            WHERE entry_id = 1
+            """,
+            ("telegram-file", "telegram-unique"),
+        )
+        assert tuple(
+            connection.execute(
+                """
+                SELECT photo_url, caption, source_url,
+                       telegram_file_id, telegram_file_unique_id
+                FROM vocabulary_entry_images WHERE entry_id = 1
+                """
+            ).fetchone()
+        ) == (
+            "https://upload.wikimedia.org/teapot.jpg",
+            "A red teapot",
+            "https://commons.wikimedia.org/wiki/File:Teapot.jpg",
+            "telegram-file",
+            "telegram-unique",
+        )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO image_backfill_attempts (
+                    entry_id, status, attempt_count, last_error, attempted_at
+                ) VALUES (2, 'unknown', 1, 'bad status',
+                          '2026-08-03T00:00:00Z')
+                """
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO image_backfill_attempts (
+                    entry_id, status, attempt_count, last_error, attempted_at
+                ) VALUES (2, 'no_visual', 1, 'unexpected error',
+                          '2026-08-03T00:00:00Z')
+                """
+            )
+        connection.execute(
+            """
+            INSERT INTO image_backfill_attempts (
+                entry_id, status, attempt_count, last_error, attempted_at
+            ) VALUES (2, 'no_visual', 1, NULL, '2026-08-03T00:00:00Z')
+            """
+        )
+
+        connection.execute("DELETE FROM vocabulary_entries WHERE id = 1")
+        connection.execute("DELETE FROM vocabulary_entries WHERE id = 2")
+        assert connection.execute(
+            "SELECT COUNT(*) FROM vocabulary_entry_images"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM image_backfill_attempts"
+        ).fetchone()[0] == 0
 
 
 def test_v5_domain_enums_match_persisted_constraint_values() -> None:
@@ -979,7 +1163,7 @@ def test_v5_creates_one_forward_card_and_one_reverse_card_per_sense(
     Database(path).initialize()
 
     with Database(path).connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert [
             tuple(row)
             for row in connection.execute(
@@ -1521,7 +1705,7 @@ def test_v5_backfill_failure_rolls_back_schema_data_and_version_then_retries(
     monkeypatch.setitem(database_module._MIGRATION_BACKFILLS, 5, original)
     Database(path).initialize()
     with Database(path).connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert connection.execute(
             "SELECT COUNT(*) FROM vocabulary_cards"
         ).fetchone()[0] == 3
@@ -1560,7 +1744,7 @@ def test_v5_sql_failure_rolls_back_schema_and_version_then_retries(
     monkeypatch.setattr(Database, "_migration_sql", staticmethod(original))
     Database(path).initialize()
     with Database(path).connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -1584,5 +1768,5 @@ def test_concurrent_v4_initialization_runs_v5_backfill_once(
 
     assert calls == [1]
     with Database(path).connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []

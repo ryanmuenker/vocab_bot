@@ -145,6 +145,7 @@ interface Transport {
   modelStatus: number;
   evaluation: { grade: string; feedback: string };
   definitionVisual: unknown;
+  selectionVisual: unknown;
   definitionSenses: readonly {
     readonly part_of_speech: string;
     readonly definition: string;
@@ -154,6 +155,7 @@ interface Transport {
   telegramPhotoMode:
     | "success"
     | "api-reject"
+    | "reject-file-id"
     | "malformed"
     | "missing-photo"
     | "fetch-reject"
@@ -203,6 +205,7 @@ function transport(): Transport {
     modelStatus: 200,
     evaluation: { grade: "correct", feedback: "Accurate." },
     definitionVisual: undefined,
+    selectionVisual: null,
     definitionSenses: null,
     wikimediaMode: "empty",
     telegramPhotoMode: "success",
@@ -235,7 +238,9 @@ function transport(): Transport {
                 ? {}
                 : { visual: state.definitionVisual }),
             })
-          : JSON.stringify(state.evaluation);
+          : systemPrompt.includes("select one safe, durable visual association")
+            ? JSON.stringify({ visual: state.selectionVisual })
+            : JSON.stringify(state.evaluation);
         return url.includes("/responses")
           ? jsonResponse({
               output: [{
@@ -310,6 +315,9 @@ function transport(): Transport {
           });
         }
         if (state.telegramPhotoMode === "malformed") return new Response("{", { status: 200 });
+        if (state.telegramPhotoMode === "reject-file-id" && body.photo === "photo-file") {
+          return jsonResponse({ ok: false });
+        }
         if (state.telegramPhotoMode === "api-reject") return jsonResponse({ ok: false });
         if (state.telegramPhotoMode === "missing-photo") {
           return jsonResponse({ ok: true, result: { message_id: ++messageId } });
@@ -383,11 +391,11 @@ describe("VocabularyCompanion capture", () => {
     expect(await stub.summary()).toMatchObject({ entries: 1, senses: 1, pendingInbox: 0, failedInbox: 0 });
   });
 
-  it("keeps one leader intent through retries and eviction while every duplicate stays null", async () => {
+  it("keeps one leader photo association through retries and eviction while duplicates stay null", async () => {
     const io = transport();
     io.definitionVisual = PROVIDER_VISUAL;
     io.telegramFails = true;
-    const stub = companion("visual-intent-lifecycle");
+    const stub = companion("photo-entry-lifecycle");
 
     await stub.enqueueTelegramUpdate(message(1, "Street"));
     await stub.enqueueTelegramUpdate(message(2, " street "));
@@ -395,14 +403,14 @@ describe("VocabularyCompanion capture", () => {
       Array.from(state.storage.sql.exec<{
         dedupe_key: string;
         status: string;
-        visual_intent: string | null;
+        photo_entry_id: number | null;
       }>(
-        `SELECT dedupe_key, status, visual_intent
+        `SELECT dedupe_key, status, photo_entry_id
          FROM inbox_events ORDER BY id`,
       ))
     )).toEqual([
-      { dedupe_key: "telegram:1", status: "pending", visual_intent: null },
-      { dedupe_key: "telegram:2", status: "waiting", visual_intent: null },
+      { dedupe_key: "telegram:1", status: "pending", photo_entry_id: null },
+      { dedupe_key: "telegram:2", status: "waiting", photo_entry_id: null },
     ]);
 
     expect(await runDurableObjectAlarm(stub)).toBe(true);
@@ -411,9 +419,9 @@ describe("VocabularyCompanion capture", () => {
         dedupe_key: string;
         status: string;
         response_text: string | null;
-        visual_intent: string | null;
+        photo_entry_id: number | null;
       }>(
-        `SELECT dedupe_key, status, response_text, visual_intent
+        `SELECT dedupe_key, status, response_text, photo_entry_id
          FROM inbox_events ORDER BY id`,
       ))
     )).toEqual([
@@ -421,24 +429,24 @@ describe("VocabularyCompanion capture", () => {
         dedupe_key: "telegram:1",
         status: "ready",
         response_text: expect.stringContaining("✓ Saved."),
-        visual_intent: JSON.stringify(VISUAL_INTENT),
+        photo_entry_id: 1,
       }),
       expect.objectContaining({
         dedupe_key: "telegram:2",
         status: "ready",
         response_text: expect.stringContaining("✓ Saved."),
-        visual_intent: null,
+        photo_entry_id: null,
       }),
     ]);
 
     await evictDurableObject(stub);
     expect(await runInDurableObject(stub, (_instance, state) =>
-      Array.from(state.storage.sql.exec<{ visual_intent: string | null }>(
-        "SELECT visual_intent FROM inbox_events ORDER BY id",
+      Array.from(state.storage.sql.exec<{ photo_entry_id: number | null }>(
+        "SELECT photo_entry_id FROM inbox_events ORDER BY id",
       ))
     )).toEqual([
-      { visual_intent: JSON.stringify(VISUAL_INTENT) },
-      { visual_intent: null },
+      { photo_entry_id: 1 },
+      { photo_entry_id: null },
     ]);
 
     io.telegramFails = false;
@@ -448,81 +456,73 @@ describe("VocabularyCompanion capture", () => {
       Array.from(state.storage.sql.exec<{
         status: string;
         response_text: string | null;
-        visual_intent: string | null;
+        photo_entry_id: number | null;
       }>(
-        `SELECT status, response_text, visual_intent
+        `SELECT status, response_text, photo_entry_id
          FROM inbox_events WHERE dedupe_key = 'telegram:3'`,
       ))
     )).toEqual([{
       status: "ready",
       response_text: expect.stringContaining("Already saved."),
-      visual_intent: null,
+      photo_entry_id: null,
     }]);
     await drain(stub);
     expect(await runInDurableObject(stub, (_instance, state) =>
-      Array.from(state.storage.sql.exec<{ status: string; visual_intent: string | null }>(
-        "SELECT status, visual_intent FROM inbox_events ORDER BY id",
+      Array.from(state.storage.sql.exec<{ status: string; photo_entry_id: number | null }>(
+        "SELECT status, photo_entry_id FROM inbox_events ORDER BY id",
       ))
     )).toEqual([
-      { status: "completed", visual_intent: null },
-      { status: "completed", visual_intent: null },
-      { status: "completed", visual_intent: null },
+      { status: "completed", photo_entry_id: null },
+      { status: "completed", photo_entry_id: null },
+      { status: "completed", photo_entry_id: null },
     ]);
   });
 
-  it("copies a ready capture response to a follower without copying its intent", async () => {
-    transport();
-    const stub = companion("visual-ready-follower");
+  it("does not copy a retrying capture's photo entry to an already-saved response", async () => {
+    const io = transport();
+    io.definitionVisual = PROVIDER_VISUAL;
+    io.telegramFails = true;
+    const stub = companion("photo-ready-follower");
     await stub.enqueueTelegramUpdate(message(1, "Street"));
-    await runInDurableObject(stub, (_instance, state) => {
-      Array.from(state.storage.sql.exec(
-        `UPDATE inbox_events
-         SET status = 'ready', payload = NULL, response_text = ?,
-             visual_intent = ?
-         WHERE dedupe_key = 'telegram:1'`,
-        "prepared definition",
-        JSON.stringify(VISUAL_INTENT),
-      ));
-    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
 
     await stub.enqueueTelegramUpdate(message(2, " street "));
 
-    expect(await runInDurableObject(stub, (_instance, state) =>
+    const events = await runInDurableObject(stub, (_instance, state) =>
       Array.from(state.storage.sql.exec<{
         dedupe_key: string;
         response_text: string | null;
-        visual_intent: string | null;
+        photo_entry_id: number | null;
       }>(
-        `SELECT dedupe_key, response_text, visual_intent
+        `SELECT dedupe_key, response_text, photo_entry_id
          FROM inbox_events ORDER BY id`,
       ))
-    )).toEqual([
-      {
-        dedupe_key: "telegram:1",
-        response_text: "prepared definition",
-        visual_intent: JSON.stringify(VISUAL_INTENT),
-      },
-      {
-        dedupe_key: "telegram:2",
-        response_text: "prepared definition",
-        visual_intent: null,
-      },
-    ]);
+    );
+    expect(events[0]).toMatchObject({
+      dedupe_key: "telegram:1",
+      response_text: expect.stringContaining("✓ Saved."),
+      photo_entry_id: 1,
+    });
+    expect(events[1]).toMatchObject({
+      dedupe_key: "telegram:2",
+      response_text: expect.stringContaining("Already saved."),
+      photo_entry_id: null,
+    });
     await runInDurableObject(stub, async (_instance, state) => {
       Array.from(state.storage.sql.exec(
         `UPDATE inbox_events
-         SET status = 'completed', response_text = NULL, visual_intent = NULL
+         SET status = 'completed', response_text = NULL, photo_entry_id = NULL
          WHERE status = 'ready'`,
       ));
       await state.storage.deleteAlarm();
     });
   });
 
-  it("clears intent on generic and terminal delivery failures", async () => {
+  it("clears photo entry ids on generic and terminal delivery failures", async () => {
     const io = transport();
     io.definitionVisual = PROVIDER_VISUAL;
     io.telegramFails = true;
-    const stub = companion("visual-intent-failures");
+    const stub = companion("photo-entry-failures");
     await stub.enqueueTelegramUpdate(message(1, "Street"));
     expect(await runDurableObjectAlarm(stub)).toBe(true);
     await runInDurableObject(stub, (_instance, state) => {
@@ -536,9 +536,8 @@ describe("VocabularyCompanion capture", () => {
     await runInDurableObject(stub, (_instance, state) => {
       Array.from(state.storage.sql.exec(
         `UPDATE inbox_events
-         SET payload = '{', visual_intent = ?
+         SET payload = '{', photo_entry_id = 1
          WHERE dedupe_key = 'telegram:2'`,
-        JSON.stringify(VISUAL_INTENT),
       ));
     });
     expect(await runDurableObjectAlarm(stub)).toBe(true);
@@ -547,14 +546,14 @@ describe("VocabularyCompanion capture", () => {
       Array.from(state.storage.sql.exec<{
         dedupe_key: string;
         status: string;
-        visual_intent: string | null;
+        photo_entry_id: number | null;
       }>(
-        `SELECT dedupe_key, status, visual_intent
+        `SELECT dedupe_key, status, photo_entry_id
          FROM inbox_events ORDER BY id`,
       ))
     )).toEqual([
-      { dedupe_key: "telegram:1", status: "failed", visual_intent: null },
-      { dedupe_key: "telegram:2", status: "failed", visual_intent: null },
+      { dedupe_key: "telegram:1", status: "failed", photo_entry_id: null },
+      { dedupe_key: "telegram:2", status: "failed", photo_entry_id: null },
     ]);
   });
 
@@ -677,12 +676,149 @@ describe("VocabularyCompanion optional photo delivery", () => {
         /^An object beside a paved street\.\n\n[\s\S]*License: CC BY-SA 4\.0[\s\S]*Source: Wikimedia Commons/u,
       ),
     });
+    expect(await runInDurableObject(stub, (_instance, state) =>
+      state.storage.sql.exec<{
+        photo_url: string | null;
+        caption: string | null;
+        source_url: string | null;
+        telegram_file_id: string | null;
+        telegram_file_unique_id: string | null;
+      }>(
+        `SELECT photo_url, caption, source_url, telegram_file_id, telegram_file_unique_id
+         FROM vocabulary_entry_images`,
+      ).one()
+    )).toMatchObject({
+      photo_url:
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a2/Street_object.jpg/1280px-Street_object.jpg",
+      caption: io.photos[0]!.caption,
+      source_url: "https://commons.wikimedia.org/wiki/File:Street_object.jpg",
+      telegram_file_id: "photo-file",
+      telegram_file_unique_id: "unique-photo",
+    });
 
     await stub.enqueueTelegramUpdate(message(3, "STREET"));
     await drain(stub);
     expect(io.sent).toHaveLength(3);
     expect(io.wikimediaCalls()).toBe(1);
     expect(io.photoCalls()).toBe(1);
+  });
+
+  it.each([
+    ["correct", "Good"],
+    ["partial", "Hard"],
+    ["incorrect", null],
+  ] as const)(
+    "sends a persisted image after a fresh %s evaluation, never with its prompt or rating",
+    async (grade, rating) => {
+      const io = transport();
+      io.definitionVisual = PROVIDER_VISUAL;
+      io.wikimediaMode = "success";
+      io.evaluation = { grade, feedback: `${grade} feedback.` };
+      const stub = companion(`study-photo-${grade}`);
+
+      await stub.enqueueTelegramUpdate(message(1, "Street"));
+      await drain(stub);
+      await vi.waitFor(() => expect(io.photos).toHaveLength(1));
+      const caption = io.photos[0]!.caption;
+
+      await stub.enqueueTelegramUpdate(message(2, "/review", "2030-07-23T04:01:00Z"));
+      await drain(stub);
+      expect(io.sent.at(-1)).toContain("What does 'Street' mean?");
+      expect(io.photos).toHaveLength(1);
+
+      await stub.enqueueTelegramUpdate(
+        message(3, "an object beside a street", "2030-07-23T04:02:00Z"),
+      );
+      await drain(stub);
+      await vi.waitFor(() => expect(io.photos).toHaveLength(2));
+      expect(io.photos[1]).toEqual({ photo: "photo-file", caption });
+      expect(io.wikimediaCalls()).toBe(1);
+
+      if (rating !== null) {
+        await stub.enqueueTelegramUpdate(message(4, rating, "2030-07-23T04:03:00Z"));
+        await drain(stub);
+        expect(io.photos).toHaveLength(2);
+      }
+    },
+  );
+
+  it("falls back to the persisted URL and refreshes an unusable Telegram file ID", async () => {
+    const io = transport();
+    io.definitionVisual = PROVIDER_VISUAL;
+    io.wikimediaMode = "success";
+    const stub = companion("study-photo-file-id-fallback");
+
+    await stub.enqueueTelegramUpdate(message(1, "Street"));
+    await drain(stub);
+    await vi.waitFor(() => expect(io.photos).toHaveLength(1));
+    const first = io.photos[0]!;
+
+    io.telegramPhotoMode = "reject-file-id";
+    await stub.enqueueTelegramUpdate(message(2, "/review", "2030-07-23T04:01:00Z"));
+    await drain(stub);
+    await stub.enqueueTelegramUpdate(
+      message(3, "an object beside a street", "2030-07-23T04:02:00Z"),
+    );
+    await drain(stub);
+    await vi.waitFor(() => expect(io.photoCalls()).toBe(3));
+
+    expect(io.photos).toEqual([
+      first,
+      {
+        photo:
+          "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a2/Street_object.jpg/1280px-Street_object.jpg",
+        caption: first.caption,
+      },
+    ]);
+    expect(io.wikimediaCalls()).toBe(1);
+    expect(await runInDurableObject(stub, (_instance, state) =>
+      state.storage.sql.exec<{ telegram_file_id: string | null }>(
+        "SELECT telegram_file_id FROM vocabulary_entry_images",
+      ).one().telegram_file_id
+    )).toBe("photo-file");
+  });
+
+  it("backfills a persisted candidate without sending Telegram messages", async () => {
+    const io = transport();
+    io.selectionVisual = PROVIDER_VISUAL;
+    io.wikimediaMode = "success";
+    const stub = companion("image-backfill");
+    await stub.importSnapshot(library(1));
+
+    await expect(
+      stub.backfillImages({ limit: 1, retryFailures: false }),
+    ).resolves.toMatchObject({
+      processed: 1,
+      associated: 1,
+      failed: 0,
+      status: {
+        totalEntries: 1,
+        associatedEntries: 1,
+        neverAttemptedEntries: 0,
+      },
+    });
+
+    expect(io.modelCalls()).toBe(1);
+    expect(io.wikimediaCalls()).toBe(1);
+    expect(io.sent).toHaveLength(0);
+    expect(io.photoCalls()).toBe(0);
+    expect(await runInDurableObject(stub, (_instance, state) =>
+      state.storage.sql.exec<{
+        origin: string;
+        photo_url: string | null;
+        caption: string | null;
+        telegram_file_id: string | null;
+      }>(
+        `SELECT origin, photo_url, caption, telegram_file_id
+         FROM vocabulary_entry_images`,
+      ).one()
+    )).toMatchObject({
+      origin: "backfill",
+      photo_url:
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a2/Street_object.jpg/1280px-Street_object.jpg",
+      caption: expect.stringContaining("Source: Wikimedia Commons"),
+      telegram_file_id: null,
+    });
   });
 
   it.each([

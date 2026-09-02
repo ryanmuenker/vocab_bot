@@ -5,9 +5,11 @@ import {
   DefinitionStatus,
   EvaluationStatus,
   OpenCodeAdapter,
+  VisualSelectionStatus,
   SHOW_ANSWER_FEEDBACK,
   parseDefinitionResponse,
   parseEvaluationResponse,
+  parseVisualSelectionResponse,
 } from "../src/integrations/opencode";
 import {
   splitTelegramMessage,
@@ -132,6 +134,102 @@ describe("OpenCodeAdapter", () => {
       },
     }), "aster");
     expect(aster.visualIntent).not.toBeNull();
+  });
+
+  it("selects a visual for a stored sense through the bounded visual RPC", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            visual: {
+              sense_index: 0,
+              category: "plant",
+              query: "aster flowering plant",
+              description: "Purple flowers on an aster plant.",
+            },
+          }),
+        },
+      }],
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const adapter = new OpenCodeAdapter({
+      apiKey: "key",
+      baseUrl: "https://example.test/v1",
+      model: "model",
+    });
+    const entry = {
+      ...ENTRY,
+      displayText: "aster",
+      normalizedText: "aster",
+      senses: [{
+        ...ENTRY.senses[0]!,
+        definition: "A flowering plant with daisy-like blossoms.",
+        exampleSentence: "The asters bloomed in autumn.",
+      }],
+    };
+
+    expect(await adapter.selectVisual(entry)).toEqual({
+      status: VisualSelectionStatus.FOUND,
+      visualIntent: {
+        senseIndex: 0,
+        category: "plant",
+        query: "aster flowering plant",
+        description: "Purple flowers on an aster plant.",
+      },
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const request = fetchMock.mock.calls[0]![1] as RequestInit;
+    const body = JSON.parse(request.body as string) as {
+      max_tokens: number;
+      messages: { role: string; content: string }[];
+    };
+    expect(body.max_tokens).toBe(1_000);
+    expect(JSON.parse(body.messages[1]!.content)).toEqual({
+      display_text: "aster",
+      senses: [{
+        part_of_speech: "adjective",
+        definition: "A flowering plant with daisy-like blossoms.",
+        example_sentence: "The asters bloomed in autumn.",
+      }],
+    });
+  });
+
+  it("keeps a plant visual eligible when another stored sense mentions a Mediterranean region", () => {
+    const entry = {
+      ...ENTRY,
+      displayText: "asphodel",
+      normalizedText: "asphodel",
+      senses: [
+        {
+          ...ENTRY.senses[0]!,
+          definition: "A flowering plant with tall spikes of white blossoms.",
+          exampleSentence: "The asphodel flowered beside the path.",
+        },
+        {
+          ...ENTRY.senses[0]!,
+          id: 2,
+          definition: "A perennial plant native to the Mediterranean region.",
+          exampleSentence: "Asphodel grows across southern Europe.",
+        },
+      ],
+    };
+
+    expect(parseVisualSelectionResponse(JSON.stringify({
+      visual: {
+        sense_index: 0,
+        category: "plant",
+        query: "asphodel flowering plant",
+        description: "Tall white flowers on an asphodel plant.",
+      },
+    }), entry)).toEqual({
+      status: VisualSelectionStatus.FOUND,
+      visualIntent: {
+        senseIndex: 0,
+        category: "plant",
+        query: "asphodel flowering plant",
+        description: "Tall white flowers on an asphodel plant.",
+      },
+    });
   });
 
   it("isolates malformed optional visual metadata from valid ordered senses", () => {
@@ -516,12 +614,17 @@ describe("TelegramAdapter", () => {
     await expect(adapter.sendText("hello")).rejects.toThrow(/message id/u);
   });
 
-  it("sends a remote photo with a plain caption and validates the photo receipt", async () => {
+  it("sends a remote photo with a plain caption and returns the largest photo receipt", async () => {
     const fetchMock = vi.fn().mockResolvedValue(response({
       ok: true,
       result: {
         message_id: 42,
         photo: [{
+          file_id: "small-photo-file",
+          file_unique_id: "small-unique-photo",
+          width: 320,
+          height: 240,
+        }, {
           file_id: "photo-file",
           file_unique_id: "unique-photo",
           width: 1_280,
@@ -537,7 +640,11 @@ describe("TelegramAdapter", () => {
         "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a2/photo.jpg",
         "Street — an object beside a street\n\nLicense: CC BY 4.0",
       ),
-    ).resolves.toBe(42);
+    ).resolves.toEqual({
+      messageId: 42,
+      fileId: "photo-file",
+      fileUniqueId: "unique-photo",
+    });
 
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(fetchMock.mock.calls[0]![0]).toBe(

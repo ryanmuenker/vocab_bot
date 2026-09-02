@@ -16,6 +16,7 @@ _MIGRATIONS = {
     3: "003_entry_terms.sql",
     4: "004_graded_reviews_and_tests.sql",
     5: "005_spaced_review_cards.sql",
+    6: "006_entry_images.sql",
 }
 
 

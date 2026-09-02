@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   MEMORIZED_STABILITY_DAYS,
+  type InspectorData,
   readInspectorData,
 } from "../src/domain/inspector";
 
@@ -111,6 +112,68 @@ describe("vocabulary inspector projection", () => {
         source: "review",
         reviewedAt: "2026-08-13T00:00:00Z",
       });
+    });
+  });
+
+  it("reports bounded image counts without exposing Telegram IDs or provider errors", async () => {
+    await runInDurableObject(stub(), (_instance, state) => {
+      state.storage.sql.exec(`
+        INSERT INTO vocabulary_entries
+          (id, display_text, normalized_text, date_added, last_reviewed, review_status)
+        VALUES
+          (1, 'Amphora', 'amphora', '2026-08-01T00:00:00Z', NULL, 'new'),
+          (2, 'Corbel', 'corbel', '2026-08-02T00:00:00Z', NULL, 'new'),
+          (3, 'Serein', 'serein', '2026-08-03T00:00:00Z', NULL, 'new');
+
+        INSERT INTO vocabulary_senses
+          (id, entry_id, definition, part_of_speech, example_sentence, source_context, date_added)
+        VALUES
+          (1, 1, 'a tall ancient jar', 'noun', 'The amphora stood by the wall.', NULL, '2026-08-01T00:00:00Z'),
+          (2, 2, 'a projecting stone bracket', 'noun', 'The corbel supported the arch.', NULL, '2026-08-02T00:00:00Z'),
+          (3, 3, 'fine evening rain', 'noun', 'A serein settled over the field.', NULL, '2026-08-03T00:00:00Z');
+
+        INSERT INTO vocabulary_entry_images
+          (id, entry_id, sense_id, category, query, description, photo_url, caption,
+           source_url, telegram_file_id, telegram_file_unique_id, origin, created_at, updated_at)
+        VALUES
+          (1, 1, 1, 'object', 'ancient amphora', 'A terracotta amphora',
+           'https://upload.example/amphora.jpg', 'An ancient amphora',
+           'https://commons.example/amphora', 'telegram-sensitive-file-id',
+           'telegram-sensitive-unique-id', 'capture',
+           '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z'),
+          (2, 2, 2, 'architecture', 'stone corbel', 'A carved stone corbel',
+           NULL, NULL, NULL, NULL, NULL, 'backfill',
+           '2026-08-02T00:00:00Z', '2026-08-02T00:00:00Z');
+
+        INSERT INTO image_backfill_attempts
+          (id, entry_id, status, attempt_count, last_error, attempted_at)
+        VALUES
+          (1, 3, 'provider_error', 2, 'provider-sensitive-error-detail',
+           '2026-08-03T00:00:00Z');
+      `);
+
+      const serialized = JSON.stringify(
+        readInspectorData(state.storage, "2026-08-14T00:00:00Z"),
+      );
+      const result = JSON.parse(serialized) as InspectorData;
+
+      expect(result.images).toEqual({
+        associated: 2,
+        telegramCached: 1,
+        unresolvedCandidates: 1,
+        backfillFailures: {
+          no_visual: 0,
+          provider_error: 1,
+          rate_limited: 0,
+          invalid_response: 0,
+          image_unavailable: 0,
+        },
+      });
+      expect(serialized).not.toContain("telegram-sensitive-file-id");
+      expect(serialized).not.toContain("telegram-sensitive-unique-id");
+      expect(serialized).not.toContain("provider-sensitive-error-detail");
+      expect(serialized).not.toContain("telegram_file_id");
+      expect(serialized).not.toContain("last_error");
     });
   });
 });

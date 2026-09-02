@@ -32,7 +32,7 @@ replace_database_files = _IMPORT_SCRIPT["replace_database_files"]
 # Digest of the shared fixture below. worker/test/snapshot.test.ts asserts the
 # same value against its byte-identical copy, which is what proves the two
 # implementations agree on the wire format.
-CROSS_LANGUAGE_DIGEST = "d4fa50222abf362c042a16b3402878990f994480f1c59f7128e88a91fbc4bba8"
+CROSS_LANGUAGE_DIGEST = "e98381d5a9c04b414326e7417d94d40ea68c5058bf77ae2293a0cbf52f22c21e"
 
 _FINGERPRINT = "a" * 64
 _CONTENT_FINGERPRINT = "b" * 64
@@ -75,10 +75,10 @@ def test_reals_render_the_way_javascript_renders_them() -> None:
 
 
 def _fixture() -> dict[str, object]:
-    """Exercises every v5 table, both card directions, and preserved history."""
+    """Exercises every v6 table, both card directions, and preserved history."""
     return validate_snapshot(
         {
-            "formatVersion": 2,
+            "formatVersion": 3,
             "entries": [
                 {
                     "id": 7,
@@ -87,7 +87,15 @@ def _fixture() -> dict[str, object]:
                     "dateAdded": "2026-07-20T00:00:00Z",
                     "lastReviewed": "2026-07-22T16:30:00Z",
                     "reviewStatus": "reviewed",
-                }
+                },
+                {
+                    "id": 8,
+                    "displayText": "Fallback",
+                    "normalizedText": "fallback",
+                    "dateAdded": "2026-07-23T00:00:00Z",
+                    "lastReviewed": None,
+                    "reviewStatus": "new",
+                },
             ],
             "senses": [
                 {
@@ -107,6 +115,43 @@ def _fixture() -> dict[str, object]:
                     "exampleSentence": "I define it.",
                     "sourceContext": None,
                     "dateAdded": "2026-07-20T00:00:00Z",
+                },
+                {
+                    "id": 13,
+                    "entryId": 8,
+                    "definition": "a reserve entry without an image",
+                    "partOfSpeech": "noun",
+                    "exampleSentence": "The fallback remains textual.",
+                    "sourceContext": None,
+                    "dateAdded": "2026-07-23T00:00:00Z",
+                },
+            ],
+            "vocabularyEntryImages": [
+                {
+                    "id": 70,
+                    "entryId": 7,
+                    "senseId": 11,
+                    "category": "place",
+                    "query": "Straße street Germany",
+                    "description": "A street in Germany.",
+                    "photoUrl": "https://upload.wikimedia.org/example.jpg",
+                    "caption": "A street in Germany. Source: Example",
+                    "sourceUrl": "https://commons.wikimedia.org/wiki/File:Example.jpg",
+                    "telegramFileId": "AgACAgIAAxkBAAI",
+                    "telegramFileUniqueId": "AQADexample",
+                    "origin": "capture",
+                    "createdAt": "2026-07-20T00:01:00Z",
+                    "updatedAt": "2026-07-22T16:31:00Z",
+                },
+            ],
+            "imageBackfillAttempts": [
+                {
+                    "id": 80,
+                    "entryId": 8,
+                    "status": "rate_limited",
+                    "attemptCount": 2,
+                    "lastError": "Wikimedia returned 429",
+                    "attemptedAt": "2026-07-23T00:05:00Z",
                 },
             ],
             "reviewEvents": [
@@ -366,6 +411,14 @@ def _corrupt(**changes: object) -> dict[str, object]:
     return snapshot
 
 
+def _legacy_fixture() -> dict[str, object]:
+    snapshot = json.loads(canonical_bytes(_fixture()))
+    snapshot["formatVersion"] = 2
+    snapshot.pop("vocabularyEntryImages")
+    snapshot.pop("imageBackfillAttempts")
+    return snapshot
+
+
 def test_snapshot_roundtrip_preserves_ids_state_and_bytes(tmp_path: Path) -> None:
     snapshot = _fixture()
     database_path = tmp_path / "source.sqlite3"
@@ -382,12 +435,14 @@ def test_snapshot_roundtrip_preserves_ids_state_and_bytes(tmp_path: Path) -> Non
     finally:
         connection.close()
     assert canonical_bytes(exported) == canonical_bytes(snapshot)
-    assert max_ids(exported) == (7, 12, 3, 2, 5, 21, 30, 41, 50, 56, 58, 61)
+    assert max_ids(exported) == (8, 13, 70, 80, 3, 2, 5, 21, 30, 41, 50, 56, 58, 61)
     assert snapshot_sha256(exported) == CROSS_LANGUAGE_DIGEST
     assert json.loads(canonical_bytes(exported)) == snapshot
     assert summary(exported, CROSS_LANGUAGE_DIGEST) == {
-        "entries": 1,
-        "senses": 2,
+        "entries": 2,
+        "senses": 3,
+        "vocabularyEntryImages": 1,
+        "imageBackfillAttempts": 1,
         "reviewEvents": 1,
         "testSessions": 1,
         "testQuestions": 1,
@@ -421,6 +476,33 @@ def test_snapshot_envelope_rejects_a_digest_mismatch(tmp_path: Path) -> None:
         load_envelope(envelope)
 
 
+def test_v2_envelope_verifies_original_digest_before_upgrade(tmp_path: Path) -> None:
+    legacy = _legacy_fixture()
+    legacy_digest = snapshot_sha256(legacy)
+    envelope = tmp_path / "legacy-export.json"
+    envelope.write_text(
+        json.dumps({"sha256": legacy_digest, "snapshot": legacy}),
+        encoding="utf-8",
+    )
+
+    loaded = load_envelope(envelope)
+    assert loaded["sha256"] == legacy_digest
+    assert loaded["snapshot"] == {
+        **legacy,
+        "formatVersion": 3,
+        "vocabularyEntryImages": [],
+        "imageBackfillAttempts": [],
+    }
+    assert validate_snapshot(legacy) == loaded["snapshot"]
+
+    envelope.write_text(
+        json.dumps({"sha256": CROSS_LANGUAGE_DIGEST, "snapshot": legacy}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="digest mismatch"):
+        load_envelope(envelope)
+
+
 def test_snapshot_rejects_v1_format_and_broken_invariants() -> None:
     with pytest.raises(ValueError, match="unsupported snapshot format"):
         validate_snapshot({**_fixture(), "formatVersion": 1})
@@ -447,6 +529,73 @@ def test_snapshot_rejects_v1_format_and_broken_invariants() -> None:
     ):
         with pytest.raises(ValueError, match=message):
             validate_snapshot(_corrupt(**changes))
+
+
+def test_snapshot_rejects_malformed_image_states_and_orphans() -> None:
+    for changes, message in (
+        ({"vocabularyEntryImages__0__caption": None}, "metadata must be populated"),
+        (
+            {"vocabularyEntryImages__0__telegramFileUniqueId": None},
+            "receipt must be populated",
+        ),
+        ({"vocabularyEntryImages__0__caption": "x" * 1025}, "caption exceeds"),
+        ({"vocabularyEntryImages__0__entryId": 99}, "orphan vocabulary entry image"),
+        ({"vocabularyEntryImages__0__senseId": 13}, "does not belong"),
+        ({"imageBackfillAttempts__0__entryId": 99}, "orphan image backfill"),
+        ({"imageBackfillAttempts__0__entryId": 7}, "cannot retain"),
+        ({"imageBackfillAttempts__0__attemptCount": 0}, "must be positive"),
+        ({"imageBackfillAttempts__0__lastError": None}, "disagrees with status"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            validate_snapshot(_corrupt(**changes))
+
+    missing_photo = _corrupt(
+        vocabularyEntryImages__0__photoUrl=None,
+        vocabularyEntryImages__0__caption=None,
+        vocabularyEntryImages__0__sourceUrl=None,
+    )
+    with pytest.raises(ValueError, match="receipt requires"):
+        validate_snapshot(missing_photo)
+
+    duplicate_image = _corrupt()
+    duplicate_image["vocabularyEntryImages"].append(
+        {
+            **duplicate_image["vocabularyEntryImages"][0],
+            "id": 71,
+            "senseId": 12,
+        }
+    )
+    with pytest.raises(ValueError, match="duplicate image association"):
+        validate_snapshot(duplicate_image)
+
+    duplicate_attempt = _corrupt()
+    duplicate_attempt["imageBackfillAttempts"].append(
+        {**duplicate_attempt["imageBackfillAttempts"][0], "id": 81}
+    )
+    with pytest.raises(ValueError, match="duplicate image backfill"):
+        validate_snapshot(duplicate_attempt)
+
+    malformed_shape = _corrupt()
+    malformed_shape["vocabularyEntryImages"][0]["extra"] = "not canonical"
+    with pytest.raises(ValueError, match="row shape"):
+        validate_snapshot(malformed_shape)
+
+
+def test_snapshot_accepts_intent_only_images_and_no_visual_attempts() -> None:
+    intent_only = _corrupt(
+        vocabularyEntryImages__0__photoUrl=None,
+        vocabularyEntryImages__0__caption=None,
+        vocabularyEntryImages__0__sourceUrl=None,
+        vocabularyEntryImages__0__telegramFileId=None,
+        vocabularyEntryImages__0__telegramFileUniqueId=None,
+    )
+    assert validate_snapshot(intent_only)["vocabularyEntryImages"][0]["photoUrl"] is None
+
+    no_visual = _corrupt(
+        imageBackfillAttempts__0__status="no_visual",
+        imageBackfillAttempts__0__lastError=None,
+    )
+    assert validate_snapshot(no_visual)["imageBackfillAttempts"][0]["lastError"] is None
 
 
 def test_snapshot_accepts_pre_grading_legacy_review_events() -> None:
@@ -484,7 +633,7 @@ def test_snapshot_export_rejects_a_v4_database(tmp_path: Path) -> None:
                 files("hermes_vocab.migrations").joinpath(name).read_text(encoding="utf-8")
             )
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
-        with pytest.raises(ValueError, match="must be version 5, found version 4"):
+        with pytest.raises(ValueError, match="must be version 6, found version 4"):
             verify_database(connection)
     finally:
         connection.close()

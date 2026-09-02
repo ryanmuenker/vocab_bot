@@ -1,7 +1,8 @@
 /**
- * Snapshot format v2: the full v5 spaced-review state as a canonical JSON
- * document that both this Worker and `src/hermes_vocab/cloudflare_snapshot.py`
- * can produce and consume byte-identically.
+ * Snapshot format v3: the full v6 spaced-review and vocabulary-image state
+ * as a canonical JSON document that both this Worker and
+ * `src/hermes_vocab/cloudflare_snapshot.py` can produce and consume
+ * byte-identically. Legacy v2 documents are accepted and upgraded in memory.
  *
  * The wire domain is deliberately narrow: null, booleans are never used, safe
  * non-negative integers, and strings. SQLite REAL columns (the FSRS scalars)
@@ -21,6 +22,27 @@ const REAL_MAX = 1e16;
 
 const GRADES = ["correct", "partial", "incorrect"] as const;
 const CARD_STATES = ["new", "review", "relearning"] as const;
+const IMAGE_CATEGORIES = [
+  "plant",
+  "animal",
+  "architecture",
+  "object",
+  "material",
+  "place",
+  "garment",
+  "food",
+  "vehicle",
+  "instrument",
+  "landform",
+  "visual style",
+] as const;
+const IMAGE_BACKFILL_STATUSES = [
+  "no_visual",
+  "provider_error",
+  "rate_limited",
+  "invalid_response",
+  "image_unavailable",
+] as const;
 
 /**
  * Column kinds. `real` values are decimal strings on the wire and doubles in
@@ -80,6 +102,31 @@ const SENSE_COLUMNS = [
   ["exampleSentence", "example_sentence", "text"],
   ["sourceContext", "source_context", "textNull"],
   ["dateAdded", "date_added", "ts"],
+] as const satisfies readonly Column[];
+const ENTRY_IMAGE_COLUMNS = [
+  ["id", "id", "id"],
+  ["entryId", "entry_id", "id"],
+  ["senseId", "sense_id", "id"],
+  ["category", "category", "enum", IMAGE_CATEGORIES],
+  ["query", "query", "prose"],
+  ["description", "description", "prose"],
+  ["photoUrl", "photo_url", "textNull"],
+  ["caption", "caption", "proseNull"],
+  ["sourceUrl", "source_url", "textNull"],
+  ["telegramFileId", "telegram_file_id", "textNull"],
+  ["telegramFileUniqueId", "telegram_file_unique_id", "textNull"],
+  ["origin", "origin", "enum", ["capture", "backfill"]],
+  ["createdAt", "created_at", "ts"],
+  ["updatedAt", "updated_at", "ts"],
+] as const satisfies readonly Column[];
+
+const IMAGE_BACKFILL_ATTEMPT_COLUMNS = [
+  ["id", "id", "id"],
+  ["entryId", "entry_id", "id"],
+  ["status", "status", "enum", IMAGE_BACKFILL_STATUSES],
+  ["attemptCount", "attempt_count", "int"],
+  ["lastError", "last_error", "proseNull"],
+  ["attemptedAt", "attempted_at", "ts"],
 ] as const satisfies readonly Column[];
 
 const CARD_COLUMNS = [
@@ -239,6 +286,8 @@ const TEST_QUESTION_COLUMNS = [
 
 export type SnapshotEntry = RowOf<typeof ENTRY_COLUMNS>;
 export type SnapshotSense = RowOf<typeof SENSE_COLUMNS>;
+export type SnapshotEntryImage = RowOf<typeof ENTRY_IMAGE_COLUMNS>;
+export type SnapshotImageBackfillAttempt = RowOf<typeof IMAGE_BACKFILL_ATTEMPT_COLUMNS>;
 export type SnapshotCard = RowOf<typeof CARD_COLUMNS>;
 export type SnapshotStudySession = RowOf<typeof STUDY_SESSION_COLUMNS>;
 export type SnapshotStudyQueueItem = RowOf<typeof STUDY_QUEUE_COLUMNS>;
@@ -251,10 +300,9 @@ export type SnapshotTestSession = RowOf<typeof TEST_SESSION_COLUMNS>;
 export type SnapshotTestQuestion = RowOf<typeof TEST_QUESTION_COLUMNS>;
 
 /**
- * Tables in dependency order: importing top to bottom satisfies every foreign
- * key except the study_queue <-> review_attempts cycle, which needs deferral.
+ * Tables present in legacy v2 snapshots.
  */
-const TABLES = [
+const V2_TABLES = [
   { key: "entries", table: "vocabulary_entries", columns: ENTRY_COLUMNS },
   { key: "senses", table: "vocabulary_senses", columns: SENSE_COLUMNS },
   { key: "reviewEvents", table: "review_events", columns: REVIEW_EVENT_COLUMNS },
@@ -268,6 +316,22 @@ const TABLES = [
   { key: "answerDrafts", table: "answer_drafts", columns: ANSWER_DRAFT_COLUMNS },
   { key: "reviewAttempts", table: "review_attempts", columns: REVIEW_ATTEMPT_COLUMNS },
 ] as const satisfies readonly { key: string; table: string; columns: readonly Column[] }[];
+
+/**
+ * Tables in dependency order. Importing top to bottom satisfies every foreign
+ * key except the study_queue <-> review_attempts cycle, which needs deferral.
+ */
+const TABLES = [
+  V2_TABLES[0],
+  V2_TABLES[1],
+  { key: "vocabularyEntryImages", table: "vocabulary_entry_images", columns: ENTRY_IMAGE_COLUMNS },
+  {
+    key: "imageBackfillAttempts",
+    table: "image_backfill_attempts",
+    columns: IMAGE_BACKFILL_ATTEMPT_COLUMNS,
+  },
+  ...V2_TABLES.slice(2),
+] as const;
 
 export interface SnapshotV2 {
   readonly formatVersion: 2;
@@ -285,9 +349,17 @@ export interface SnapshotV2 {
   readonly reviewAttempts: readonly SnapshotReviewAttempt[];
 }
 
+export type SnapshotV3 = Omit<SnapshotV2, "formatVersion"> & {
+  readonly formatVersion: 3;
+  readonly vocabularyEntryImages: readonly SnapshotEntryImage[];
+  readonly imageBackfillAttempts: readonly SnapshotImageBackfillAttempt[];
+};
+
+export type SnapshotImport = SnapshotV2 | SnapshotV3;
+
 export interface ExportEnvelope {
   readonly sha256: string;
-  readonly snapshot: SnapshotV2;
+  readonly snapshot: SnapshotV3;
 }
 
 export type SnapshotSummary = { readonly [K in (typeof TABLES)[number]["key"]]: number } & {
@@ -429,7 +501,7 @@ function uniqueNonNull(values: readonly (string | number | null)[]): boolean {
 }
 
 /** Cross-row invariants that the SQL CHECK constraints and indexes enforce. */
-function validSemantics(snapshot: SnapshotV2): boolean {
+function validSemantics(snapshot: SnapshotV3): boolean {
   const entryIds = ids(snapshot.entries);
   const senseIds = ids(snapshot.senses);
   const cardIds = ids(snapshot.cards);
@@ -444,6 +516,39 @@ function validSemantics(snapshot: SnapshotV2): boolean {
 
   if (!uniqueNonNull(snapshot.entries.map(({ normalizedText }) => normalizedText))) return false;
   if (snapshot.senses.some(({ entryId }) => !entryIds.has(entryId))) return false;
+
+  const imageEntryIds: number[] = [];
+  for (const image of snapshot.vocabularyEntryImages) {
+    if (!entryIds.has(image.entryId) || senseEntry.get(image.senseId) !== image.entryId) return false;
+    imageEntryIds.push(image.entryId);
+    const metadata = [image.photoUrl, image.caption, image.sourceUrl];
+    if (metadata.some((value) => value === null) && metadata.some((value) => value !== null)) {
+      return false;
+    }
+    if (image.caption !== null) {
+      let captionLength = 0;
+      for (const _character of image.caption) {
+        captionLength += 1;
+        if (captionLength > 1024) return false;
+      }
+    }
+    const receipt = [image.telegramFileId, image.telegramFileUniqueId];
+    if (receipt.some((value) => value === null) && receipt.some((value) => value !== null)) {
+      return false;
+    }
+    if (image.telegramFileId !== null && image.photoUrl === null) return false;
+  }
+  if (!uniqueNonNull(imageEntryIds)) return false;
+
+  const backfillEntryIds: number[] = [];
+  for (const attempt of snapshot.imageBackfillAttempts) {
+    if (!entryIds.has(attempt.entryId) || attempt.attemptCount < 1) return false;
+    backfillEntryIds.push(attempt.entryId);
+    if ((attempt.status === "no_visual") !== (attempt.lastError === null)) return false;
+  }
+  if (!uniqueNonNull(backfillEntryIds)) return false;
+  const associatedEntries = new Set(imageEntryIds);
+  if (backfillEntryIds.some((entryId) => associatedEntries.has(entryId))) return false;
 
   // Legacy audit carriers keep their pre-card shape. An answered event must
   // carry the answer itself, but `grade`/`evaluationFeedback` may be null:
@@ -612,22 +717,41 @@ function validSemantics(snapshot: SnapshotV2): boolean {
   return true;
 }
 
-export function parseSnapshot(value: unknown): SnapshotV2 | null {
+type ParsedSnapshot = {
+  readonly snapshot: SnapshotV3;
+  readonly digestSource: SnapshotImport;
+};
+
+function parseSnapshotVersion(value: unknown): ParsedSnapshot | null {
   const root = record(value);
-  const keys = ["formatVersion", ...TABLES.map(({ key }) => key)];
-  if (root === null || !exactKeys(root, keys) || root.formatVersion !== 2) return null;
-  const parsed: Record<string, unknown> = { formatVersion: 2 };
-  for (const { key, columns } of TABLES) {
+  if (root === null || (root.formatVersion !== 2 && root.formatVersion !== 3)) return null;
+  const tables = root.formatVersion === 2 ? V2_TABLES : TABLES;
+  const keys = ["formatVersion", ...tables.map(({ key }) => key)];
+  if (!exactKeys(root, keys)) return null;
+  const parsed: Record<string, unknown> = { formatVersion: root.formatVersion };
+  for (const { key, columns } of tables) {
     const rows = parseTable(root[key], columns);
     if (rows === null) return null;
     parsed[key] = rows;
   }
-  const snapshot = parsed as unknown as SnapshotV2;
+  const digestSource = parsed as unknown as SnapshotImport;
+  const snapshot = root.formatVersion === 2
+    ? {
+        ...digestSource,
+        formatVersion: 3,
+        vocabularyEntryImages: [],
+        imageBackfillAttempts: [],
+      } as SnapshotV3
+    : digestSource as SnapshotV3;
   try {
-    return validSemantics(snapshot) ? snapshot : null;
+    return validSemantics(snapshot) ? { snapshot, digestSource } : null;
   } catch {
     return null;
   }
+}
+
+export function parseSnapshot(value: unknown): SnapshotV3 | null {
+  return parseSnapshotVersion(value)?.snapshot ?? null;
 }
 
 export function canonicalizeJcs(value: unknown): string {
@@ -649,7 +773,7 @@ export function canonicalizeJcs(value: unknown): string {
   }).join(",")}}`;
 }
 
-export async function sha256Snapshot(snapshot: SnapshotV2): Promise<string> {
+export async function sha256Snapshot(snapshot: SnapshotImport): Promise<string> {
   const digest = await crypto.subtle.digest(
     "SHA-256",
     new TextEncoder().encode(canonicalizeJcs(snapshot)),
@@ -665,20 +789,20 @@ export async function parseVerifiedEnvelope(value: unknown): Promise<ExportEnvel
   const root = record(value);
   if (root === null || !exactKeys(root, ["sha256", "snapshot"]) ||
       typeof root.sha256 !== "string" || !SHA256_PATTERN.test(root.sha256)) return null;
-  const snapshot = parseSnapshot(root.snapshot);
-  if (snapshot === null || (await sha256Snapshot(snapshot)) !== root.sha256) return null;
-  return { sha256: root.sha256, snapshot };
+  const parsed = parseSnapshotVersion(root.snapshot);
+  if (parsed === null || (await sha256Snapshot(parsed.digestSource)) !== root.sha256) return null;
+  return { sha256: root.sha256, snapshot: parsed.snapshot };
 }
 
-export function summarizeSnapshot(snapshot: SnapshotV2, sha256: string): SnapshotSummary {
+export function summarizeSnapshot(snapshot: SnapshotV3, sha256: string): SnapshotSummary {
   const counts: Record<string, number> = {};
   for (const { key } of TABLES) counts[key] = snapshot[key].length;
   return { ...counts, sha256 } as SnapshotSummary;
 }
 
-/** Read the whole v5 state out of Durable Object SQLite. */
-export function readSnapshot(storage: DurableObjectStorage): SnapshotV2 {
-  const snapshot: Record<string, unknown> = { formatVersion: 2 };
+/** Read the whole v6 state out of Durable Object SQLite. */
+export function readSnapshot(storage: DurableObjectStorage): SnapshotV3 {
+  const snapshot: Record<string, unknown> = { formatVersion: 3 };
   for (const { key, table, columns } of TABLES) {
     const query = `SELECT ${columns.map(([, column]) => column).join(", ")} FROM ${table} ORDER BY id`;
     snapshot[key] = Array.from(
@@ -696,12 +820,12 @@ export function readSnapshot(storage: DurableObjectStorage): SnapshotV2 {
     });
   }
   const parsed = parseSnapshot(snapshot);
-  if (parsed === null) throw new TypeError("Stored state is not a valid SnapshotV2");
+  if (parsed === null) throw new TypeError("Stored state is not a valid SnapshotV3");
   return parsed;
 }
 
 /** Write a validated snapshot into otherwise empty Durable Object SQLite. */
-export function writeSnapshot(storage: DurableObjectStorage, snapshot: SnapshotV2): void {
+export function writeSnapshot(storage: DurableObjectStorage, snapshot: SnapshotV3): void {
   storage.transactionSync(() => {
     const sql = storage.sql;
     // study_queue.completed_attempt_id and review_attempts.queue_item_id form
@@ -717,7 +841,7 @@ export function writeSnapshot(storage: DurableObjectStorage, snapshot: SnapshotV
       const query =
         `INSERT INTO ${table} (${columns.map(([, column]) => column).join(", ")}) ` +
         `VALUES (${columns.map(() => "?").join(", ")})`;
-      // Rows are validated SnapshotV2 rows; the union of per-table row shapes
+      // Rows are validated SnapshotV3 rows; the union of per-table row shapes
       // has no index signature, so widen once here rather than per access.
       const rows = snapshot[key] as readonly Record<string, string | number | null>[];
       for (const row of rows) {

@@ -13,6 +13,8 @@ import { readInspectorData } from "./domain/inspector";
 import type { InspectorData } from "./domain/inspector";
 import {
   CaptureStatus,
+  EntryImageOrigin,
+  ImageBackfillStatus,
   CardDirection,
   EntryTextStatus,
   EvaluationGrade,
@@ -27,12 +29,7 @@ import type {
   ReviewRating,
   StudyAnswerContext,
   StudyPromptSnapshot,
-  VisualIntent,
 } from "./domain/models";
-import {
-  decodeVisualIntent,
-  encodeVisualIntent,
-} from "./domain/visual-enrichment";
 import { caseFold, normalizeEntryText, trimPythonWhitespace } from "./domain/normalization";
 import {
   allowedRatings,
@@ -43,11 +40,12 @@ import {
 } from "./domain/routing";
 import type { StudyCommand, StudyCommandName } from "./domain/routing";
 import { parseSnapshot, readSnapshot, sha256Snapshot, summarizeSnapshot, writeSnapshot } from "./domain/snapshot";
-import type { SnapshotSummary, SnapshotV2 } from "./domain/snapshot";
+import type { SnapshotImport, SnapshotSummary, SnapshotV3 } from "./domain/snapshot";
 import {
   DefinitionStatus,
   EvaluationStatus,
   OpenCodeAdapter,
+  VisualSelectionStatus,
 } from "./integrations/opencode";
 import type { EvaluationResult } from "./integrations/opencode";
 import { splitTelegramMessage, TelegramAdapter } from "./integrations/telegram";
@@ -56,8 +54,16 @@ import type {
   WikimediaLookupRequest,
   WikimediaPhotoCandidate,
 } from "./integrations/wikimedia";
-import { initializeSchema, migrateInboxVisualIntent } from "./storage/schema";
-import { TEST_REQUIRED_CARDS, VocabularyStore } from "./storage/vocabulary-store";
+import {
+  initializeSchema,
+  migrateInboxPhotoEntry,
+  migrateInboxVisualIntent,
+} from "./storage/schema";
+import {
+  TEST_REQUIRED_CARDS,
+  VocabularyStore,
+} from "./storage/vocabulary-store";
+import type { ImageBackfillSummary } from "./storage/vocabulary-store";
 
 const EMPTY_REPLY = "Send a word or phrase.";
 const TOO_LONG_REPLY = "Send a word or phrase under 500 characters.";
@@ -138,6 +144,7 @@ interface InboxRow extends Record<string, SqlStorageValue> {
   coalesced_to_event_id: number | null;
   response_text: string | null;
   visual_intent: string | null;
+  photo_entry_id: number | null;
   next_chunk_index: number;
   attempt_count: number;
   created_at: string;
@@ -156,7 +163,16 @@ export interface AdmittedTelegramMessage {
 
 interface PhotoDeliveryRequest {
   readonly eventId: number;
+  readonly entryId: number;
+  readonly fileId: string | null;
+  readonly candidate: WikimediaPhotoCandidate | null;
   readonly lookup: WikimediaLookupRequest;
+}
+
+interface StudyPreparation {
+  readonly text: string;
+  readonly promptId: number | null;
+  readonly photoEntryId: number | null;
 }
 
 function timestamp(now = new Date()): string {
@@ -217,6 +233,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
     void this.ctx.blockConcurrencyWhile(async () => {
       initializeSchema(this.ctx.storage.sql);
       migrateInboxVisualIntent(this.ctx.storage.sql);
+      migrateInboxPhotoEntry(this.ctx.storage.sql);
       this.store.runReverseCardCapMaintenance();
     });
   }
@@ -288,9 +305,9 @@ export class VocabularyCompanion extends DurableObject<Env> {
     return routed;
   }
 
-  async importSnapshot(snapshot: SnapshotV2): Promise<SnapshotSummary> {
+  async importSnapshot(snapshot: SnapshotImport): Promise<SnapshotSummary> {
     const parsed = parseSnapshot(snapshot);
-    if (parsed === null) throw new TypeError("Invalid SnapshotV2");
+    if (parsed === null) throw new TypeError("Invalid vocabulary snapshot");
     const inboxCount = this.ctx.storage.sql.exec<{ count: number }>(
       "SELECT COUNT(*) AS count FROM inbox_events",
     ).one().count;
@@ -301,7 +318,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
     return summarizeSnapshot(imported, await sha256Snapshot(imported));
   }
 
-  async exportSnapshot(): Promise<SnapshotV2 | null> {
+  async exportSnapshot(): Promise<SnapshotV3 | null> {
     const unfinished = this.ctx.storage.sql.exec<{ count: number }>(
       "SELECT COUNT(*) AS count FROM inbox_events WHERE status IN ('pending', 'waiting', 'ready')",
     ).one().count;
@@ -332,6 +349,117 @@ export class VocabularyCompanion extends DurableObject<Env> {
     if (result.status === DefinitionStatus.FOUND) return { status: "found" };
     if (result.status === DefinitionStatus.NOT_FOUND) return { status: "not_found" };
     return { status: "error" };
+  }
+
+  async backfillImages(input: {
+    readonly limit: number;
+    readonly retryFailures: boolean;
+  }): Promise<{
+    readonly processed: number;
+    readonly associated: number;
+    readonly failed: number;
+    readonly status: ImageBackfillSummary;
+  }> {
+    if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 10) {
+      throw new RangeError("image backfill limit must be an integer from 1 through 10");
+    }
+    if (typeof input.retryFailures !== "boolean") {
+      throw new TypeError("retryFailures must be a boolean");
+    }
+
+    const entries = this.store.imageBackfillEntries(input.limit, input.retryFailures);
+    let associated = 0;
+    for (const entry of entries) {
+      let selected;
+      try {
+        selected = await this.provider.selectVisual(entry);
+      } catch {
+        this.store.recordImageBackfillAttempt(
+          entry.id,
+          ImageBackfillStatus.PROVIDER_ERROR,
+          "provider_error",
+        );
+        continue;
+      }
+      if (
+        selected.status !== VisualSelectionStatus.FOUND ||
+        selected.visualIntent === null
+      ) {
+        const status =
+          selected.status === VisualSelectionStatus.NO_VISUAL
+            ? ImageBackfillStatus.NO_VISUAL
+            : selected.status === VisualSelectionStatus.RATE_LIMITED
+              ? ImageBackfillStatus.RATE_LIMITED
+              : selected.status === VisualSelectionStatus.INVALID_RESPONSE
+                ? ImageBackfillStatus.INVALID_RESPONSE
+                : ImageBackfillStatus.PROVIDER_ERROR;
+        this.store.recordImageBackfillAttempt(
+          entry.id,
+          status,
+          status === ImageBackfillStatus.NO_VISUAL ? null : status,
+        );
+        continue;
+      }
+
+      const sense = entry.senses[selected.visualIntent.senseIndex];
+      if (sense === undefined) {
+        this.store.recordImageBackfillAttempt(
+          entry.id,
+          ImageBackfillStatus.INVALID_RESPONSE,
+          "invalid_response",
+        );
+        continue;
+      }
+      let candidate: WikimediaPhotoCandidate | null;
+      try {
+        candidate = await this.wikimedia.findPhoto({
+          displayText: entry.displayText,
+          sense,
+          intent: selected.visualIntent,
+        });
+      } catch {
+        candidate = null;
+      }
+      if (candidate === null) {
+        this.store.recordImageBackfillAttempt(
+          entry.id,
+          ImageBackfillStatus.IMAGE_UNAVAILABLE,
+          "image_unavailable",
+        );
+        continue;
+      }
+
+      const image = this.store.saveEntryImageIntent(
+        entry.id,
+        sense.id,
+        selected.visualIntent,
+        EntryImageOrigin.BACKFILL,
+      );
+      if (image === null) {
+        this.store.recordImageBackfillAttempt(
+          entry.id,
+          ImageBackfillStatus.INVALID_RESPONSE,
+          "storage_error",
+        );
+        continue;
+      }
+      if (image.photoUrl === null) {
+        this.store.saveEntryImageCandidate(entry.id, candidate);
+      }
+      const persistedImage = this.store.getEntryImage(entry.id);
+      if (persistedImage !== null && persistedImage.photoUrl !== null) associated += 1;
+    }
+
+    return {
+      processed: entries.length,
+      associated,
+      failed: entries.length - associated,
+      status: this.store.imageBackfillSummary(),
+    };
+  }
+
+  async imageBackfillStatus(): Promise<ImageBackfillSummary> {
+    return this.store.imageBackfillSummary();
   }
 
   /**
@@ -741,13 +869,13 @@ export class VocabularyCompanion extends DurableObject<Env> {
     }
     const now = new Date(event.created_at);
     const prepared = await this.prepareStudyAnswer(payload.promptId, payload.answerText, now);
-    this.readyEvent(event.id, prepared.text, prepared.promptId);
+    this.readyEvent(event.id, prepared.text, prepared.promptId, prepared.photoEntryId);
     await this.recordDeliveryIntent(event.dedupe_key, now);
   }
 
   private async prepareCapture(event: InboxRow, displayText: string): Promise<void> {
     const definition = await this.provider.defineEntry(displayText);
-    let visualIntent: VisualIntent | null = null;
+    let photoEntryId: number | null = null;
     let response: string;
     if (definition.status === DefinitionStatus.NOT_FOUND) {
       response = NOT_FOUND_REPLY;
@@ -763,11 +891,22 @@ export class VocabularyCompanion extends DurableObject<Env> {
           result.entry,
           result.status === CaptureStatus.SAVED ? "✓ Saved." : "Already saved.",
         );
-        if (result.status === CaptureStatus.SAVED) visualIntent = definition.visualIntent;
+        if (result.status === CaptureStatus.SAVED && definition.visualIntent !== null) {
+          const sense = result.entry.senses[definition.visualIntent.senseIndex];
+          if (sense !== undefined) {
+            const image = this.store.saveEntryImageIntent(
+              result.entry.id,
+              sense.id,
+              definition.visualIntent,
+              EntryImageOrigin.CAPTURE,
+            );
+            if (image !== null) photoEntryId = result.entry.id;
+          }
+        }
       }
     }
     this.ctx.storage.transactionSync(() => {
-      this.readyEvent(event.id, response, null, visualIntent);
+      this.readyEvent(event.id, response, null, photoEntryId);
       const followers = rows(
         this.ctx.storage.sql.exec<{ id: number }>(
           "SELECT id FROM inbox_events WHERE status = 'waiting' AND coalesced_to_event_id = ? ORDER BY id",
@@ -786,43 +925,56 @@ export class VocabularyCompanion extends DurableObject<Env> {
     promptId: number,
     answerText: string,
     now: Date,
-  ): Promise<{ text: string; promptId: number | null }> {
+  ): Promise<StudyPreparation> {
     const context = this.store.currentAnswerContext();
-    if (context === null) return { text: NO_ACTIVE_REPLY, promptId: null };
-    if (context.prompt.id !== promptId) return { text: STALE_PROMPT_REPLY, promptId: null };
+    if (context === null) {
+      return { text: NO_ACTIVE_REPLY, promptId: null, photoEntryId: null };
+    }
+    if (context.prompt.id !== promptId) {
+      return { text: STALE_PROMPT_REPLY, promptId: null, photoEntryId: null };
+    }
 
     if (context.draft !== null) {
       const choices = allowedRatings(context.draft.evaluation.grade);
       if (context.draft.evaluation.grade === EvaluationGrade.INCORRECT) {
-        return this.settleStudyStep(context, "again", now);
+        return { ...this.settleStudyStep(context, "again", now), photoEntryId: null };
       }
       const rating = parseRating(answerText, choices);
-      if (rating === null) return { text: INVALID_RATING_REPLY, promptId: null };
-      return this.settleStudyStep(context, rating, now);
+      if (rating === null) {
+        return { text: INVALID_RATING_REPLY, promptId: null, photoEntryId: null };
+      }
+      return { ...this.settleStudyStep(context, rating, now), photoEntryId: null };
     }
     if (trimPythonWhitespace(answerText).length === 0) {
-      return { text: INVALID_ANSWER_REPLY, promptId: null };
+      return { text: INVALID_ANSWER_REPLY, promptId: null, photoEntryId: null };
     }
 
     const evaluated = await this.evaluateAnswer(context, answerText);
     if (evaluated.status === EvaluationStatus.RATE_LIMITED) {
-      return { text: EVALUATION_RATE_LIMIT_REPLY, promptId: null };
+      return { text: EVALUATION_RATE_LIMIT_REPLY, promptId: null, photoEntryId: null };
     }
     if (evaluated.status !== EvaluationStatus.VALID || evaluated.evaluation === null) {
-      return { text: EVALUATION_ERROR_REPLY, promptId: null };
+      return { text: EVALUATION_ERROR_REPLY, promptId: null, photoEntryId: null };
     }
     if (this.store.recordAnswer(context.prompt.id, answerText, evaluated.evaluation, now) === null) {
-      return { text: STUDY_STORAGE_ERROR_REPLY, promptId: null };
+      return { text: STUDY_STORAGE_ERROR_REPLY, promptId: null, photoEntryId: null };
     }
     const persisted = this.store.currentAnswerContext();
     if (persisted === null || persisted.draft === null) {
-      return { text: STALE_PROMPT_REPLY, promptId: null };
+      return { text: STALE_PROMPT_REPLY, promptId: null, photoEntryId: null };
     }
     const choices = allowedRatings(persisted.draft.evaluation.grade);
     if (persisted.draft.evaluation.grade === EvaluationGrade.INCORRECT) {
-      return this.settleStudyStep(persisted, "again", now);
+      return {
+        ...this.settleStudyStep(persisted, "again", now),
+        photoEntryId: persisted.entry.id,
+      };
     }
-    return { text: formatStudyEvaluation(persisted, choices), promptId: persisted.prompt.id };
+    return {
+      text: formatStudyEvaluation(persisted, choices),
+      promptId: persisted.prompt.id,
+      photoEntryId: persisted.entry.id,
+    };
   }
 
   private async evaluateAnswer(
@@ -987,7 +1139,8 @@ export class VocabularyCompanion extends DurableObject<Env> {
       rows(this.ctx.storage.sql.exec(
         `UPDATE inbox_events
          SET status = 'failed', attempt_count = ?, updated_at = ?,
-             last_error = 'telegram_delivery_failed', payload = NULL, visual_intent = NULL
+             last_error = 'telegram_delivery_failed', payload = NULL,
+             visual_intent = NULL, photo_entry_id = NULL
          WHERE id = ? AND status = 'ready'`,
         attempts,
         timestamp(),
@@ -1021,50 +1174,112 @@ export class VocabularyCompanion extends DurableObject<Env> {
   }
 
   private photoDeliveryRequest(event: InboxRow): PhotoDeliveryRequest | null {
-    if (event.visual_intent === null) return null;
-    if (event.normalized_key === null) {
+    if (event.photo_entry_id === null) return null;
+    const entry = this.store.getEntryById(event.photo_entry_id);
+    const image = this.store.getEntryImage(event.photo_entry_id);
+    if (entry === null || image === null) {
       this.logOptionalPhotoFailure(event.id, "intent", "invalid");
       return null;
     }
-    const entry = this.store.getEntry(event.normalized_key);
-    if (entry === null) {
-      this.logOptionalPhotoFailure(event.id, "intent", "invalid");
-      return null;
-    }
-    const intent = decodeVisualIntent(entry.displayText, entry.senses, event.visual_intent);
-    if (intent === null) {
-      this.logOptionalPhotoFailure(event.id, "intent", "invalid");
-      return null;
-    }
-    const sense = entry.senses[intent.senseIndex];
+    const senseIndex = entry.senses.findIndex((sense) => sense.id === image.senseId);
+    const sense = entry.senses[senseIndex];
     if (sense === undefined) {
+      this.logOptionalPhotoFailure(event.id, "intent", "invalid");
+      return null;
+    }
+    const candidate =
+      image.photoUrl === null && image.caption === null && image.sourceUrl === null
+        ? null
+        : image.photoUrl !== null && image.caption !== null && image.sourceUrl !== null
+          ? {
+              photoUrl: image.photoUrl,
+              caption: image.caption,
+              sourceUrl: image.sourceUrl,
+            }
+          : null;
+    if (
+      candidate === null &&
+      (image.photoUrl !== null || image.caption !== null || image.sourceUrl !== null)
+    ) {
       this.logOptionalPhotoFailure(event.id, "intent", "invalid");
       return null;
     }
     return {
       eventId: event.id,
+      entryId: entry.id,
+      fileId: image.telegramFileId,
+      candidate,
       lookup: {
         displayText: entry.displayText,
         sense,
-        intent,
+        intent: {
+          senseIndex,
+          category: image.category,
+          query: image.query,
+          description: image.description,
+        },
       },
     };
   }
 
   private async deliverOptionalPhoto(request: PhotoDeliveryRequest): Promise<void> {
-    let candidate: WikimediaPhotoCandidate | null;
-    try {
-      candidate = await this.wikimedia.findPhoto(request.lookup);
-    } catch {
-      this.logOptionalPhotoFailure(request.eventId, "wikimedia", "unavailable");
-      return;
-    }
+    let candidate = request.candidate;
+    let fileId = request.fileId;
     if (candidate === null) {
-      this.logOptionalPhotoFailure(request.eventId, "wikimedia", "unavailable");
-      return;
+      try {
+        candidate = await this.wikimedia.findPhoto(request.lookup);
+      } catch {
+        this.logOptionalPhotoFailure(request.eventId, "wikimedia", "unavailable");
+        return;
+      }
+      if (candidate === null) {
+        this.logOptionalPhotoFailure(request.eventId, "wikimedia", "unavailable");
+        return;
+      }
+      this.store.saveEntryImageCandidate(request.entryId, candidate);
+      const persisted = this.store.getEntryImage(request.entryId);
+      if (
+        persisted?.photoUrl !== null &&
+        persisted?.photoUrl !== undefined &&
+        persisted.caption !== null &&
+        persisted.sourceUrl !== null
+      ) {
+        candidate = {
+          photoUrl: persisted.photoUrl,
+          caption: persisted.caption,
+          sourceUrl: persisted.sourceUrl,
+        };
+        fileId = persisted.telegramFileId;
+      }
     }
     try {
-      await this.telegram.sendPhoto(candidate.photoUrl, candidate.caption);
+      const receipt = await this.telegram.sendPhoto(
+        fileId ?? candidate.photoUrl,
+        candidate.caption,
+      );
+      if (fileId === null) {
+        this.store.attachEntryImageReceipt(request.entryId, {
+          telegramFileId: receipt.fileId,
+          telegramFileUniqueId: receipt.fileUniqueId,
+        });
+      }
+      return;
+    } catch {
+      if (fileId === null) {
+        this.logOptionalPhotoFailure(request.eventId, "telegram", "rejected");
+        return;
+      }
+    }
+
+    // Telegram file IDs are durable but can become unusable. Fall back to the
+    // persisted Commons URL once, then replace the cached receipt on success.
+    this.store.clearEntryImageReceipt(request.entryId);
+    try {
+      const receipt = await this.telegram.sendPhoto(candidate.photoUrl, candidate.caption);
+      this.store.attachEntryImageReceipt(request.entryId, {
+        telegramFileId: receipt.fileId,
+        telegramFileUniqueId: receipt.fileUniqueId,
+      });
     } catch {
       this.logOptionalPhotoFailure(request.eventId, "telegram", "rejected");
     }
@@ -1160,16 +1375,16 @@ export class VocabularyCompanion extends DurableObject<Env> {
     id: number,
     response: string,
     preparedTargetId: number | null,
-    visualIntent: VisualIntent | null = null,
+    photoEntryId: number | null = null,
   ): void {
     rows(this.ctx.storage.sql.exec(
       `UPDATE inbox_events
-       SET status = 'ready', response_text = ?, visual_intent = ?, payload = NULL,
-           prepared_target_id = ?, next_chunk_index = 0, attempt_count = 0,
-           updated_at = ?, last_error = NULL
+       SET status = 'ready', response_text = ?, visual_intent = NULL,
+           photo_entry_id = ?, payload = NULL, prepared_target_id = ?,
+           next_chunk_index = 0, attempt_count = 0, updated_at = ?, last_error = NULL
        WHERE id = ? AND status IN ('pending', 'waiting')`,
       response,
-      visualIntent === null ? null : encodeVisualIntent(visualIntent),
+      photoEntryId,
       preparedTargetId,
       timestamp(),
       id,
@@ -1180,7 +1395,8 @@ export class VocabularyCompanion extends DurableObject<Env> {
     rows(this.ctx.storage.sql.exec(
       `UPDATE inbox_events
        SET status = 'completed', payload = NULL, response_text = NULL,
-           visual_intent = NULL, updated_at = ?, last_error = NULL
+           visual_intent = NULL, photo_entry_id = NULL,
+           updated_at = ?, last_error = NULL
        WHERE id = ? AND status = 'ready'`,
       timestamp(),
       id,
@@ -1191,7 +1407,7 @@ export class VocabularyCompanion extends DurableObject<Env> {
     rows(this.ctx.storage.sql.exec(
       `UPDATE inbox_events
        SET status = 'failed', payload = NULL, response_text = NULL,
-           visual_intent = NULL, updated_at = ?, last_error = ?
+           visual_intent = NULL, photo_entry_id = NULL, updated_at = ?, last_error = ?
        WHERE id = ?`,
       timestamp(),
       reason,

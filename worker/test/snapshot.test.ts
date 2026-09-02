@@ -12,20 +12,31 @@ import {
   summarizeSnapshot,
   writeSnapshot,
   type SnapshotV2,
+  type SnapshotV3,
 } from "../src/domain/snapshot";
 import { initializeSchema } from "../src/storage/schema";
 
-/** Exercises every v5 table, both card directions, and preserved v4 history. */
+/** Exercises every v6 table, both card directions, and preserved v4 history. */
 const SNAPSHOT = {
-  formatVersion: 2,
-  entries: [{
-    id: 7,
-    displayText: "Straße 😀",
-    normalizedText: "strasse 😀",
-    dateAdded: "2026-07-20T00:00:00Z",
-    lastReviewed: "2026-07-22T16:30:00Z",
-    reviewStatus: "reviewed",
-  }],
+  formatVersion: 3,
+  entries: [
+    {
+      id: 7,
+      displayText: "Straße 😀",
+      normalizedText: "strasse 😀",
+      dateAdded: "2026-07-20T00:00:00Z",
+      lastReviewed: "2026-07-22T16:30:00Z",
+      reviewStatus: "reviewed",
+    },
+    {
+      id: 8,
+      displayText: "Fallback",
+      normalizedText: "fallback",
+      dateAdded: "2026-07-23T00:00:00Z",
+      lastReviewed: null,
+      reviewStatus: "new",
+    },
+  ],
   senses: [
     {
       id: 11,
@@ -45,7 +56,40 @@ const SNAPSHOT = {
       sourceContext: null,
       dateAdded: "2026-07-20T00:00:00Z",
     },
+    {
+      id: 13,
+      entryId: 8,
+      definition: "a reserve entry without an image",
+      partOfSpeech: "noun",
+      exampleSentence: "The fallback remains textual.",
+      sourceContext: null,
+      dateAdded: "2026-07-23T00:00:00Z",
+    },
   ],
+  vocabularyEntryImages: [{
+    id: 70,
+    entryId: 7,
+    senseId: 11,
+    category: "place",
+    query: "Straße street Germany",
+    description: "A street in Germany.",
+    photoUrl: "https://upload.wikimedia.org/example.jpg",
+    caption: "A street in Germany. Source: Example",
+    sourceUrl: "https://commons.wikimedia.org/wiki/File:Example.jpg",
+    telegramFileId: "AgACAgIAAxkBAAI",
+    telegramFileUniqueId: "AQADexample",
+    origin: "capture",
+    createdAt: "2026-07-20T00:01:00Z",
+    updatedAt: "2026-07-22T16:31:00Z",
+  }],
+  imageBackfillAttempts: [{
+    id: 80,
+    entryId: 8,
+    status: "rate_limited",
+    attemptCount: 2,
+    lastError: "Wikimedia returned 429",
+    attemptedAt: "2026-07-23T00:05:00Z",
+  }],
   reviewEvents: [{
     id: 3,
     entryId: 7,
@@ -278,27 +322,36 @@ const SNAPSHOT = {
       createdAt: "2026-07-19T12:00:00Z",
     },
   ],
-} as const satisfies SnapshotV2;
+} as const satisfies SnapshotV3;
 
 function stub() {
   return env.VOCABULARY.getByName(`snapshot-${crypto.randomUUID()}`);
 }
 
-/** Deeply mutable mirror of SnapshotV2 so corruption edits stay type-checked. */
+/** Deeply mutable mirror of SnapshotV3 so corruption edits stay type-checked. */
 type Draft = {
-  -readonly [K in keyof SnapshotV2]: SnapshotV2[K] extends readonly (infer Row)[]
+  -readonly [K in keyof SnapshotV3]: SnapshotV3[K] extends readonly (infer Row)[]
     ? { -readonly [F in keyof Row]: Row[F] }[]
-    : SnapshotV2[K];
+    : SnapshotV3[K];
 };
 
 function mutate(change: (draft: Draft) => void): unknown {
-  // JSON.parse returns `any`; the clone is structurally SnapshotV2 by construction.
+  // JSON.parse returns `any`; the clone is structurally SnapshotV3 by construction.
   const draft = JSON.parse(JSON.stringify(SNAPSHOT)) as Draft;
   change(draft);
   return draft;
 }
 
-describe("SnapshotV2 and JCS", () => {
+function legacySnapshot(): SnapshotV2 {
+  const {
+    vocabularyEntryImages: _vocabularyEntryImages,
+    imageBackfillAttempts: _imageBackfillAttempts,
+    ...base
+  } = SNAPSHOT;
+  return { ...base, formatVersion: 2 };
+}
+
+describe("SnapshotV3 and JCS", () => {
   it("matches the cross-language constrained JCS vector", async () => {
     const vector = {
       nested: { z: null, a: true },
@@ -330,7 +383,7 @@ describe("SnapshotV2 and JCS", () => {
     expect(() => encodeReal(Number.NaN)).toThrow(/outside the snapshot domain/u);
   });
 
-  it("round-trips every v5 table through Durable Object SQLite unchanged", async () => {
+  it("round-trips every v6 table through Durable Object SQLite unchanged", async () => {
     expect(parseSnapshot(SNAPSHOT)).toEqual(SNAPSHOT);
     await runInDurableObject(stub(), (_instance, state) => {
       initializeSchema(state.storage.sql);
@@ -369,10 +422,12 @@ describe("SnapshotV2 and JCS", () => {
     const sha256 = await sha256Snapshot(SNAPSHOT);
     // tests/unit/test_cloudflare_snapshot.py asserts the same digest over a
     // byte-identical fixture: proof the two implementations agree on the wire.
-    expect(sha256).toBe("d4fa50222abf362c042a16b3402878990f994480f1c59f7128e88a91fbc4bba8");
+    expect(sha256).toBe("e98381d5a9c04b414326e7417d94d40ea68c5058bf77ae2293a0cbf52f22c21e");
     expect(summarizeSnapshot(SNAPSHOT, sha256)).toEqual({
-      entries: 1,
-      senses: 2,
+      entries: 2,
+      senses: 3,
+      vocabularyEntryImages: 1,
+      imageBackfillAttempts: 1,
       reviewEvents: 1,
       testSessions: 1,
       testQuestions: 1,
@@ -395,6 +450,26 @@ describe("SnapshotV2 and JCS", () => {
     await expect(parseVerifiedEnvelope({ sha256, snapshot: tampered })).resolves.toBeNull();
     await expect(parseVerifiedEnvelope({ sha256: "0".repeat(64), snapshot: SNAPSHOT }))
       .resolves.toBeNull();
+  });
+
+  it("verifies a legacy v2 digest before upgrading the snapshot", async () => {
+    const legacy = legacySnapshot();
+    const sha256 = await sha256Snapshot(legacy);
+    const upgraded = {
+      ...legacy,
+      formatVersion: 3,
+      vocabularyEntryImages: [],
+      imageBackfillAttempts: [],
+    };
+    expect(parseSnapshot(legacy)).toEqual(upgraded);
+    await expect(parseVerifiedEnvelope({ sha256, snapshot: legacy })).resolves.toEqual({
+      sha256,
+      snapshot: upgraded,
+    });
+    await expect(parseVerifiedEnvelope({
+      sha256: await sha256Snapshot(SNAPSHOT),
+      snapshot: legacy,
+    })).resolves.toBeNull();
   });
 
   it("refuses v4 snapshots, non-canonical reals, and dangling references", () => {
@@ -429,6 +504,62 @@ describe("SnapshotV2 and JCS", () => {
     }))).toBeNull();
   });
 
+  it("rejects malformed image states, orphan rows, and duplicate entry associations", () => {
+    const changes: ((draft: Draft) => void)[] = [
+      (draft) => { draft.vocabularyEntryImages[0]!.caption = null; },
+      (draft) => { draft.vocabularyEntryImages[0]!.telegramFileUniqueId = null; },
+      (draft) => {
+        draft.vocabularyEntryImages[0]!.photoUrl = null;
+        draft.vocabularyEntryImages[0]!.caption = null;
+        draft.vocabularyEntryImages[0]!.sourceUrl = null;
+      },
+      (draft) => { draft.vocabularyEntryImages[0]!.caption = "x".repeat(1025); },
+      (draft) => { draft.vocabularyEntryImages[0]!.entryId = 99; },
+      (draft) => { draft.vocabularyEntryImages[0]!.senseId = 13; },
+      (draft) => { draft.imageBackfillAttempts[0]!.entryId = 99; },
+      (draft) => { draft.imageBackfillAttempts[0]!.entryId = 7; },
+      (draft) => { draft.imageBackfillAttempts[0]!.attemptCount = 0; },
+      (draft) => { draft.imageBackfillAttempts[0]!.lastError = null; },
+      (draft) => { draft.imageBackfillAttempts[0]!.status = "no_visual"; },
+    ];
+    for (const change of changes) expect(parseSnapshot(mutate(change))).toBeNull();
+
+    expect(parseSnapshot(mutate((draft) => {
+      draft.vocabularyEntryImages.push({
+        ...draft.vocabularyEntryImages[0]!,
+        id: 71,
+        senseId: 12,
+      });
+    }))).toBeNull();
+    expect(parseSnapshot(mutate((draft) => {
+      draft.imageBackfillAttempts.push({
+        ...draft.imageBackfillAttempts[0]!,
+        id: 81,
+      });
+    }))).toBeNull();
+
+    const malformedShape = mutate(() => {}) as Record<string, unknown>;
+    const rows = malformedShape.vocabularyEntryImages as Record<string, unknown>[];
+    rows[0]!.extra = "not canonical";
+    expect(parseSnapshot(malformedShape)).toBeNull();
+  });
+
+  it("accepts intent-only images and terminal no-visual attempts", () => {
+    expect(parseSnapshot(mutate((draft) => {
+      const image = draft.vocabularyEntryImages[0]!;
+      image.photoUrl = null;
+      image.caption = null;
+      image.sourceUrl = null;
+      image.telegramFileId = null;
+      image.telegramFileUniqueId = null;
+    }))).not.toBeNull();
+    expect(parseSnapshot(mutate((draft) => {
+      const attempt = draft.imageBackfillAttempts[0]!;
+      attempt.status = "no_visual";
+      attempt.lastError = null;
+    }))).not.toBeNull();
+  });
+
   it("accepts pre-grading legacy review events but still binds the answer to the status", () => {
     // v4 recorded answers before it recorded grades; those rows are real
     // history and must cross the bridge rather than block the export.
@@ -451,7 +582,7 @@ describe("SnapshotV2 and JCS", () => {
   });
 });
 
-describe("v5 schema", () => {
+describe("v6 schema", () => {
   it("keeps the append-only triggers and drops the v4-only indexes", async () => {
     await runInDurableObject(stub(), (_instance, state) => {
       const sql = state.storage.sql;

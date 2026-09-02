@@ -19,6 +19,64 @@ CREATE TABLE IF NOT EXISTS vocabulary_senses (
   date_added TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS vocabulary_entry_images (
+  id INTEGER PRIMARY KEY,
+  entry_id INTEGER NOT NULL UNIQUE
+    REFERENCES vocabulary_entries(id) ON DELETE CASCADE,
+  sense_id INTEGER NOT NULL,
+  category TEXT NOT NULL CHECK (
+    category IN (
+      'plant', 'animal', 'architecture', 'object', 'material', 'place',
+      'garment', 'food', 'vehicle', 'instrument', 'landform', 'visual style'
+    )
+  ),
+  query TEXT NOT NULL CHECK (length(trim(query)) > 0),
+  description TEXT NOT NULL CHECK (length(trim(description)) > 0),
+  photo_url TEXT,
+  caption TEXT,
+  source_url TEXT,
+  telegram_file_id TEXT,
+  telegram_file_unique_id TEXT,
+  origin TEXT NOT NULL CHECK (origin IN ('capture', 'backfill')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (sense_id, entry_id)
+    REFERENCES vocabulary_senses(id, entry_id) ON DELETE CASCADE,
+  CHECK (
+    (photo_url IS NULL AND caption IS NULL AND source_url IS NULL)
+    OR
+    (photo_url IS NOT NULL AND length(photo_url) > 0
+      AND caption IS NOT NULL AND length(trim(caption)) > 0 AND length(caption) <= 1024
+      AND source_url IS NOT NULL AND length(source_url) > 0)
+  ),
+  CHECK (
+    (telegram_file_id IS NULL AND telegram_file_unique_id IS NULL)
+    OR
+    (telegram_file_id IS NOT NULL AND length(telegram_file_id) > 0
+      AND telegram_file_unique_id IS NOT NULL AND length(telegram_file_unique_id) > 0
+      AND photo_url IS NOT NULL)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS image_backfill_attempts (
+  id INTEGER PRIMARY KEY,
+  entry_id INTEGER NOT NULL UNIQUE
+    REFERENCES vocabulary_entries(id) ON DELETE CASCADE,
+  status TEXT NOT NULL CHECK (
+    status IN (
+      'no_visual', 'provider_error', 'rate_limited', 'invalid_response',
+      'image_unavailable'
+    )
+  ),
+  attempt_count INTEGER NOT NULL CHECK (attempt_count >= 1),
+  last_error TEXT,
+  attempted_at TEXT NOT NULL,
+  CHECK (
+    (status = 'no_visual' AND last_error IS NULL)
+    OR (status != 'no_visual' AND last_error IS NOT NULL AND length(trim(last_error)) > 0)
+  )
+);
+
 CREATE TABLE IF NOT EXISTS maintenance_migrations (
   name TEXT PRIMARY KEY,
   applied_at TEXT NOT NULL
@@ -285,6 +343,7 @@ CREATE TABLE IF NOT EXISTS inbox_events (
   coalesced_to_event_id INTEGER REFERENCES inbox_events(id),
   response_text TEXT,
   visual_intent TEXT,
+  photo_entry_id INTEGER REFERENCES vocabulary_entries(id),
   next_chunk_index INTEGER NOT NULL DEFAULT 0 CHECK (next_chunk_index >= 0),
   attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 10),
   created_at TEXT NOT NULL,
@@ -404,6 +463,8 @@ CREATE INDEX IF NOT EXISTS inbox_events_actionable_idx
   ON inbox_events(status, id);
 CREATE INDEX IF NOT EXISTS inbox_events_capture_key_idx
   ON inbox_events(normalized_key, id);
+CREATE INDEX IF NOT EXISTS image_backfill_attempts_status_idx
+  ON image_backfill_attempts(status, attempted_at, id);
 
 `;
 
@@ -423,6 +484,23 @@ export function migrateInboxVisualIntent(sql: SqlStorage): void {
     `INSERT OR IGNORE INTO maintenance_migrations (name, applied_at)
      VALUES (?, ?)`,
     INBOX_VISUAL_INTENT_MIGRATION,
+    new Date().toISOString().replace(/\.000Z$/u, "Z"),
+  ));
+}
+
+const INBOX_PHOTO_ENTRY_MIGRATION = "inbox_photo_entry_v1";
+
+export function migrateInboxPhotoEntry(sql: SqlStorage): void {
+  const columns = Array.from(sql.exec<{ name: string }>("PRAGMA table_info(inbox_events)"));
+  if (!columns.some(({ name }) => name === "photo_entry_id")) {
+    Array.from(sql.exec(
+      "ALTER TABLE inbox_events ADD COLUMN photo_entry_id INTEGER REFERENCES vocabulary_entries(id)",
+    ));
+  }
+  Array.from(sql.exec(
+    `INSERT OR IGNORE INTO maintenance_migrations (name, applied_at)
+     VALUES (?, ?)`,
+    INBOX_PHOTO_ENTRY_MIGRATION,
     new Date().toISOString().replace(/\.000Z$/u, "Z"),
   ));
 }

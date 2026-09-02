@@ -1,6 +1,7 @@
-"""Snapshot format v2: the full v5 spaced-review state as a canonical JSON
-document that this package and ``worker/src/domain/snapshot.ts`` both produce
-and consume byte-identically.
+"""Snapshot format v3: the full v6 spaced-review and vocabulary-image state
+as a canonical JSON document that this package and
+``worker/src/domain/snapshot.ts`` both produce and consume byte-identically.
+Legacy v2 documents are accepted and upgraded in memory.
 
 The wire domain is deliberately narrow: null, safe non-negative integers, and
 strings. SQLite REAL columns (the FSRS scalars) travel as canonical decimal
@@ -19,8 +20,8 @@ from pathlib import Path
 from typing import Any
 
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
-SCHEMA_VERSION = 5
-FORMAT_VERSION = 2
+SCHEMA_VERSION = 6
+FORMAT_VERSION = 3
 
 _UTC_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -32,6 +33,27 @@ _REAL_MAX = 1e16
 
 _GRADES = ("correct", "partial", "incorrect")
 _CARD_STATES = ("new", "review", "relearning")
+_IMAGE_CATEGORIES = (
+    "plant",
+    "animal",
+    "architecture",
+    "object",
+    "material",
+    "place",
+    "garment",
+    "food",
+    "vehicle",
+    "instrument",
+    "landform",
+    "visual style",
+)
+_IMAGE_BACKFILL_STATUSES = (
+    "no_visual",
+    "provider_error",
+    "rate_limited",
+    "invalid_response",
+    "image_unavailable",
+)
 
 # Columns are (json key, sql column, kind[, enum values]). Kinds mirror
 # worker/src/domain/snapshot.ts exactly.
@@ -52,6 +74,31 @@ _SENSE_COLUMNS = (
     ("exampleSentence", "example_sentence", "text"),
     ("sourceContext", "source_context", "textNull"),
     ("dateAdded", "date_added", "ts"),
+)
+_ENTRY_IMAGE_COLUMNS = (
+    ("id", "id", "id"),
+    ("entryId", "entry_id", "id"),
+    ("senseId", "sense_id", "id"),
+    ("category", "category", "enum", _IMAGE_CATEGORIES),
+    ("query", "query", "prose"),
+    ("description", "description", "prose"),
+    ("photoUrl", "photo_url", "textNull"),
+    ("caption", "caption", "proseNull"),
+    ("sourceUrl", "source_url", "textNull"),
+    ("telegramFileId", "telegram_file_id", "textNull"),
+    ("telegramFileUniqueId", "telegram_file_unique_id", "textNull"),
+    ("origin", "origin", "enum", ("capture", "backfill")),
+    ("createdAt", "created_at", "ts"),
+    ("updatedAt", "updated_at", "ts"),
+)
+
+_IMAGE_BACKFILL_ATTEMPT_COLUMNS = (
+    ("id", "id", "id"),
+    ("entryId", "entry_id", "id"),
+    ("status", "status", "enum", _IMAGE_BACKFILL_STATUSES),
+    ("attemptCount", "attempt_count", "int"),
+    ("lastError", "last_error", "proseNull"),
+    ("attemptedAt", "attempted_at", "ts"),
 )
 
 _CARD_COLUMNS = (
@@ -209,9 +256,8 @@ _TEST_QUESTION_COLUMNS = (
     ("answeredAt", "answered_at", "tsNull"),
 )
 
-# Dependency order: importing top to bottom satisfies every foreign key except
-# the study_queue <-> review_attempts cycle, which needs deferral.
-TABLES: tuple[tuple[str, str, tuple[tuple[Any, ...], ...]], ...] = (
+# Tables present in legacy v2 snapshots.
+V2_TABLES: tuple[tuple[str, str, tuple[tuple[Any, ...], ...]], ...] = (
     ("entries", "vocabulary_entries", _ENTRY_COLUMNS),
     ("senses", "vocabulary_senses", _SENSE_COLUMNS),
     ("reviewEvents", "review_events", _REVIEW_EVENT_COLUMNS),
@@ -224,6 +270,20 @@ TABLES: tuple[tuple[str, str, tuple[tuple[Any, ...], ...]], ...] = (
     ("deliveryAttempts", "prompt_delivery_attempts", _DELIVERY_ATTEMPT_COLUMNS),
     ("answerDrafts", "answer_drafts", _ANSWER_DRAFT_COLUMNS),
     ("reviewAttempts", "review_attempts", _REVIEW_ATTEMPT_COLUMNS),
+)
+
+# Dependency order: importing top to bottom satisfies every foreign key except
+# the study_queue <-> review_attempts cycle, which needs deferral.
+TABLES: tuple[tuple[str, str, tuple[tuple[Any, ...], ...]], ...] = (
+    V2_TABLES[0],
+    V2_TABLES[1],
+    ("vocabularyEntryImages", "vocabulary_entry_images", _ENTRY_IMAGE_COLUMNS),
+    (
+        "imageBackfillAttempts",
+        "image_backfill_attempts",
+        _IMAGE_BACKFILL_ATTEMPT_COLUMNS,
+    ),
+    *V2_TABLES[2:],
 )
 
 _NULLABLE_KINDS = frozenset(
@@ -250,8 +310,8 @@ def load_envelope(path: Path) -> dict[str, Any]:
         character not in "0123456789abcdef" for character in digest
     ):
         raise ValueError("invalid snapshot digest")
-    snapshot = validate_snapshot(value["snapshot"])
-    if snapshot_sha256(snapshot) != digest:
+    snapshot, digest_source = _validate_snapshot_version(value["snapshot"])
+    if snapshot_sha256(digest_source) != digest:
         raise ValueError("snapshot digest mismatch")
     return {"sha256": digest, "snapshot": snapshot}
 
@@ -410,6 +470,40 @@ def _validate_semantics(snapshot: dict[str, Any]) -> None:
     for row in snapshot["senses"]:
         if row["entryId"] not in entry_ids:
             raise ValueError("orphan vocabulary sense")
+
+    image_entry_ids: list[int] = []
+    for row in snapshot["vocabularyEntryImages"]:
+        if row["entryId"] not in entry_ids:
+            raise ValueError("orphan vocabulary entry image")
+        if sense_entry.get(row["senseId"]) != row["entryId"]:
+            raise ValueError("image sense does not belong to its entry")
+        image_entry_ids.append(row["entryId"])
+        metadata = (row["photoUrl"], row["caption"], row["sourceUrl"])
+        if any(value is None for value in metadata) and any(
+            value is not None for value in metadata
+        ):
+            raise ValueError("image metadata must be populated together")
+        if row["caption"] is not None and len(row["caption"]) > 1024:
+            raise ValueError("image caption exceeds Telegram limit")
+        receipt = (row["telegramFileId"], row["telegramFileUniqueId"])
+        if (receipt[0] is None) != (receipt[1] is None):
+            raise ValueError("Telegram image receipt must be populated together")
+        if receipt[0] is not None and row["photoUrl"] is None:
+            raise ValueError("Telegram image receipt requires resolved metadata")
+    _require_unique(image_entry_ids, "duplicate image association for entry")
+
+    backfill_entry_ids: list[int] = []
+    for row in snapshot["imageBackfillAttempts"]:
+        if row["entryId"] not in entry_ids:
+            raise ValueError("orphan image backfill attempt")
+        if row["attemptCount"] < 1:
+            raise ValueError("image backfill attempt count must be positive")
+        if (row["status"] == "no_visual") != (row["lastError"] is None):
+            raise ValueError("image backfill error disagrees with status")
+        backfill_entry_ids.append(row["entryId"])
+    _require_unique(backfill_entry_ids, "duplicate image backfill attempt for entry")
+    if set(image_entry_ids) & set(backfill_entry_ids):
+        raise ValueError("associated entry cannot retain a backfill attempt")
 
     for row in snapshot["reviewEvents"]:
         if row["entryId"] not in entry_ids:
@@ -618,18 +712,44 @@ def _validate_semantics(snapshot: dict[str, Any]) -> None:
     )
 
 
-def validate_snapshot(value: Any) -> dict[str, Any]:
-    expected = {"formatVersion", *(key for key, _, _ in TABLES)}
-    if not isinstance(value, dict) or set(value) != expected:
+def _validate_snapshot_version(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not isinstance(value, dict):
         raise ValueError("invalid snapshot shape")
-    if value["formatVersion"] != FORMAT_VERSION:
-        raise ValueError("unsupported snapshot format")
-    root: dict[str, Any] = {"formatVersion": FORMAT_VERSION}
-    for key, _, columns in TABLES:
-        root[key] = _rows(value[key], columns)
+    keys = set(value)
+    v2_expected = {"formatVersion", *(key for key, _, _ in V2_TABLES)}
+    v3_expected = {"formatVersion", *(key for key, _, _ in TABLES)}
+    if keys == v2_expected:
+        version = value["formatVersion"]
+        if version != 2:
+            raise ValueError("unsupported snapshot format")
+        tables = V2_TABLES
+    elif keys == v3_expected:
+        version = value["formatVersion"]
+        if version != FORMAT_VERSION:
+            raise ValueError("unsupported snapshot format")
+        tables = TABLES
+    else:
+        raise ValueError("invalid snapshot shape")
+    digest_source: dict[str, Any] = {"formatVersion": version}
+    for key, _, columns in tables:
+        digest_source[key] = _rows(value[key], columns)
+    if version == 2:
+        root = {
+            **digest_source,
+            "formatVersion": FORMAT_VERSION,
+            "vocabularyEntryImages": [],
+            "imageBackfillAttempts": [],
+        }
+    else:
+        root = digest_source
     _validate_semantics(root)
     _validate_jcs_value(root)
-    return root
+    return root, digest_source
+
+
+def validate_snapshot(value: Any) -> dict[str, Any]:
+    snapshot, _ = _validate_snapshot_version(value)
+    return snapshot
 
 
 def extract_snapshot(connection: sqlite3.Connection) -> dict[str, Any]:

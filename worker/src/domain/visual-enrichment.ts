@@ -105,7 +105,7 @@ const CATEGORY_MARKERS: Record<VisualCategory, readonly string[]> = {
     "glass", "ceramic", "leather",
   ],
   [VisualCategory.PLACE]: [
-    "place", "location", "landscape", "site", "region", "city", "country", "village",
+    "place", "location", "landscape", "site", "city", "country", "village",
     "island", "park", "garden",
   ],
   [VisualCategory.GARMENT]: [
@@ -274,7 +274,7 @@ export function validateVisualIntent(
   };
 }
 
-/** Stable transient-inbox representation; vocabulary aggregates never store it. */
+/** Stable persisted representation shared by capture and backfill. */
 export function encodeVisualIntent(intent: VisualIntent): string {
   return JSON.stringify(intent);
 }
